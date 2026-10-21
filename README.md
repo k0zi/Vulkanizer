@@ -119,8 +119,9 @@ The official PyTorch wheels contain only native NVIDIA machine code (SASS), no P
 run their kernels. The conda-forge CUDA builds also ship PTX (`compute_120`):
 `tools/setup_torch.sh` installs these with micromamba, without a system-wide install. `run_torch.sh` loads
 Vulkanizer's `libcuda`, `libcudart`, `libcublas` and `libcublasLt` instead of NVIDIA's,
-and disables everything that requires NVIDIA hardware or libraries: cuDNN and the fused attention kernels
-(so `scaled_dot_product_attention` runs on the math path). `VULKANIZER_TORCH_DEFAULTS=0` skips this.
+and disables everything that requires NVIDIA hardware or libraries: cuDNN, the fused attention kernels
+(so `scaled_dot_product_attention` runs on the math path) and the Triton/CuTe DSL kernels of `torch._native`
+(`TORCH_DISABLE_NATIVE_JIT=1`), which compile to SASS. `VULKANIZER_TORCH_DEFAULTS=0` skips this.
 
 ### Useful environment variables
 
