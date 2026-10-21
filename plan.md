@@ -186,6 +186,54 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     (ggml f16 k=128 batched: 24 → 6,7 ms; a natív 2,5 ms, mert a broadcastolt A-t egyszer olvassa).
   - Hátra: mmvq (Q4_0 ~1,4×, Q6_K lassabb a natívnál), dequantize + GEMM összevonása,
     flash attention gyorsítása (a tile kernel pp-ben lassú).
+- [ ] **4.7** ComfyUI (Z-Image Turbo) teljes képgenerálás.
+  - Már kész: a conda-forge környezetben fut (`venv-vulkanizer`, a torchvision feloldás nélkül, URL-ről).
+    Indítás: `run_torch.sh` + `--disable-cuda-malloc --disable-dynamic-vram`. A `torch._native` Triton/CuTe DSL
+    kernelei `TORCH_DISABLE_NATIVE_JIT=1`-gyel ki vannak kapcsolva (`tools/torch/sitecustomize.py`).
+  - **Kész, ha:** a Z-Image Turbo sablon 1024×1024-es képet generál, és az eredmény megegyezik a CPU-s futáséval.
+  - Az alábbi hiányzó funkciók a ComfyUI nélkülük is futó, de lassabb vagy szűkebb útjait nyitnák meg:
+- [x] **4.8** Stream-rendezett allokáció a Driver API-ban: `cuMemAllocAsync`, `cuMemFreeAsync` (`_ptsz` is),
+  `cuMemAllocFromPoolAsync`, `cuMemPool*`, `cuDevice{Get,Set,GetDefault}MemPool` (`src/driver/api_mempool.cpp`).
+  A felszabadítás a stream addigi munkája után történik várakozás nélkül (`Device::freeBufferAfter`, serial alapján).
+  A poolok nem cache-elnek, csak az attribútumokat és a statisztikát tartják. A runtime `cudaMallocAsync`/`cudaMemPool*`
+  ezekre épül; `cuGetProcAddress` a per-thread flaggel a `_ptsz`/`_ptds` változatot adja.
+- [ ] **4.9** Virtuális memóriakezelés (VMM) sparse bufferekkel, a ComfyUI DynamicVRAM-jához (comfy-aimdo).
+  - Kész (`src/driver/api_vmm.cpp`, `tests/vmm.cpp`): reserve/free, create/release, map/unmap, set/get access,
+    granularitás (2 MB), `cuMemRetainAllocationHandle`, `cuMemHostRegister/Unregister` (csak nyilvántartás,
+    `DEVICEMAP` nem megy). RADV-n egy 12 GB-os foglalás 4 db ~4 GB-os sparse bufferből áll.
+  - A RADV felülről lefelé osztja a címeket: a többi darab az első alá kerül. A VA-tartomány tetején túlcsorduló
+    címet nem szabad kérni, mert a libdrm címkezelője ettől elromlik, és utána minden kérés elbukik.
+  - Unmapkor a felvett munkát meg kell várni (`finish`), mapkor nem. A host-oldali másolás sparse memóriába
+    staging bufferen át megy (lassú modellbetöltés; UMA-n a VkDeviceMemory közvetlen mappelése gyorsítana).
+  - Hátra: a ComfyUI + aimdo kipróbálása.
+  - API: `cuMemAddressReserve/Free`, `cuMemCreate/Release`, `cuMemMap/Unmap`, `cuMemSetAccess`,
+    `cuMemGetAllocationGranularity`; mellette `cuMemHostRegister/Unregister`.
+  - Megvalósítás: reserve = `SPARSE_BINDING | SPARSE_RESIDENCY` VkBuffer BDA-val; create = VkDeviceMemory;
+    map/unmap = `vkQueueBindSparse` a stream munkájához rendezve. A granularitás a sparse alignment (RADV: 64 KB) és 2 MB közül a nagyobb.
+  - Fő akadály: RADV-n a `maxBufferSize` 4 GB, az aimdo viszont 16 GB-os (cast buffer) és modellméretű (Z-Image: 11,5 GB)
+    tartományokat foglal. Ezért egy foglalás több, ≤4 GB-os sparse bufferből áll, egybefüggő címtartományon
+    (`bufferDeviceAddressCaptureReplay`, `VkBufferOpaqueCaptureAddressCreateInfo`). A `findAllocation` és a
+    copy/fill/write/read darabhatárokon vágjon.
+  - **Kész, ha:** a ComfyUI `--disable-dynamic-vram` nélkül indul, és az aimdo-val generál.
+- [ ] **4.10** Triton backend: a `torch._native` műveletei, a `torch.compile`, a comfy-kitchen triton backendje.
+  - A Triton NVIDIA backendje a `cuda.h`-val lefordít egy C launchert (ehhez a saját `include/cuda.h` kell).
+    A PTX-et `ptxas`-szal cubinná alakítaná, helyette a PTX-et kell betölteni (ptxas-wrapper vagy
+    `TRITON_PTXAS_PATH`, ami PTX-et ad vissza; a `cuModuleLoadData` PTX-et is elfogad).
+  - Kellhet még: `cuLaunchKernelEx`, `cuFuncSetAttribute`, `cuOccupancyMaxActiveClusters` stb.
+  - **Kész, ha:** `TORCH_DISABLE_NATIVE_JIT` nélkül is helyes a `tests/torch/ops.py`, és lefut egy `torch.compile`-olt MLP.
+  - Kész (tesztelés hátra):
+    - `tools/triton/ptxas`: a PTX-et adja tovább „cubin”-ként, a verziója (12.8) határozza meg a PTX ISA verziót.
+    - A `sitecustomize` beállítja a `TRITON_PTXAS_PATH`-ot, és a Triton `driver.c`-je a saját `include/cuda.h`-val fordul;
+      ehhez a header kapott launch config, tensor map, limit és pointer-attribútum típusokat.
+    - Driver: `cuLaunchKernelEx` (`_ptsz`), `cuFuncSetAttribute/SetCacheConfig`, `cuCtxSet/GetLimit`, `cuPointerGetAttribute(s)`,
+      `cuOccupancy*`. A `cuTensorMapEncode*` `NOT_SUPPORTED` (TMA, sm_90).
+    - A fordító most már ismeri a `.shared::cta`, `.L1::evict_*` módosítókat, és emulálja az `mma.sync`-et
+      (m16n8k8/k16, f16/bf16 → f32/f16) és az `ldmatrix`-ot (x1/x2/x4, `.trans`) warp shuffle-lel (`tests/warp_matrix.cpp`).
+    - `tests/cuda_abi`: a driver típusai és enumjai az NVIDIA headerhez mérve.
+- [ ] **4.11** CUDA 13 runtime (`libcudart.so.13`, `libcublas.so.13`): a cu130-as PyTorch buildekhez és a ComfyUI
+  „cu130 or higher” optimalizált útjaihoz. Az ABI-eltéréseket (`cudaDeviceProp`, eltávolított API-k) verziónként kell kezelni.
+- Nem Vulkanizer-feladat: a `torchaudio` (nincs a torch 2.14-hez conda-forge build), a ComfyUI-Manager
+  „PyTorch is not installed” üzenete emiatt jön.
 
 ### Fázis 5 – Széles kompatibilitás és teljesítmény
 - [ ] **5.1** cuDNN shim: konvolúció, batchnorm/layernorm, softmax, attention.
@@ -225,6 +273,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 | `VULKANIZER_PROFILE` | `1` = kilépéskor kiírja a kernelenkénti GPU-időt és az API-hívásonkénti host-időt |
 | `VULKANIZER_FAST_FMA` | `1` = az f32 `fma` a driver natív (esetleg nem fused) `Fma`-ja, ott is, ahol a próba szerint nem fused (gyorsabb, kevésbé pontos) |
 | `VULKANIZER_FMA_F64` | `1` = a nem fused eszközön az f32 `fma` f64-ben számolódik (alapból f32 TwoProduct/TwoSum emuláció) |
+| `VULKANIZER_NO_VMM` | `1` = nincs sparse binding, így nincs CUDA VMM (`cuMemAddressReserve` stb. `NOT_SUPPORTED`) |
 | `VULKANIZER_NO_PACK` | `1` = nincs block packing (minden CUDA block külön workgroup) |
 | `VULKANIZER_GEMM_F32` | `1` = a cuBLAS `COMPUTE_16F` GEMM-ek is f32 szorzással futnak (alapból packed f16, ha az eszköz tud f16 aritmetikát) |
 

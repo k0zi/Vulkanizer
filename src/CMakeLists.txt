@@ -4,18 +4,21 @@ target_include_directories(vulkanizer_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE} REQUIRED)
 set(vk_gen ${CMAKE_CURRENT_BINARY_DIR}/vk)
-add_custom_command(
-  OUTPUT ${vk_gen}/fma_probe.comp.inc
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${vk_gen}
-  COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num -o ${vk_gen}/fma_probe.comp.inc
-          ${CMAKE_CURRENT_SOURCE_DIR}/vk/shaders/fma_probe.comp
-  DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vk/shaders/fma_probe.comp
-  COMMENT "glslc fma_probe.comp"
-)
+foreach(probe fma_probe fma_probe_f64)
+  add_custom_command(
+    OUTPUT ${vk_gen}/${probe}.comp.inc
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${vk_gen}
+    COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num -o ${vk_gen}/${probe}.comp.inc
+            ${CMAKE_CURRENT_SOURCE_DIR}/vk/shaders/${probe}.comp
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vk/shaders/${probe}.comp
+    COMMENT "glslc ${probe}.comp"
+  )
+endforeach()
 
 # Internal building blocks, linked statically into libcuda.so (and into internal tests).
 add_library(vulkanizer_core STATIC
   ${vk_gen}/fma_probe.comp.inc
+  ${vk_gen}/fma_probe_f64.comp.inc
   vk/instance.cpp
   vk/device.cpp
   ptx/lexer.cpp
@@ -40,6 +43,8 @@ add_library(vulkanizer_cuda SHARED
   driver/api_init.cpp
   driver/api_context.cpp
   driver/api_memory.cpp
+  driver/api_mempool.cpp
+  driver/api_vmm.cpp
   driver/api_module.cpp
   driver/api_stream.cpp
   driver/printf.cpp

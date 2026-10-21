@@ -20,9 +20,11 @@ struct PhysicalDeviceInfo {
     VkSubgroupFeatureFlags subgroupOps = 0;  // supported in compute shaders
     bool dot4x8Accelerated = false;          // 4x8-bit packed integer dot products run in hardware
     VkDeviceSize maxMemoryAllocationSize = 0;
+    VkDeviceSize maxBufferSize = 0;  // maintenance4 (Vulkan 1.3); else maxMemoryAllocationSize
     VkDeviceSize deviceLocalBytes = 0;
     uint8_t uuid[VK_UUID_SIZE]{};
     uint32_t computeQueueFamily = 0;
+    bool computeQueueSparse = false;  // the compute queue family supports sparse binding
 
     bool isCpu() const { return props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU; }
     const char* name() const { return props.deviceName; }

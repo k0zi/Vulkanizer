@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Stands in for NVIDIA's ptxas when Triton runs on Vulkanizer (TRITON_PTXAS_PATH, set by
+# tools/torch/sitecustomize.py): the "cubin" it writes is the PTX itself, which Vulkanizer's
+# cuModuleLoadData translates to SPIR-V. The reported release picks the PTX ISA version Triton
+# emits (12.8 -> PTX 8.7).
+set -euo pipefail
+
+in="" out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version) echo "Vulkanizer ptxas stand-in (PTX pass-through), release 12.8, V12.8.0"; exit 0 ;;
+    -o|--output-file) out="$2"; shift ;;
+    --opt-level|--gpu-name|-arch|--maxrregcount) shift ;;  # options with a separate value
+    -*) ;;
+    *) in="$1" ;;
+  esac
+  shift
+done
+if [[ -z "$in" || -z "$out" ]]; then
+  echo "usage: ptxas [options] input.ptx -o output" >&2
+  exit 1
+fi
+cp -- "$in" "$out"

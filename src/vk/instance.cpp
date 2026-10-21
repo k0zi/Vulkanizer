@@ -157,9 +157,11 @@ bool Instance::queryDevice(VkPhysicalDevice pd, PhysicalDeviceInfo& out, std::st
     if (out.apiVersion >= VK_API_VERSION_1_3) {
         out.minSubgroupSize = p13.minSubgroupSize;
         out.maxSubgroupSize = p13.maxSubgroupSize;
+        out.maxBufferSize = p13.maxBufferSize;
     } else {
         out.minSubgroupSize = out.maxSubgroupSize = out.subgroupSize;
     }
+    if (!out.maxBufferSize) out.maxBufferSize = out.maxMemoryAllocationSize;
 
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -189,6 +191,7 @@ bool Instance::queryDevice(VkPhysicalDevice pd, PhysicalDeviceInfo& out, std::st
         return false;
     }
     out.computeQueueFamily = static_cast<uint32_t>(computeOnly >= 0 ? computeOnly : anyCompute);
+    out.computeQueueSparse = qfs[out.computeQueueFamily].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT;
 
     for (uint32_t i = 0; i < out.memProps.memoryHeapCount; ++i)
         if (out.memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)

@@ -29,6 +29,10 @@ const uint32_t kFmaProbeSpirv[] = {
 #include "fma_probe.comp.inc"
 };
 
+const uint32_t kFmaProbeF64Spirv[] = {
+#include "fma_probe_f64.comp.inc"
+};
+
 // VULKANIZER_PROFILE=1: GPU time per kernel, summed over all devices and printed at exit.
 namespace {
 
@@ -135,6 +139,15 @@ VkResult Device::init() {
     e12.vulkanMemoryModelDeviceScope = s12.vulkanMemoryModelDeviceScope;
     e12.shaderBufferInt64Atomics = s12.shaderBufferInt64Atomics;
     e12.shaderSharedInt64Atomics = s12.shaderSharedInt64Atomics;
+    // CUDA virtual memory: sparse buffers, several of them side by side for reservations larger
+    // than maxBufferSize (VULKANIZER_NO_VMM=1 turns it off).
+    const char* noVmm = std::getenv("VULKANIZER_NO_VMM");
+    if (info_.computeQueueSparse && sup.features.sparseBinding && sup.features.sparseResidencyBuffer &&
+        !(noVmm && *noVmm && std::strcmp(noVmm, "0") != 0)) {
+        en.features.sparseBinding = VK_TRUE;
+        en.features.sparseResidencyBuffer = VK_TRUE;
+        e12.bufferDeviceAddressCaptureReplay = s12.bufferDeviceAddressCaptureReplay;
+    }
     if (has13) {
         e13.subgroupSizeControl = s13.subgroupSizeControl;
         e13.computeFullSubgroups = s13.computeFullSubgroups;
@@ -154,6 +167,8 @@ VkResult Device::init() {
     features_.subgroupSizeControl = e13.subgroupSizeControl;
     features_.computeFullSubgroups = e13.computeFullSubgroups;
     features_.timelineSemaphore = e12.timelineSemaphore;
+    features_.sparseBuffers = en.features.sparseResidencyBuffer;
+    features_.addressCaptureReplay = e12.bufferDeviceAddressCaptureReplay;
     // Without hardware support drivers lower it into byte extracts and full 32-bit multiplies;
     // the compiler's own emulation does better.
     features_.integerDotProduct = e13.shaderIntegerDotProduct && info_.dot4x8Accelerated;
@@ -222,15 +237,19 @@ VkResult Device::init() {
     }
 
     features_.fusedFma = probeFusedFma();
+    features_.fusedFma64 = features_.shaderFloat64 && probeFusedFma64();
+    if (features_.sparseBuffers) probeSparse();
 
-    VULKANIZER_INFO("created Vulkan device '%s' (queue family %u, %s fma)", info_.name(), info_.computeQueueFamily,
-               features_.fusedFma ? "fused" : "unfused");
+    VULKANIZER_INFO("created Vulkan device '%s' (queue family %u, %s f32 fma, %s f64 fma)", info_.name(),
+               info_.computeQueueFamily, features_.fusedFma ? "fused" : "unfused",
+               features_.fusedFma64 ? "fused" : "unfused");
     return VK_SUCCESS;
 }
 
 Device::~Device() {
     if (!device_) return;
     vkDeviceWaitIdle(device_);
+    for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
     for (Batch& b : batches_) {
         if (b.fence) vkDestroyFence(device_, b.fence, nullptr);
         if (b.arena.buffer) {
@@ -329,11 +348,30 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
 
 VkResult Device::allocateBuffer(VkDeviceSize size, Buffer& out) {
     // Prefer memory that is both device-local and host-mappable (UMA / ReBAR): copies become memcpy.
-    return createBuffer(size, kDeviceBufferUsage,
-                        {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0},
-                        out);
+    auto attempt = [&] {
+        return createBuffer(size, kDeviceBufferUsage,
+                            {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0},
+                            out);
+    };
+    reapDeferredFrees();
+    VkResult r = attempt();
+    if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (!deferredFrees_.empty() && finish() == VK_SUCCESS) {  // memory freed asynchronously comes back
+            reapDeferredFrees();
+            r = attempt();
+        }
+    }
+    return r;
+}
+
+void Device::destroyBuffer(Buffer& buf) {
+    if (buf.mapped) vkUnmapMemory(device_, buf.memory);
+    if (buf.buffer) vkDestroyBuffer(device_, buf.buffer, nullptr);
+    if (buf.memory) vkFreeMemory(device_, buf.memory, nullptr);
+    buf = Buffer{};
 }
 
 void Device::freeBuffer(Buffer& buf) {
@@ -341,10 +379,114 @@ void Device::freeBuffer(Buffer& buf) {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (hasRecordedWork()) finish();  // recorded kernels may still use it
     }
-    if (buf.mapped) vkUnmapMemory(device_, buf.memory);
-    if (buf.buffer) vkDestroyBuffer(device_, buf.buffer, nullptr);
-    if (buf.memory) vkFreeMemory(device_, buf.memory, nullptr);
+    destroyBuffer(buf);
+}
+
+void Device::freeBufferAfter(Buffer& buf, uint64_t serial) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    deferredFrees_.emplace_back(serial, buf);
     buf = Buffer{};
+    reapDeferredFrees();
+}
+
+void Device::reapDeferredFrees() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    size_t kept = 0;
+    for (auto& entry : deferredFrees_) {
+        if (isComplete(entry.first)) destroyBuffer(entry.second);
+        else deferredFrees_[kept++] = entry;
+    }
+    deferredFrees_.resize(kept);
+}
+
+// ---- virtual memory --------------------------------------------------------------------------
+
+// Page size and memory types of sparse buffers, from a small one.
+void Device::probeSparse() {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+    bci.size = 1 << 20;
+    bci.usage = kDeviceBufferUsage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(device_, &bci, nullptr, &buffer) != VK_SUCCESS) {
+        features_.sparseBuffers = false;
+        return;
+    }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, buffer, &req);
+    vkDestroyBuffer(device_, buffer, nullptr);
+    sparsePageSize_ = req.alignment;
+    sparseMemoryTypes_ = req.memoryTypeBits;
+    // Whole pages, and below 4 GB where drivers' 32-bit size fields would wrap.
+    maxSparseBufferSize_ = std::min<VkDeviceSize>(info_.maxBufferSize, VkDeviceSize(4) << 30) / req.alignment * req.alignment;
+}
+
+VkResult Device::createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, Buffer& out, uint64_t& opaqueOut) {
+    if (!features_.sparseBuffers || size > maxSparseBufferSize_) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (opaqueAddress && !features_.addressCaptureReplay) return VK_ERROR_FEATURE_NOT_PRESENT;
+    VkBufferOpaqueCaptureAddressCreateInfo oci{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
+    oci.opaqueCaptureAddress = opaqueAddress;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.pNext = opaqueAddress ? &oci : nullptr;
+    bci.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
+    if (features_.addressCaptureReplay) bci.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+    bci.size = size;
+    bci.usage = kDeviceBufferUsage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    out = Buffer{};
+    if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer)) return r;
+    out.size = size;
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = out.buffer;
+    out.address = vkGetBufferDeviceAddress(device_, &bai);
+    opaqueOut = features_.addressCaptureReplay ? vkGetBufferOpaqueCaptureAddress(device_, &bai) : 0;
+    return VK_SUCCESS;
+}
+
+VkResult Device::allocateMemory(VkDeviceSize size, VkDeviceMemory& out) {
+    VkMemoryAllocateFlagsInfo flagsInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (VkMemoryPropertyFlags pref : {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), VkMemoryPropertyFlags(0)}) {
+        const int32_t type = findMemoryType(sparseMemoryTypes_, pref);
+        if (type < 0) continue;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.pNext = &flagsInfo;
+        mai.allocationSize = size;
+        mai.memoryTypeIndex = uint32_t(type);
+        if ((r = vkAllocateMemory(device_, &mai, nullptr, &out)) == VK_SUCCESS) return r;
+    }
+    return r;
+}
+
+void Device::freeMemory(VkDeviceMemory memory) {
+    if (memory) vkFreeMemory(device_, memory, nullptr);
+}
+
+VkResult Device::bindSparse(const std::vector<SparseBind>& binds) {
+    if (binds.empty()) return VK_SUCCESS;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    // Pages being unbound may still be used by recorded work. Newly bound pages are not
+    // (CUDA forbids touching unmapped memory), and the work recorded later is submitted after
+    // the binding completed below.
+    for (const SparseBind& b : binds)
+        if (!b.memory) {
+            if (VkResult r = finish()) return r;
+            break;
+        }
+    std::vector<VkSparseMemoryBind> pages(binds.size());
+    std::vector<VkSparseBufferMemoryBindInfo> infos(binds.size());
+    for (size_t i = 0; i < binds.size(); ++i) {
+        pages[i] = {binds[i].offset, binds[i].size, binds[i].memory, binds[i].memoryOffset, 0};
+        infos[i] = {binds[i].buffer->buffer, 1, &pages[i]};
+    }
+    VkBindSparseInfo bsi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+    bsi.bufferBindCount = uint32_t(infos.size());
+    bsi.pBufferBinds = infos.data();
+    if (VkResult r = vkResetFences(device_, 1, &fence_)) return r;
+    if (VkResult r = vkQueueBindSparse(queue_, 1, &bsi, fence_)) return r;
+    return vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
 }
 
 bool Device::probeFusedFma() {
@@ -362,6 +504,27 @@ bool Device::probeFusedFma() {
         float r = 0;
         if (dispatch(pipeline, 1, 1, 1, &params, sizeof params) == VK_SUCCESS && read(out, 0, &r, 4) == VK_SUCCESS)
             fused = r == 1.0f / 16777216.0f;
+        destroyComputePipeline(pipeline);
+    }
+    freeBuffer(out);
+    return fused;
+}
+
+bool Device::probeFusedFma64() {
+    Buffer out;
+    if (allocateBuffer(8, out) != VK_SUCCESS) return false;
+    ComputePipeline pipeline;
+    const uint32_t spec[5] = {1, 1, 1, 0, 1};
+    bool fused = false;
+    struct {
+        VkDeviceAddress out;
+        double a, c;
+    } params{out.address, 1.0 + 1.0 / 134217728.0, -(1.0 + 1.0 / 67108864.0)};
+    if (createComputePipeline(kFmaProbeF64Spirv, sizeof kFmaProbeF64Spirv / 4, "main", sizeof params, spec,
+                              pipeline) == VK_SUCCESS) {
+        double r = 0;
+        if (dispatch(pipeline, 1, 1, 1, &params, sizeof params) == VK_SUCCESS && read(out, 0, &r, 8) == VK_SUCCESS)
+            fused = r == 1.0 / 18014398509481984.0;  // 2^-54
         destroyComputePipeline(pipeline);
     }
     freeBuffer(out);
@@ -403,6 +566,7 @@ VkResult Device::beginBatch() {
     if (VkResult r = vkBeginCommandBuffer(b.cmd, &bi)) return r;
     b.serial = nextSerial_++;
     b.arenaUsed = 0;
+    b.kernels.clear();
     if (profiling_) vkCmdResetQueryPool(b.cmd, b.profile, 0, 2 * kMaxCommandsPerBatch);
     open_ = int32_t(nextBatch_);
     nextBatch_ = (nextBatch_ + 1) % kBatches;
@@ -445,6 +609,15 @@ void Device::collectProfile(Batch& b) {
 
 VkResult Device::waitBatch(Batch& b) {
     const VkResult r = vkWaitForFences(device_, 1, &b.fence, VK_TRUE, UINT64_MAX);
+    if (r == VK_ERROR_DEVICE_LOST) {
+        // Usually a kernel that hung (the kernel driver resets the GPU after its timeout).
+        std::string names;
+        for (const char* k : b.kernels) {
+            const std::string n = k ? displayName(k) : std::string("(internal)");
+            if (names.find(n) == std::string::npos) names += "\n  " + n;
+        }
+        VULKANIZER_ERROR("Vulkan device lost; the lost batch ran these kernels:%s", names.c_str());
+    }
     if (r != VK_SUCCESS) return r;
     b.pending = false;
     collectProfile(b);
@@ -755,6 +928,7 @@ VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t g
         Batch& b = batches_[open_];
         const uint32_t query = uint32_t(2 * b.labels.size());
         if (profiling_) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.profile, query);
+        b.kernels.push_back(label);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
         if (pushSize) vkCmdPushConstants(cb, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
         // CUDA allows 2^31-1 blocks in x; split along x when the device allows fewer. The base

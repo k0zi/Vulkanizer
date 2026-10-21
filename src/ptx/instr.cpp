@@ -61,8 +61,14 @@ private:
 
     bool statement() {
         const Token& tk = peek();
-        if (isPunct(tk, '{') || isPunct(tk, '}')) {  // nested scopes are flattened
+        if (isPunct(tk, '{')) {  // nested scope: its registers may shadow the enclosing ones
             next();
+            scopes_.emplace_back();
+            return true;
+        }
+        if (isPunct(tk, '}')) {
+            next();
+            if (!scopes_.empty()) scopes_.pop_back();
             return true;
         }
         if (tk.kind == TokenKind::Directive) return directive();
@@ -120,10 +126,28 @@ private:
         return expectPunct(';');
     }
 
-    // Nested scopes may redeclare a name; they never overlap in nvcc's output, so one
-    // register (or variable) per name is enough.
+    // Scopes are flattened into one register set. A register that a nested scope redeclares
+    // gets a unique name there (the enclosing one stays live across the scope: CUDA's math
+    // library declares %r0..%r3 in inline asm blocks of functions that use %r1..%r3 around them).
     void addReg(std::string name, std::string_view type) {
+        if (!scopes_.empty() && regNames_.count(name)) {
+            f_.names.push_back("$scope" + std::to_string(scopeNames_++) + "_" + name);
+            const std::string_view fresh = f_.names.back();
+            scopes_.back()[std::move(name)] = fresh;
+            regNames_.insert(std::string(fresh));
+            f_.regs.push_back({std::string(fresh), type});
+            return;
+        }
         if (regNames_.insert(name).second) f_.regs.push_back({std::move(name), type});
+    }
+
+    // The register a name refers to in the current scope.
+    std::string_view resolve(std::string_view name) const {
+        if (scopes_.empty()) return name;
+        const std::string key(name);
+        for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it)
+            if (auto found = it->find(key); found != it->end()) return found->second;
+        return name;
     }
 
     bool localDecl() {
@@ -187,12 +211,23 @@ private:
             // plain names (no '%') are legal registers too, e.g. in inline asm scopes
             if (g.kind != TokenKind::Register && g.kind != TokenKind::Identifier)
                 return fail(g, "expected predicate register after '@'");
-            ins.guard = g.text;
+            ins.guard = resolve(g.text);
         }
         const Token& op = next();
         if (op.kind != TokenKind::Identifier) return fail(op, "expected instruction, got '" + std::string(op.text) + "'");
         ins.opcode = op.text;
-        while (peek().kind == TokenKind::Directive) ins.mods.push_back(next().text);
+        while (peek().kind == TokenKind::Directive) {
+            std::string_view mod = next().text;
+            // Qualified modifiers: ".L1::evict_last", ".shared::cta" (the CTA's own shared memory,
+            // the same as ".shared"), ".shared::cluster".
+            while (isPunct(peek(), ':') && isPunct(peek(1), ':') && peek(2).kind == TokenKind::Identifier) {
+                next();
+                next();
+                const Token& q = next();
+                mod = std::string_view(mod.data(), size_t(q.text.data() + q.text.size() - mod.data()));
+            }
+            ins.mods.push_back(mod == ".shared::cta" ? std::string_view(".shared") : mod);
+        }
 
         if (!isPunct(peek(), ';')) {
             for (;;) {
@@ -239,8 +274,8 @@ private:
         const Token& tk = peek();
         if (tk.kind == TokenKind::Register) {
             next();
-            o.name = tk.text;
             o.kind = isSpecialRegister(tk.text) ? OperandKind::Special : OperandKind::Register;
+            o.name = o.kind == OperandKind::Register ? resolve(tk.text) : tk.text;
             if (peek().kind == TokenKind::Directive && peek().text.size() == 2) {
                 const char c = peek().text[1];
                 if (c == 'x' || c == 'y' || c == 'z' || c == 'w') {
@@ -253,7 +288,7 @@ private:
                 const Token& q = next();
                 if (q.kind != TokenKind::Register && q.kind != TokenKind::Identifier)
                     return fail(q, "expected register after '|'");
-                o.pairName = q.text;
+                o.pairName = resolve(q.text);
             }
             return true;
         }
@@ -265,13 +300,13 @@ private:
         if (tk.kind == TokenKind::Identifier) {
             next();
             o.kind = tk.text == "_" ? OperandKind::Sink : OperandKind::Symbol;
-            o.name = tk.text;
+            o.name = resolve(tk.text);
             if (isPunct(peek(), '|')) {  // "r0|p": plain register names
                 next();
                 const Token& q = next();
                 if (q.kind != TokenKind::Register && q.kind != TokenKind::Identifier)
                     return fail(q, "expected register after '|'");
-                o.pairName = q.text;
+                o.pairName = resolve(q.text);
             }
             return true;
         }
@@ -313,7 +348,7 @@ private:
         const Token& base = peek();
         if (base.kind == TokenKind::Register || base.kind == TokenKind::Identifier) {
             next();
-            o.name = base.text;
+            o.name = resolve(base.text);
             o.baseIsRegister = base.kind == TokenKind::Register;
         } else if (base.kind == TokenKind::Integer) {
             next();
@@ -344,6 +379,8 @@ private:
     Function& f_;
     ParseError& err_;
     std::unordered_set<std::string> regNames_;
+    std::vector<std::unordered_map<std::string, std::string_view>> scopes_;  // renames of the open nested scopes
+    unsigned scopeNames_ = 0;
 };
 
 void appendOperand(std::string& s, const Operand& o) {

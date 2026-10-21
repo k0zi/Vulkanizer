@@ -1284,17 +1284,25 @@ private:
         } else {
             r = b_.op(spv::OpIMul, type, {a, bv});
         }
-        if (isMad) r = b_.op(spv::OpIAdd, compType(rt, ins), {r, value(ins, ins.operands[3], rt)});
+        if (isMad && (ins.has(".cc") || ins.opcode == "madc")) {
+            // mad{.lo,.hi}.cc / madc{.lo,.hi}{.cc}: the addition takes and/or sets the carry flag
+            if (ins.has(".wide") || (t.width != 32 && t.width != 64)) fail(ins, "32/64-bit mad.lo/hi expected");
+            r = addWithCarry(t, r, value(ins, ins.operands[3], t), false, ins.opcode == "madc", ins.has(".cc"));
+        } else if (isMad) {
+            r = b_.op(spv::OpIAdd, compType(rt, ins), {r, value(ins, ins.operands[3], rt)});
+        }
         storeReg(ins, dstReg(ins).name, rt, r);
     }
 
     // a * b + c with a single rounding. Vulkan's Fma may be evaluated as a multiply and an add
     // (RADV on GFX9, llvmpipe), which breaks the error-free transformations CUDA's math library
     // is built on. The driver probes this per device (Target::fusedFma); where Fma is unfused,
-    // f32 fma is emulated from f32 operations (fmaFromF32), or with VULKANIZER_FMA_F64=1 computed in
+    // f32 fma is emulated from f32 operations (fmaEmulated), or with VULKANIZER_FMA_F64=1 computed in
     // f64, where the product is exact, and rounded once to f32 (up to a rare double rounding).
+    // f64 fma is emulated the same way where the driver's f64 Fma is unfused (llvmpipe).
     // VULKANIZER_FAST_FMA=1 uses the driver's Fma anyway: fastest, least precise.
     uint32_t fusedMulAdd(const PtxType& t, uint32_t a, uint32_t b, uint32_t c) {
+        if (t.width == 64 && !t_.fusedFma64) return fmaEmulated(64, a, b, c);
         if (t.width != 32 || t_.fusedFma) return glsl(tFloat(t.width), GLSLstd450Fma, {a, b, c});
         if (t_.fmaInF64 && t_.float64) {
             const uint32_t d = tFloat(64);
@@ -1302,20 +1310,21 @@ private:
             const uint32_t r = glsl(d, GLSLstd450Fma, {wide(a), wide(b), wide(c)});
             return b_.op(spv::OpFConvert, tFloat(32), {r});
         }
-        return fmaFromF32(a, b, c);
+        return fmaEmulated(32, a, b, c);
     }
 
-    // fma from f32 operations (all NoContraction): the product's exact error by Veltkamp
+    // fma from f32 (f64) operations (all NoContraction): the product's exact error by Veltkamp
     // splitting (Dekker's TwoProduct), the sum's by TwoSum, then one final rounding of the
     // small terms. Exact where error-free transformations need it (c = -RN(a b): the result is
     // the product's error), faithful otherwise; outside the safe range (|a|, |b| >= 2^100,
-    // infinities, NaN) it degrades to a * b + c.
-    uint32_t fmaFromF32(uint32_t a, uint32_t b, uint32_t c) {
-        const uint32_t f = tFloat(32);
+    // 2^500 for f64, infinities, NaN) it degrades to a * b + c.
+    uint32_t fmaEmulated(uint32_t width, uint32_t a, uint32_t b, uint32_t c) {
+        const uint32_t f = tFloat(width);
         auto mul = [&](uint32_t x, uint32_t y) { return b_.op(spv::OpFMul, f, {x, y}); };
         auto add = [&](uint32_t x, uint32_t y) { return b_.op(spv::OpFAdd, f, {x, y}); };
         auto sub = [&](uint32_t x, uint32_t y) { return b_.op(spv::OpFSub, f, {x, y}); };
-        const uint32_t splitter = b_.constFloat(32, 0x45801000);  // 2^12 + 1
+        const uint32_t splitter = width == 64 ? b_.constFloat(64, 0x41A0000002000000ull)  // 2^27 + 1
+                                              : b_.constFloat(32, 0x45801000);           // 2^12 + 1
         auto split = [&](uint32_t x, uint32_t& hi, uint32_t& lo) {
             const uint32_t s = mul(splitter, x);
             hi = sub(s, sub(s, x));
@@ -1331,7 +1340,8 @@ private:
         const uint32_t err = add(sub(p, sub(s, bb)), sub(c, bb));
         const uint32_t r = add(s, add(e, err));
         // safe range: |a|, |b| < 2^100 and a finite result (else the plain a * b + c)
-        const uint32_t limit = b_.constFloat(32, 0x71800000);  // 2^100
+        const uint32_t limit = width == 64 ? b_.constFloat(64, 0x5F30000000000000ull)  // 2^500
+                                           : b_.constFloat(32, 0x71800000);           // 2^100
         auto below = [&](uint32_t x) {
             return b_.op(spv::OpFOrdLessThan, tBool(), {glsl(f, GLSLstd450FAbs, {x}), limit});
         };
@@ -1872,14 +1882,19 @@ private:
         expectOperands(ins, 3);
         const PtxType t = typeOf(ins);
         if (!t.isInt() || (t.width != 32 && t.width != 64)) fail(ins, "32/64-bit integer expected");
+        const bool sub = ins.opcode == "sub" || ins.opcode == "subc";
+        const bool useCarry = ins.opcode == "addc" || ins.opcode == "subc";
+        const uint32_t a = value(ins, ins.operands[1], t), b = value(ins, ins.operands[2], t);
+        storeReg(ins, dstReg(ins).name, t, addWithCarry(t, a, b, sub, useCarry, ins.has(".cc")));
+    }
+
+    // a + b (or a - b), plus the carry flag (minus the borrow) if useCarry; stores the new flag if setCarry.
+    uint32_t addWithCarry(PtxType t, uint32_t a, uint32_t b, bool sub, bool useCarry, bool setCarry) {
         if (!carryVar_) {
             carryVar_ = b_.localVariable(tU32());
             b_.name(carryVar_, "carry");
         }
         const uint32_t w = t.width, type = b_.typeInt(w), pair = structPair(type);
-        const bool sub = ins.opcode == "sub" || ins.opcode == "subc";
-        const bool useCarry = ins.opcode == "addc" || ins.opcode == "subc";
-        const uint32_t a = value(ins, ins.operands[1], t), b = value(ins, ins.operands[2], t);
         auto widen = [&](uint32_t c32) { return w == 64 ? extendTo64(c32, false) : c32; };
         const spv::Op op = sub ? spv::OpISubBorrow : spv::OpIAddCarry;
         uint32_t res = b_.op(op, pair, {a, b});
@@ -1890,8 +1905,8 @@ private:
             r = b_.op(spv::OpCompositeExtract, type, {res2, 0});
             c = b_.op(spv::OpBitwiseOr, type, {c, b_.op(spv::OpCompositeExtract, type, {res2, 1})});
         }
-        if (ins.has(".cc")) b_.opVoid(spv::OpStore, {carryVar_, w == 64 ? truncTo32(c) : c});
-        storeReg(ins, dstReg(ins).name, t, r);
+        if (setCarry) b_.opVoid(spv::OpStore, {carryVar_, w == 64 ? truncTo32(c) : c});
+        return r;
     }
 
     // dp4a.atype.btype d, a, b, c = c + sum of the four byte products
@@ -2279,7 +2294,8 @@ private:
 
     bool usesWarpOps() const {
         for (const ptx::Instruction& ins : fn_.instructions)
-            if (ins.opcode == "shfl" || ins.opcode == "vote" || ins.opcode == "activemask" || ins.opcode == "match")
+            if (ins.opcode == "shfl" || ins.opcode == "vote" || ins.opcode == "activemask" || ins.opcode == "match" ||
+                ins.opcode == "mma" || ins.opcode == "ldmatrix")
                 return true;
         return false;
     }
@@ -2374,6 +2390,125 @@ private:
         if (!d.pairName.empty()) storeReg(ins, d.pairName, {Base::Pred, 1}, pval);
     }
 
+    // Registers of a {...} operand (or a single register).
+    std::vector<const ptx::Operand*> vectorElems(const ptx::Instruction& ins, const ptx::Operand& o, size_t n) {
+        std::vector<const ptx::Operand*> r;
+        if (o.kind == ptx::OperandKind::Vector) {
+            for (const ptx::Operand& e : o.elems) r.push_back(&e);
+        } else {
+            r.push_back(&o);
+        }
+        if (r.size() != n) fail(ins, "expected a vector of " + std::to_string(n) + " registers");
+        return r;
+    }
+
+    // mma.sync.aligned.{m16n8k8,m16n8k16}.row.col.{f32,f16}.{f16,bf16}.{f16,bf16}.{f32,f16} d, a, b, c
+    // Tensor core matrix multiply-accumulate of a warp, emulated with shuffles: each lane gathers
+    // the A row and B column elements of its four outputs from the lanes holding them (fragment
+    // layouts from the PTX ISA) and accumulates in f32.
+    void emitMma(const ptx::Instruction& ins) {
+        if (ins.operands.size() != 4) fail(ins, "mma needs 4 operands");
+        uint32_t k = 0;
+        if (ins.has(".m16n8k8")) k = 8;
+        else if (ins.has(".m16n8k16")) k = 16;
+        else fail(ins, "only the m16n8k8 and m16n8k16 mma shapes are supported");
+        if (!ins.has(".row") || !ins.has(".col")) fail(ins, "mma layout must be .row.col");
+        std::vector<std::string_view> types;  // d, a, b, c
+        for (std::string_view m : ins.mods)
+            if (m == ".f32" || m == ".f16" || m == ".bf16" || m == ".tf32" || m == ".s8" || m == ".u8" || m == ".s32" ||
+                m == ".f64" || m == ".e4m3" || m == ".e5m2")
+                types.push_back(m);
+        if (types.size() != 4 || types[1] != types[2] || (types[1] != ".f16" && types[1] != ".bf16") ||
+            (types[0] != ".f32" && types[0] != ".f16") || (types[3] != ".f32" && types[3] != ".f16"))
+            fail(ins, "only f16/bf16 inputs with f32/f16 accumulators are supported by mma");
+        const bool brain = types[1] == ".bf16", f16d = types[0] == ".f16", f16c = types[3] == ".f16";
+        const uint32_t kBlocks = k / 8;
+        const PtxType bits{Base::Bit, 32}, f32t{Base::Float, 32};
+        const auto dOps = vectorElems(ins, ins.operands[0], f16d ? 2 : 4);
+        const auto aOps = vectorElems(ins, ins.operands[1], 2 * kBlocks);
+        const auto bOps = vectorElems(ins, ins.operands[2], kBlocks);
+        const auto cOps = vectorElems(ins, ins.operands[3], f16c ? 2 : 4);
+
+        const uint32_t f32 = tFloat(32);
+        auto halves = [&](uint32_t word, uint32_t& lo, uint32_t& hi) {
+            if (brain) {
+                lo = b_.op(spv::OpBitcast, f32, {b_.op(spv::OpShiftLeftLogical, tU32(), {word, cU32(16)})});
+                hi = b_.op(spv::OpBitcast, f32, {b_.op(spv::OpBitwiseAnd, tU32(), {word, cU32(0xFFFF0000u)})});
+            } else {
+                const uint32_t v = glsl(b_.typeVector(f32, 2), GLSLstd450UnpackHalf2x16, {word});
+                lo = b_.op(spv::OpCompositeExtract, f32, {v, 0});
+                hi = b_.op(spv::OpCompositeExtract, f32, {v, 1});
+            }
+        };
+        const uint32_t lane = laneId();
+        const uint32_t quad = b_.op(spv::OpBitwiseAnd, tU32(), {lane, cU32(~3u)});  // 4 * groupID
+        const uint32_t t2 = b_.op(spv::OpShiftLeftLogical, tU32(), {b_.op(spv::OpBitwiseAnd, tU32(), {lane, cU32(3)}), cU32(3)});
+
+        // aRow[r][k]: A[groupID + 8r][k]; bCol[c][k]: B[k][2 threadID_in_group + c]
+        std::vector<uint32_t> aRow[2], bCol[2];
+        for (uint32_t r = 0; r < 2; ++r) aRow[r].resize(k), bCol[r].resize(k);
+        for (uint32_t kb = 0; kb < kBlocks; ++kb) {
+            const uint32_t aRegs[2] = {value(ins, *aOps[2 * kb], bits), value(ins, *aOps[2 * kb + 1], bits)};
+            const uint32_t bReg = value(ins, *bOps[kb], bits);
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t kk = 8 * kb + 2 * j;
+                for (uint32_t r = 0; r < 2; ++r)
+                    halves(warpShuffle(aRegs[r], b_.op(spv::OpIAdd, tU32(), {quad, cU32(j)})), aRow[r][kk], aRow[r][kk + 1]);
+                for (uint32_t c = 0; c < 2; ++c)
+                    halves(warpShuffle(bReg, b_.op(spv::OpIAdd, tU32(), {t2, cU32(4 * c + j)})), bCol[c][kk], bCol[c][kk + 1]);
+            }
+        }
+        uint32_t acc[4];  // (row groupID, groupID + 8) x (col 2t, 2t + 1)
+        if (f16c) {
+            for (uint32_t r = 0; r < 2; ++r) halves(value(ins, *cOps[r], bits), acc[2 * r], acc[2 * r + 1]);
+            if (brain) fail(ins, "mma with bf16 inputs accumulates in f32");
+        } else {
+            for (uint32_t i = 0; i < 4; ++i) acc[i] = value(ins, *cOps[i], f32t);
+        }
+        for (uint32_t i = 0; i < 4; ++i)
+            for (uint32_t kk = 0; kk < k; ++kk)
+                acc[i] = b_.op(spv::OpFAdd, f32, {acc[i], b_.op(spv::OpFMul, f32, {aRow[i / 2][kk], bCol[i % 2][kk]})});
+        if (f16d) {
+            for (uint32_t r = 0; r < 2; ++r) {
+                const uint32_t lo = floatToHalfBits(acc[2 * r], false), hi = floatToHalfBits(acc[2 * r + 1], false);
+                storeReg(ins, dOps[r]->name, bits,
+                         b_.op(spv::OpBitwiseOr, tU32(), {lo, b_.op(spv::OpShiftLeftLogical, tU32(), {hi, cU32(16)})}));
+            }
+        } else {
+            for (uint32_t i = 0; i < 4; ++i) storeReg(ins, dOps[i]->name, f32t, acc[i]);
+        }
+    }
+
+    // ldmatrix.sync.aligned.m8n8.{x1,x2,x4}{.trans}.shared.b16 d, [a]: lanes 8j..8j+7 hold the row
+    // addresses of matrix j; each lane receives two 16-bit elements of every matrix.
+    void emitLdmatrix(const ptx::Instruction& ins) {
+        if (ins.operands.size() != 2) fail(ins, "ldmatrix needs 2 operands");
+        if (!ins.has(".m8n8") || !ins.has(".b16") || !ins.has(".shared")) fail(ins, "only ldmatrix.m8n8.shared.b16 is supported");
+        const uint32_t n = ins.has(".x4") ? 4 : ins.has(".x2") ? 2 : 1;
+        const bool trans = ins.has(".trans");
+        const auto dOps = vectorElems(ins, ins.operands[0], n);
+        const uint32_t addr = address(ins, ins.operands[1], Space::Shared);
+        const uint32_t lane = laneId();
+        const uint32_t row = b_.op(spv::OpShiftRightLogical, tU32(), {lane, cU32(2)});  // 0..7
+        const uint32_t quarter = b_.op(spv::OpBitwiseAnd, tU32(), {lane, cU32(3)});
+        const PtxType b32{Base::Bit, 32}, b16{Base::Bit, 16};
+        for (uint32_t j = 0; j < n; ++j) {
+            uint32_t word;
+            if (!trans) {  // row `row`, columns 2 quarter, 2 quarter + 1
+                const uint32_t rowAddr = warpShuffle(addr, b_.op(spv::OpIAdd, tU32(), {row, cU32(8 * j)}));
+                word = loadWords(Space::Shared, b_.op(spv::OpIAdd, tU32(), {rowAddr, b_.op(spv::OpShiftLeftLogical, tU32(), {quarter, cU32(2)})}), b32);
+            } else {  // column `row`, rows 2 quarter and 2 quarter + 1
+                const uint32_t r0 = b_.op(spv::OpIAdd, tU32(), {b_.op(spv::OpShiftLeftLogical, tU32(), {quarter, cU32(1)}), cU32(8 * j)});
+                const uint32_t col = b_.op(spv::OpShiftLeftLogical, tU32(), {row, cU32(1)});
+                const uint32_t a0 = warpShuffle(addr, r0), a1 = warpShuffle(addr, b_.op(spv::OpIAdd, tU32(), {r0, cU32(1)}));
+                const uint32_t lo = loadWords(Space::Shared, b_.op(spv::OpIAdd, tU32(), {a0, col}), b16);
+                const uint32_t hi = loadWords(Space::Shared, b_.op(spv::OpIAdd, tU32(), {a1, col}), b16);
+                word = b_.op(spv::OpBitwiseOr, tU32(), {lo, b_.op(spv::OpShiftLeftLogical, tU32(), {hi, cU32(16)})});
+            }
+            storeReg(ins, dOps[j]->name, b32, word);
+        }
+    }
+
     // vote{.sync}.{all,any,uni}.pred d, {!}p{, mask}   vote{.sync}.ballot.b32 d, {!}p{, mask}
     void emitVote(const ptx::Instruction& ins) {
         const bool sync = ins.has(".sync");
@@ -2426,7 +2561,8 @@ private:
 
     void emitInstruction(const ptx::Instruction& ins) {
         const std::string_view op = ins.opcode;
-        if (op != "cvt" && op != "ld" && op != "st" && op != "mov" && op != "atom" && op != "red") {
+        if (op != "cvt" && op != "ld" && op != "st" && op != "mov" && op != "atom" && op != "red" && op != "mma" &&
+            op != "ldmatrix") {
             if (const Half h = halfOf(ins); h != Half::None) {
                 if (op == "setp" || op == "set") emitHalfCompare(ins, h);
                 else emitHalfArith(ins, h);
@@ -2443,7 +2579,7 @@ private:
         else if (op == "mul") {
             if (typeOf(ins).isFloat()) emitBinary(ins);
             else emitMul(ins, false);
-        } else if (op == "mad") emitMul(ins, true);
+        } else if (op == "mad" || op == "madc") emitMul(ins, true);
         else if (op == "fma") emitFma(ins);
         else if (op == "not" || op == "neg" || op == "abs") emitUnary(ins);
         else if (op == "shl" || op == "shr") emitShift(ins);
@@ -2471,6 +2607,8 @@ private:
         else if (op == "brkpt" || op == "pmevent" || op == "nanosleep") {}  // no effect here
         else if (op == "set") emitSet(ins);
         else if (op == "shfl") emitShfl(ins);
+        else if (op == "mma") emitMma(ins);
+        else if (op == "ldmatrix") emitLdmatrix(ins);
         else if (op == "vote") emitVote(ins);
         else if (op == "activemask") emitActivemask(ins);
         else if (op == "match") emitMatch(ins);

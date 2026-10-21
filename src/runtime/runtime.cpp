@@ -579,15 +579,39 @@ cudaError_t CUDARTAPI cudaFree(void* devPtr) {
     return record(cuMemFree(reinterpret_cast<CUdeviceptr>(devPtr)));
 }
 
-// Stream-ordered allocation: allocated right away; freed once the stream's work is done.
-cudaError_t CUDARTAPI cudaMallocAsync(void** devPtr, size_t size, cudaStream_t stream) { return cudaMalloc(devPtr, size); }
+// Stream-ordered allocation (the driver allocates right away and frees once the stream's
+// work is done, without waiting).
+cudaError_t CUDARTAPI cudaMallocFromPoolAsync(void** devPtr, size_t size, cudaMemPool_t pool, cudaStream_t stream) {
+    ENTER();
+    if (!devPtr) return record(cudaErrorInvalidValue);
+    if (size == 0) {
+        *devPtr = nullptr;
+        return cudaSuccess;
+    }
+    CUdeviceptr p = 0;
+    const CUresult r = pool ? cuMemAllocFromPoolAsync(&p, size, pool, stream) : cuMemAllocAsync(&p, size, stream);
+    if (r) return record(r == CUDA_ERROR_OUT_OF_MEMORY ? cudaErrorMemoryAllocation : toCudaError(r));
+    *devPtr = reinterpret_cast<void*>(p);
+    return cudaSuccess;
+}
+
+cudaError_t CUDARTAPI cudaMallocAsync(void** devPtr, size_t size, cudaStream_t stream) {
+    return cudaMallocFromPoolAsync(devPtr, size, nullptr, stream);
+}
 
 cudaError_t CUDARTAPI cudaFreeAsync(void* devPtr, cudaStream_t stream) {
     ENTER();
     if (!devPtr) return cudaSuccess;
-    if (CUresult r = cuStreamSynchronize(stream)) return record(r);
-    return record(cuMemFree(reinterpret_cast<CUdeviceptr>(devPtr)));
+    return record(cuMemFreeAsync(reinterpret_cast<CUdeviceptr>(devPtr), stream));
 }
+
+cudaError_t CUDARTAPI cudaMallocAsync_ptsz(void** devPtr, size_t size, cudaStream_t stream) {
+    return cudaMallocAsync(devPtr, size, stream);
+}
+cudaError_t CUDARTAPI cudaMallocFromPoolAsync_ptsz(void** devPtr, size_t size, cudaMemPool_t pool, cudaStream_t stream) {
+    return cudaMallocFromPoolAsync(devPtr, size, pool, stream);
+}
+cudaError_t CUDARTAPI cudaFreeAsync_ptsz(void* devPtr, cudaStream_t stream) { return cudaFreeAsync(devPtr, stream); }
 
 cudaError_t CUDARTAPI cudaMallocHost(void** ptr, size_t size) {
     ENTER();
@@ -756,13 +780,14 @@ cudaError_t CUDARTAPI cudaMallocManaged(void** devPtr, size_t size, unsigned int
     ENTER();
     return record(cudaErrorNotSupported);
 }
+// Registration is bookkeeping in the driver; mapped registrations (device access) fail.
 cudaError_t CUDARTAPI cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    return record(cuMemHostRegister(ptr, size, flags));
 }
 cudaError_t CUDARTAPI cudaHostUnregister(void* ptr) {
     ENTER();
-    return record(cudaErrorHostMemoryNotRegistered);
+    return record(cuMemHostUnregister(ptr));
 }
 cudaError_t CUDARTAPI cudaHostGetDevicePointer(void** pDevice, void* pHost, unsigned int flags) {
     ENTER();
@@ -1225,34 +1250,50 @@ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventHan
     return record(cudaErrorNotSupported);
 }
 
-// ---- memory pools: one default pool per device, plain allocations underneath ------------------------
+// ---- memory pools (the driver's; the runtime types share the driver's layouts) --------------------
 
 cudaError_t CUDARTAPI cudaDeviceGetDefaultMemPool(cudaMemPool_t* pool, int device) {
     ENTER();
-    if (!pool) return record(cudaErrorInvalidValue);
-    static char pools[64];
-    if (device < 0 || device >= 64) return record(cudaErrorInvalidDevice);
-    *pool = reinterpret_cast<cudaMemPool_t>(&pools[device]);
-    return cudaSuccess;
+    return record(cuDeviceGetDefaultMemPool(pool, device));
+}
+cudaError_t CUDARTAPI cudaDeviceGetMemPool(cudaMemPool_t* pool, int device) {
+    ENTER();
+    return record(cuDeviceGetMemPool(pool, device));
+}
+cudaError_t CUDARTAPI cudaDeviceSetMemPool(int device, cudaMemPool_t pool) {
+    ENTER();
+    return record(cuDeviceSetMemPool(device, pool));
+}
+cudaError_t CUDARTAPI cudaMemPoolCreate(cudaMemPool_t* pool, const CUmemPoolProps* props) {
+    ENTER();
+    return record(cuMemPoolCreate(pool, props));
+}
+cudaError_t CUDARTAPI cudaMemPoolDestroy(cudaMemPool_t pool) {
+    ENTER();
+    return record(cuMemPoolDestroy(pool));
 }
 cudaError_t CUDARTAPI cudaMemPoolGetAttribute(cudaMemPool_t pool, int attr, void* value) {
     ENTER();
-    if (!pool || !value) return record(cudaErrorInvalidValue);
-    // thresholds, reuse flags and usage counters: all 0 (64-bit for the byte counters)
-    std::memset(value, 0, attr >= 4 ? sizeof(uint64_t) : sizeof(int));
-    return cudaSuccess;
+    return record(cuMemPoolGetAttribute(pool, CUmemPool_attribute(attr), value));
 }
 cudaError_t CUDARTAPI cudaMemPoolSetAttribute(cudaMemPool_t pool, int attr, void* value) {
     ENTER();
-    return pool ? cudaSuccess : record(cudaErrorInvalidValue);
+    return record(cuMemPoolSetAttribute(pool, CUmemPool_attribute(attr), value));
 }
-cudaError_t CUDARTAPI cudaMemPoolSetAccess(cudaMemPool_t pool, const void* descList, size_t count) {
+cudaError_t CUDARTAPI cudaMemPoolSetAccess(cudaMemPool_t pool, const CUmemAccessDesc* descList, size_t count) {
     ENTER();
-    return pool ? cudaSuccess : record(cudaErrorInvalidValue);
+    return record(cuMemPoolSetAccess(pool, descList, count));
+}
+cudaError_t CUDARTAPI cudaMemPoolGetAccess(int* flags, cudaMemPool_t pool, CUmemLocation* location) {
+    ENTER();
+    CUmemAccess_flags f;
+    if (CUresult r = cuMemPoolGetAccess(&f, pool, location)) return record(r);
+    if (flags) *flags = int(f);
+    return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaMemPoolTrimTo(cudaMemPool_t pool, size_t minBytesToKeep) {
     ENTER();
-    return pool ? cudaSuccess : record(cudaErrorInvalidValue);
+    return record(cuMemPoolTrimTo(pool, minBytesToKeep));
 }
 
 cudaError_t CUDARTAPI cudaPointerGetAttributes(struct cudaPointerAttributes* attributes, const void* ptr) {

@@ -2,6 +2,8 @@
 
 #include "common/log.h"
 
+#include <algorithm>
+
 namespace vulkanizer::driver {
 
 Driver& Driver::get() {
@@ -32,6 +34,10 @@ CUresult Driver::init() {
         slot->primary.device = slot->ordinal;
         slot->primary.primary = true;
         liveHandles_.insert(&slot->primary);
+        slot->defaultPool.device = slot->ordinal;
+        slot->defaultPool.props.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
+        slot->defaultPool.props.location = {CU_MEM_LOCATION_TYPE_DEVICE, slot->ordinal};
+        liveHandles_.insert(&slot->defaultPool);
         slots_.push_back(std::move(slot));
     }
     initialized_.store(true, std::memory_order_release);
@@ -93,13 +99,51 @@ bool validStream(CUstream stream) {
     return stream == nullptr || stream == CU_STREAM_LEGACY || stream == CU_STREAM_PER_THREAD || validHandle(stream);
 }
 
+VmReservation* findReservation(DeviceSlot& slot, CUdeviceptr ptr) {
+    auto it = slot.reservations.upper_bound(ptr);
+    if (it == slot.reservations.begin()) return nullptr;
+    --it;
+    return ptr - it->first < it->second.size ? &it->second : nullptr;
+}
+
 bool findAllocation(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, AllocRef& out) {
     auto it = slot.allocations.upper_bound(ptr);
-    if (it == slot.allocations.begin()) return false;
-    --it;
-    const VkDeviceSize offset = ptr - it->first;
-    if (offset >= it->second.size || bytes > it->second.size - offset) return false;
-    out = {&it->second, it->first, offset};
+    if (it != slot.allocations.begin()) {
+        --it;
+        const VkDeviceSize offset = ptr - it->first;
+        if (offset < it->second.size && bytes <= it->second.size - offset) {
+            out = {&it->second, it->first, offset};
+            return true;
+        }
+    }
+    if (VmReservation* res = findReservation(slot, ptr)) {
+        const size_t i = (ptr - res->base) / res->chunkSize;
+        vk::Buffer& chunk = res->chunks[i];
+        const VkDeviceSize offset = ptr - chunk.address;
+        if (bytes > chunk.size - offset) return false;
+        out = {&chunk, chunk.address, offset};
+        return true;
+    }
+    return false;
+}
+
+bool findPieces(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, std::vector<AllocPiece>& out) {
+    out.clear();
+    AllocRef ref;
+    if (findAllocation(slot, ptr, bytes, ref)) {
+        out.push_back({ref, 0, bytes});
+        return true;
+    }
+    VmReservation* res = findReservation(slot, ptr);
+    if (!res || bytes > res->base + res->size - ptr) return false;
+    for (size_t at = 0; at < bytes;) {
+        const CUdeviceptr p = ptr + at;
+        vk::Buffer& chunk = res->chunks[(p - res->base) / res->chunkSize];
+        const VkDeviceSize offset = p - chunk.address;
+        const size_t n = std::min<size_t>(bytes - at, chunk.size - offset);
+        out.push_back({{&chunk, chunk.address, offset}, at, n});
+        at += n;
+    }
     return true;
 }
 

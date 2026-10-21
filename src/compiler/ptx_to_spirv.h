@@ -25,6 +25,7 @@ struct Target {
     bool integerDotProduct = false;  // OpSDot/OpUDot/OpSUDot on packed 4x8-bit vectors
     bool fusedFma = false;           // the driver's Fma rounds once; otherwise f32 fma is emulated:
     bool fmaInF64 = false;           // in f64 (else with f32 TwoProduct/TwoSum)
+    bool fusedFma64 = false;         // the same for f64 Fma; otherwise emulated with f64 TwoProduct/TwoSum
 };
 
 // Kernel ABI (see plan.md):

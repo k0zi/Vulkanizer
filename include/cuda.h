@@ -37,6 +37,9 @@ typedef struct CUmod_st* CUmodule;
 typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef struct CUevent_st* CUevent;
+typedef struct CUmemPoolHandle_st* CUmemoryPool;
+typedef unsigned long long CUmemGenericAllocationHandle_v1;
+typedef CUmemGenericAllocationHandle_v1 CUmemGenericAllocationHandle;
 
 typedef struct CUuuid_st {
     char bytes[16];
@@ -86,6 +89,8 @@ typedef enum cudaError_enum {
     CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE = 708,
     CUDA_ERROR_CONTEXT_IS_DESTROYED = 709,
     CUDA_ERROR_ASSERT = 710,
+    CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED = 712,
+    CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 713,
     CUDA_ERROR_LAUNCH_FAILED = 719,
     CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE = 720,
     CUDA_ERROR_NOT_PERMITTED = 800,
@@ -135,8 +140,16 @@ typedef enum CUdevice_attribute_enum {
     CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR = 82,
     CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY = 83,
     CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD = 84,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91,
     CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95,
-    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97
+    CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 97,
+    CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED = 99,
+    CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102,
+    CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED = 103,
+    CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED = 107,
+    CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED = 113,
+    CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 115,
+    CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES = 119
 } CUdevice_attribute;
 
 typedef enum CUfunction_attribute_enum {
@@ -149,8 +162,61 @@ typedef enum CUfunction_attribute_enum {
     CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6,
     CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7,
     CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8,
-    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9
+    CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9,
+    CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET = 10,
+    CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH = 11,
+    CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT = 12,
+    CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH = 13,
+    CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED = 14,
+    CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 15
 } CUfunction_attribute;
+
+typedef enum CUfunc_cache_enum {
+    CU_FUNC_CACHE_PREFER_NONE = 0x00,
+    CU_FUNC_CACHE_PREFER_SHARED = 0x01,
+    CU_FUNC_CACHE_PREFER_L1 = 0x02,
+    CU_FUNC_CACHE_PREFER_EQUAL = 0x03
+} CUfunc_cache;
+
+typedef enum CUlimit_enum {
+    CU_LIMIT_STACK_SIZE = 0x00,
+    CU_LIMIT_PRINTF_FIFO_SIZE = 0x01,
+    CU_LIMIT_MALLOC_HEAP_SIZE = 0x02,
+    CU_LIMIT_DEV_RUNTIME_SYNC_DEPTH = 0x03,
+    CU_LIMIT_DEV_RUNTIME_PENDING_LAUNCH_COUNT = 0x04,
+    CU_LIMIT_MAX_L2_FETCH_GRANULARITY = 0x05,
+    CU_LIMIT_PERSISTING_L2_CACHE_SIZE = 0x06
+} CUlimit;
+
+typedef enum CUmemorytype_enum {
+    CU_MEMORYTYPE_HOST = 0x01,
+    CU_MEMORYTYPE_DEVICE = 0x02,
+    CU_MEMORYTYPE_ARRAY = 0x03,
+    CU_MEMORYTYPE_UNIFIED = 0x04
+} CUmemorytype;
+
+typedef enum CUpointer_attribute_enum {
+    CU_POINTER_ATTRIBUTE_CONTEXT = 1,
+    CU_POINTER_ATTRIBUTE_MEMORY_TYPE = 2,
+    CU_POINTER_ATTRIBUTE_DEVICE_POINTER = 3,
+    CU_POINTER_ATTRIBUTE_HOST_POINTER = 4,
+    CU_POINTER_ATTRIBUTE_P2P_TOKENS = 5,
+    CU_POINTER_ATTRIBUTE_SYNC_MEMOPS = 6,
+    CU_POINTER_ATTRIBUTE_BUFFER_ID = 7,
+    CU_POINTER_ATTRIBUTE_IS_MANAGED = 8,
+    CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9,
+    CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE = 10,
+    CU_POINTER_ATTRIBUTE_RANGE_START_ADDR = 11,
+    CU_POINTER_ATTRIBUTE_RANGE_SIZE = 12,
+    CU_POINTER_ATTRIBUTE_MAPPED = 13,
+    CU_POINTER_ATTRIBUTE_ALLOWED_HANDLE_TYPES = 14,
+    CU_POINTER_ATTRIBUTE_IS_GPU_DIRECT_RDMA_CAPABLE = 15,
+    CU_POINTER_ATTRIBUTE_ACCESS_FLAGS = 16,
+    CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE = 17,
+    CU_POINTER_ATTRIBUTE_MAPPING_SIZE = 18,
+    CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR = 19,
+    CU_POINTER_ATTRIBUTE_MEMORY_BLOCK_ID = 20
+} CUpointer_attribute;
 
 typedef enum CUjit_option_enum {
     CU_JIT_MAX_REGISTERS = 0,
@@ -196,6 +262,231 @@ typedef enum CUdriverProcAddressQueryResult_enum {
     CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT = 2
 } CUdriverProcAddressQueryResult;
 
+/* Virtual memory management and stream-ordered allocation */
+
+typedef enum CUmemLocationType_enum {
+    CU_MEM_LOCATION_TYPE_INVALID = 0x0,
+    CU_MEM_LOCATION_TYPE_DEVICE = 0x1,
+    CU_MEM_LOCATION_TYPE_HOST = 0x2,
+    CU_MEM_LOCATION_TYPE_HOST_NUMA = 0x3,
+    CU_MEM_LOCATION_TYPE_HOST_NUMA_CURRENT = 0x4
+} CUmemLocationType;
+
+typedef enum CUmemAllocationType_enum {
+    CU_MEM_ALLOCATION_TYPE_INVALID = 0x0,
+    CU_MEM_ALLOCATION_TYPE_PINNED = 0x1
+} CUmemAllocationType;
+
+typedef enum CUmemAllocationHandleType_enum {
+    CU_MEM_HANDLE_TYPE_NONE = 0x0,
+    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 0x1,
+    CU_MEM_HANDLE_TYPE_WIN32 = 0x2,
+    CU_MEM_HANDLE_TYPE_WIN32_KMT = 0x4,
+    CU_MEM_HANDLE_TYPE_FABRIC = 0x8
+} CUmemAllocationHandleType;
+
+typedef enum CUmemAccess_flags_enum {
+    CU_MEM_ACCESS_FLAGS_PROT_NONE = 0x0,
+    CU_MEM_ACCESS_FLAGS_PROT_READ = 0x1,
+    CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 0x3
+} CUmemAccess_flags;
+
+typedef enum CUmemAllocationGranularity_flags_enum {
+    CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0x0,
+    CU_MEM_ALLOC_GRANULARITY_RECOMMENDED = 0x1
+} CUmemAllocationGranularity_flags;
+
+typedef enum CUmemPool_attribute_enum {
+    CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES = 1,
+    CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC = 2,
+    CU_MEMPOOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES = 3,
+    CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4,
+    CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 5,
+    CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH = 6,
+    CU_MEMPOOL_ATTR_USED_MEM_CURRENT = 7,
+    CU_MEMPOOL_ATTR_USED_MEM_HIGH = 8
+} CUmemPool_attribute;
+
+typedef struct CUmemLocation_st {
+    CUmemLocationType type;
+    int id;
+} CUmemLocation_v1;
+typedef CUmemLocation_v1 CUmemLocation;
+
+typedef struct CUmemAllocationProp_st {
+    CUmemAllocationType type;
+    CUmemAllocationHandleType requestedHandleTypes;
+    CUmemLocation location;
+    void* win32HandleMetaData;
+    struct {
+        unsigned char compressionType;
+        unsigned char gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char reserved[4];
+    } allocFlags;
+} CUmemAllocationProp_v1;
+typedef CUmemAllocationProp_v1 CUmemAllocationProp;
+
+typedef struct CUmemAccessDesc_st {
+    CUmemLocation location;
+    CUmemAccess_flags flags;
+} CUmemAccessDesc_v1;
+typedef CUmemAccessDesc_v1 CUmemAccessDesc;
+
+typedef struct CUmemPoolProps_st {
+    CUmemAllocationType allocType;
+    CUmemAllocationHandleType handleTypes;
+    CUmemLocation location;
+    void* win32SecurityAttributes;
+    size_t maxSize;
+    unsigned short usage;
+    unsigned char reserved[54];
+} CUmemPoolProps_v1;
+typedef CUmemPoolProps_v1 CUmemPoolProps;
+
+#define CU_MEMHOSTREGISTER_PORTABLE 0x01
+#define CU_MEMHOSTREGISTER_DEVICEMAP 0x02
+#define CU_MEMHOSTREGISTER_IOMEMORY 0x04
+#define CU_MEMHOSTREGISTER_READ_ONLY 0x08
+
+/* Extended launches (cuLaunchKernelEx) */
+
+typedef enum CUlaunchAttributeID_enum {
+    CU_LAUNCH_ATTRIBUTE_IGNORE = 0,
+    CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW = 1,
+    CU_LAUNCH_ATTRIBUTE_COOPERATIVE = 2,
+    CU_LAUNCH_ATTRIBUTE_SYNCHRONIZATION_POLICY = 3,
+    CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION = 4,
+    CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE = 5,
+    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION = 6,
+    CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT = 7,
+    CU_LAUNCH_ATTRIBUTE_PRIORITY = 8,
+    CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN_MAP = 9,
+    CU_LAUNCH_ATTRIBUTE_MEM_SYNC_DOMAIN = 10,
+    CU_LAUNCH_ATTRIBUTE_LAUNCH_COMPLETION_EVENT = 12,
+    CU_LAUNCH_ATTRIBUTE_DEVICE_UPDATABLE_KERNEL_NODE = 13,
+    CU_LAUNCH_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 14
+} CUlaunchAttributeID;
+
+typedef enum CUclusterSchedulingPolicy_enum {
+    CU_CLUSTER_SCHEDULING_POLICY_DEFAULT = 0,
+    CU_CLUSTER_SCHEDULING_POLICY_SPREAD = 1,
+    CU_CLUSTER_SCHEDULING_POLICY_LOAD_BALANCING = 2
+} CUclusterSchedulingPolicy;
+
+typedef enum CUaccessProperty_enum {
+    CU_ACCESS_PROPERTY_NORMAL = 0,
+    CU_ACCESS_PROPERTY_STREAMING = 1,
+    CU_ACCESS_PROPERTY_PERSISTING = 2
+} CUaccessProperty;
+
+typedef struct CUaccessPolicyWindow_st {
+    void* base_ptr;
+    size_t num_bytes;
+    float hitRatio;
+    CUaccessProperty hitProp;
+    CUaccessProperty missProp;
+} CUaccessPolicyWindow_v1;
+typedef CUaccessPolicyWindow_v1 CUaccessPolicyWindow;
+
+typedef union CUlaunchAttributeValue_union {
+    char pad[64];
+    CUaccessPolicyWindow accessPolicyWindow;
+    int cooperative;
+    int syncPolicy;
+    struct {
+        unsigned int x;
+        unsigned int y;
+        unsigned int z;
+    } clusterDim;
+    CUclusterSchedulingPolicy clusterSchedulingPolicyPreference;
+    int programmaticStreamSerializationAllowed;
+    struct {
+        CUevent event;
+        int flags;
+        int triggerAtBlockStart;
+    } programmaticEvent;
+    int priority;
+    unsigned int sharedMemCarveout;
+} CUlaunchAttributeValue;
+
+typedef struct CUlaunchAttribute_st {
+    CUlaunchAttributeID id;
+    char pad[8 - sizeof(CUlaunchAttributeID)];
+    CUlaunchAttributeValue value;
+} CUlaunchAttribute;
+
+typedef struct CUlaunchConfig_st {
+    unsigned int gridDimX;
+    unsigned int gridDimY;
+    unsigned int gridDimZ;
+    unsigned int blockDimX;
+    unsigned int blockDimY;
+    unsigned int blockDimZ;
+    unsigned int sharedMemBytes;
+    CUstream hStream;
+    CUlaunchAttribute* attrs;
+    unsigned int numAttrs;
+} CUlaunchConfig;
+
+/* Tensor maps (TMA, sm_90+): declared for source compatibility, not supported */
+
+typedef struct CUtensorMap_st {
+#if defined(__cplusplus)
+    alignas(64)
+#else
+    _Alignas(64)
+#endif
+        cuuint64_t opaque[16];
+} CUtensorMap;
+
+typedef enum CUtensorMapDataType_enum {
+    CU_TENSOR_MAP_DATA_TYPE_UINT8 = 0,
+    CU_TENSOR_MAP_DATA_TYPE_UINT16,
+    CU_TENSOR_MAP_DATA_TYPE_UINT32,
+    CU_TENSOR_MAP_DATA_TYPE_INT32,
+    CU_TENSOR_MAP_DATA_TYPE_UINT64,
+    CU_TENSOR_MAP_DATA_TYPE_INT64,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT64,
+    CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+    CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ,
+    CU_TENSOR_MAP_DATA_TYPE_TFLOAT32,
+    CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ,
+    CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+    CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
+    CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B
+} CUtensorMapDataType;
+
+typedef enum CUtensorMapInterleave_enum {
+    CU_TENSOR_MAP_INTERLEAVE_NONE = 0,
+    CU_TENSOR_MAP_INTERLEAVE_16B,
+    CU_TENSOR_MAP_INTERLEAVE_32B
+} CUtensorMapInterleave;
+
+typedef enum CUtensorMapSwizzle_enum {
+    CU_TENSOR_MAP_SWIZZLE_NONE = 0,
+    CU_TENSOR_MAP_SWIZZLE_32B,
+    CU_TENSOR_MAP_SWIZZLE_64B,
+    CU_TENSOR_MAP_SWIZZLE_128B,
+    CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
+    CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B,
+    CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B
+} CUtensorMapSwizzle;
+
+typedef enum CUtensorMapL2promotion_enum {
+    CU_TENSOR_MAP_L2_PROMOTION_NONE = 0,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_64B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+} CUtensorMapL2promotion;
+
+typedef enum CUtensorMapFloatOOBfill_enum {
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE = 0,
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+} CUtensorMapFloatOOBfill;
+
 #define CU_STREAM_LEGACY ((CUstream)0x1)
 #define CU_STREAM_PER_THREAD ((CUstream)0x2)
 
@@ -231,6 +522,8 @@ typedef enum CUdriverProcAddressQueryResult_enum {
 #define cuMemsetD8 cuMemsetD8_v2
 #define cuMemsetD16 cuMemsetD16_v2
 #define cuMemsetD32 cuMemsetD32_v2
+#define cuMemHostRegister cuMemHostRegister_v2
+#define cuMemHostGetDevicePointer cuMemHostGetDevicePointer_v2
 #define cuStreamDestroy cuStreamDestroy_v2
 #define cuEventDestroy cuEventDestroy_v2
 
@@ -279,6 +572,8 @@ CUresult CUDAAPI cuCtxGetDevice(CUdevice* device);
 CUresult CUDAAPI cuCtxGetFlags(unsigned int* flags);
 CUresult CUDAAPI cuCtxSynchronize(void);
 CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int* version);
+CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value);
+CUresult CUDAAPI cuCtxGetLimit(size_t* pvalue, CUlimit limit);
 
 /* ------------------------------------------------------------------------ */
 /* Memory management                                                        */
@@ -307,6 +602,46 @@ CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us, size_t N, CUstream hStream);
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream hStream);
 
+CUresult CUDAAPI cuPointerGetAttribute(void* data, CUpointer_attribute attribute, CUdeviceptr ptr);
+CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes, CUpointer_attribute* attributes, void** data,
+                                        CUdeviceptr ptr);
+
+CUresult CUDAAPI cuMemHostRegister(void* p, size_t bytesize, unsigned int Flags);
+CUresult CUDAAPI cuMemHostUnregister(void* p);
+CUresult CUDAAPI cuMemHostGetDevicePointer(CUdeviceptr* pdptr, void* p, unsigned int Flags);
+
+/* Stream-ordered allocation and memory pools */
+CUresult CUDAAPI cuMemAllocAsync(CUdeviceptr* dptr, size_t bytesize, CUstream hStream);
+CUresult CUDAAPI cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream);
+CUresult CUDAAPI cuMemAllocFromPoolAsync(CUdeviceptr* dptr, size_t bytesize, CUmemoryPool pool, CUstream hStream);
+CUresult CUDAAPI cuMemPoolCreate(CUmemoryPool* pool, const CUmemPoolProps* poolProps);
+CUresult CUDAAPI cuMemPoolDestroy(CUmemoryPool pool);
+CUresult CUDAAPI cuMemPoolTrimTo(CUmemoryPool pool, size_t minBytesToKeep);
+CUresult CUDAAPI cuMemPoolSetAttribute(CUmemoryPool pool, CUmemPool_attribute attr, void* value);
+CUresult CUDAAPI cuMemPoolGetAttribute(CUmemoryPool pool, CUmemPool_attribute attr, void* value);
+CUresult CUDAAPI cuMemPoolSetAccess(CUmemoryPool pool, const CUmemAccessDesc* map, size_t count);
+CUresult CUDAAPI cuMemPoolGetAccess(CUmemAccess_flags* flags, CUmemoryPool memPool, CUmemLocation* location);
+CUresult CUDAAPI cuDeviceGetDefaultMemPool(CUmemoryPool* pool_out, CUdevice dev);
+CUresult CUDAAPI cuDeviceGetMemPool(CUmemoryPool* pool, CUdevice dev);
+CUresult CUDAAPI cuDeviceSetMemPool(CUdevice dev, CUmemoryPool pool);
+
+/* Virtual memory management */
+CUresult CUDAAPI cuMemAddressReserve(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr,
+                                     unsigned long long flags);
+CUresult CUDAAPI cuMemAddressFree(CUdeviceptr ptr, size_t size);
+CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop,
+                             unsigned long long flags);
+CUresult CUDAAPI cuMemRelease(CUmemGenericAllocationHandle handle);
+CUresult CUDAAPI cuMemMap(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle,
+                          unsigned long long flags);
+CUresult CUDAAPI cuMemUnmap(CUdeviceptr ptr, size_t size);
+CUresult CUDAAPI cuMemSetAccess(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
+CUresult CUDAAPI cuMemGetAccess(unsigned long long* flags, const CUmemLocation* location, CUdeviceptr ptr);
+CUresult CUDAAPI cuMemGetAllocationGranularity(size_t* granularity, const CUmemAllocationProp* prop,
+                                               CUmemAllocationGranularity_flags option);
+CUresult CUDAAPI cuMemGetAllocationPropertiesFromHandle(CUmemAllocationProp* prop, CUmemGenericAllocationHandle handle);
+CUresult CUDAAPI cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handle, void* addr);
+
 /* ------------------------------------------------------------------------ */
 /* Modules and execution                                                    */
 /* ------------------------------------------------------------------------ */
@@ -322,12 +657,35 @@ CUresult CUDAAPI cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const cha
 
 CUresult CUDAAPI cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc);
 CUresult CUDAAPI cuFuncGetParamInfo(CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize);
+CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value);
+CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config);
+
+CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, CUfunction func, int blockSize,
+                                                             size_t dynamicSMemSize);
+CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* numBlocks, CUfunction func, int blockSize,
+                                                                      size_t dynamicSMemSize, unsigned int flags);
+CUresult CUDAAPI cuOccupancyMaxActiveClusters(int* numClusters, CUfunction func, const CUlaunchConfig* config);
+
+CUresult CUDAAPI cuTensorMapEncodeTiled(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType,
+                                        cuuint32_t tensorRank, void* globalAddress, const cuuint64_t* globalDim,
+                                        const cuuint64_t* globalStrides, const cuuint32_t* boxDim,
+                                        const cuuint32_t* elementStrides, CUtensorMapInterleave interleave,
+                                        CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
+                                        CUtensorMapFloatOOBfill oobFill);
+CUresult CUDAAPI cuTensorMapEncodeIm2col(CUtensorMap* tensorMap, CUtensorMapDataType tensorDataType,
+                                         cuuint32_t tensorRank, void* globalAddress, const cuuint64_t* globalDim,
+                                         const cuuint64_t* globalStrides, const int* pixelBoxLowerCorner,
+                                         const int* pixelBoxUpperCorner, cuuint32_t channelsPerPixel,
+                                         cuuint32_t pixelsPerColumn, const cuuint32_t* elementStrides,
+                                         CUtensorMapInterleave interleave, CUtensorMapSwizzle swizzle,
+                                         CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
 
 CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                                 unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                                 unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream,
                                 void** kernelParams, void** extra);
+CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
 
 /* ------------------------------------------------------------------------ */
 /* Streams and events                                                       */

@@ -70,7 +70,46 @@ struct CUevent_st {
     int32_t timestamp = -1;   // GPU timestamp slot, -1 without timing
 };
 
+// A memory pool (stream-ordered allocation). Allocations come straight from the device; the pool
+// keeps the statistics and attributes applications read back.
+struct CUmemPoolHandle_st {
+    static constexpr uint32_t kMagic = 0x4c4f5053;  // 'SPOL'
+    uint32_t magic = kMagic;
+    CUdevice device = 0;
+    CUmemPoolProps props{};
+    uint64_t releaseThreshold = 0;
+    int reuseFlags[3] = {1, 1, 1};  // CU_MEMPOOL_ATTR_REUSE_*
+    uint64_t usedBytes = 0, usedHigh = 0;
+};
+
+// Physical memory of the virtual memory API (cuMemCreate); the CUmemGenericAllocationHandle
+// points to it. Freed when it is released and no longer mapped.
+struct CUmemAllocation_st {
+    static constexpr uint32_t kMagic = 0x4d454d53;  // 'SMEM'
+    uint32_t magic = kMagic;
+    CUdevice device = 0;
+    CUmemAllocationProp prop{};
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    size_t size = 0;
+    int refs = 1;  // the handle itself plus one per mapping
+};
+
 namespace vulkanizer::driver {
+
+// An address range of cuMemAddressReserve: sparse buffers of `chunkSize` bytes side by side
+// (one buffer is limited to maxBufferSize, 4 GB on RADV).
+struct VmReservation {
+    CUdeviceptr base = 0;
+    size_t size = 0;
+    VkDeviceSize chunkSize = 0;
+    std::vector<vk::Buffer> chunks;
+};
+
+struct VmMapping {
+    size_t size = 0;
+    CUmemAllocation_st* allocation = nullptr;
+    size_t offset = 0;  // into the allocation
+};
 
 struct DeviceSlot {
     CUdevice ordinal = 0;
@@ -80,6 +119,11 @@ struct DeviceSlot {
     int primaryRefs = 0;
     std::map<CUdeviceptr, vk::Buffer> allocations;  // keyed by base address
     size_t allocatedBytes = 0;
+    std::map<CUdeviceptr, CUmemPoolHandle_st*> poolAllocations;  // stream-ordered ones, by pool
+    CUmemPoolHandle_st defaultPool;
+    CUmemPoolHandle_st* currentPool = &defaultPool;
+    std::map<CUdeviceptr, VmReservation> reservations;  // keyed by base address
+    std::map<CUdeviceptr, VmMapping> mappings;          // keyed by mapped address
     vk::Buffer printfBuffer;  // device printf records of the current launch
 };
 
@@ -169,6 +213,17 @@ struct AllocRef {
 };
 // Finds the allocation containing [ptr, ptr + bytes). Caller holds the driver lock.
 bool findAllocation(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, AllocRef& out);
+
+// [ptr, ptr + bytes) as consecutive buffer ranges: a virtual memory reservation consists of
+// several buffers. `at` is the piece's offset within the range.
+struct AllocPiece {
+    AllocRef ref;
+    size_t at = 0, size = 0;
+};
+bool findPieces(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, std::vector<AllocPiece>& out);
+
+// The reservation containing ptr, or nullptr.
+VmReservation* findReservation(DeviceSlot& slot, CUdeviceptr ptr);
 
 CUresult toCuResult(VkResult r);
 

@@ -186,4 +186,27 @@ CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int* version) {
     return CUDA_SUCCESS;
 }
 
+// Limits are remembered and reported back; the kernels do not depend on them (no device-side
+// malloc or stack, and device printf has its own buffer).
+static size_t g_limits[7] = {1024, 1 << 20, 8 << 20, 2, 2048, 64, 0};
+
+CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value) {
+    VULKANIZER_TRACE_API();
+    if (CUresult r = requireInit()) return r;
+    if (!validHandle(currentContext())) return CUDA_ERROR_INVALID_CONTEXT;
+    if (unsigned(limit) >= sizeof g_limits / sizeof g_limits[0]) return CUDA_ERROR_UNSUPPORTED_LIMIT;
+    g_limits[limit] = value;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuCtxGetLimit(size_t* pvalue, CUlimit limit) {
+    VULKANIZER_TRACE_API();
+    if (!pvalue) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = requireInit()) return r;
+    if (!validHandle(currentContext())) return CUDA_ERROR_INVALID_CONTEXT;
+    if (unsigned(limit) >= sizeof g_limits / sizeof g_limits[0]) return CUDA_ERROR_UNSUPPORTED_LIMIT;
+    *pvalue = g_limits[limit];
+    return CUDA_SUCCESS;
+}
+
 }  // extern "C"

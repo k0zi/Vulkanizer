@@ -34,6 +34,8 @@ vulkanizer_cuda_test(ptx_module)
 vulkanizer_cuda_test(vector_add)
 vulkanizer_cuda_test(kernels)
 vulkanizer_cuda_test(fatbin)
+vulkanizer_cuda_test(vmm)
+vulkanizer_cuda_test(warp_matrix)
 vulkanizer_cuda_test(cublas)
 target_link_libraries(cublas PRIVATE vulkanizer_cublas vulkanizer_cublaslt)
 
@@ -56,7 +58,7 @@ set(VULKANIZER_CUDA_TOOLKIT ${PROJECT_SOURCE_DIR}/.cuda CACHE PATH "CUDA toolkit
 if(EXISTS ${VULKANIZER_CUDA_TOOLKIT}/bin/nvcc)
   find_program(VULKANIZER_NVCC_HOST_CXX NAMES g++-13 g++-12 g++-14 g++ REQUIRED)
   set(nvcc_out ${CMAKE_CURRENT_BINARY_DIR}/cuda)
-  foreach(name rt_vector_add rt_features rt_kernels rt_printf)
+  foreach(name rt_vector_add rt_features rt_kernels rt_printf rt_math_f64)
     set(src ${CMAKE_CURRENT_SOURCE_DIR}/cuda/${name}.cu)
     add_custom_command(
       OUTPUT ${nvcc_out}/${name}
@@ -86,6 +88,10 @@ if(EXISTS ${VULKANIZER_CUDA_TOOLKIT}/bin/nvcc)
   set_source_files_properties(cudart_abi/nvidia.cpp PROPERTIES INCLUDE_DIRECTORIES ${VULKANIZER_CUDA_TOOLKIT}/include)
   target_include_directories(cudart_abi PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
   add_test(NAME cudart_abi COMMAND cudart_abi)
+
+  add_executable(cuda_abi cuda_abi/main.cpp cuda_abi/nvidia.cpp cuda_abi/vulkanizer.cpp)
+  set_source_files_properties(cuda_abi/nvidia.cpp PROPERTIES INCLUDE_DIRECTORIES ${VULKANIZER_CUDA_TOOLKIT}/include)
+  add_test(NAME cuda_abi COMMAND cuda_abi)
 else()
   message(STATUS "No CUDA toolkit in ${VULKANIZER_CUDA_TOOLKIT}: nvcc tests disabled (run tools/setup_cuda.sh)")
 endif()

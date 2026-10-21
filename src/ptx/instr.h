@@ -69,10 +69,11 @@ struct Function {
     std::vector<Instruction> instructions;
     std::vector<Label> labels;
     std::vector<LocalVar> locals;  // .local, .shared and call-site .param variables
-    std::deque<std::string> names;  // storage for names created by inlining (stable addresses)
+    std::deque<std::string> names;  // storage for names created by scoping and inlining (stable addresses)
 };
 
-// Parses the instruction stream of `entry`. Nested { } scopes are flattened and calls to
+// Parses the instruction stream of `entry`. Nested { } scopes are flattened (registers they
+// redeclare are renamed) and calls to
 // device functions (.func) are inlined; their .param arguments become local variables.
 bool parseFunctionBody(const Module& module, const Entry& entry, Function& out, ParseError& err);
 

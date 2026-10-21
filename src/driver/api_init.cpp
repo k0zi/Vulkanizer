@@ -79,6 +79,12 @@ static const ErrorInfo kErrors[] = {
     {CUDA_ERROR_LAUNCH_TIMEOUT, "CUDA_ERROR_LAUNCH_TIMEOUT", "the launch timed out and was terminated"},
     {CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE, "CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE", "primary context is active"},
     {CUDA_ERROR_CONTEXT_IS_DESTROYED, "CUDA_ERROR_CONTEXT_IS_DESTROYED", "context is destroyed"},
+    {CUDA_ERROR_ALREADY_MAPPED, "CUDA_ERROR_ALREADY_MAPPED", "resource already mapped"},
+    {CUDA_ERROR_NOT_MAPPED, "CUDA_ERROR_NOT_MAPPED", "resource not mapped"},
+    {CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED, "CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED",
+     "part or all of the requested memory range is already mapped"},
+    {CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED, "CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED",
+     "pointer does not correspond to a registered memory region"},
     {CUDA_ERROR_LAUNCH_FAILED, "CUDA_ERROR_LAUNCH_FAILED", "unspecified launch failure"},
     {CUDA_ERROR_NOT_PERMITTED, "CUDA_ERROR_NOT_PERMITTED", "operation not permitted"},
     {CUDA_ERROR_NOT_SUPPORTED, "CUDA_ERROR_NOT_SUPPORTED", "operation not supported"},
@@ -92,15 +98,20 @@ static const ErrorInfo* findError(CUresult error) {
 }
 
 // Resolves a driver entry point by name. For cudaVersion >= 3.2 the "_v2" ABI
-// variant wins when it exists, mirroring the cuda.h #define mapping.
-// TODO: per-symbol version table (_v3, _ptds/_ptsz variants).
-static void* lookupEntryPoint(const char* symbol, int cudaVersion) {
+// variant wins when it exists, mirroring the cuda.h #define mapping; with the per-thread
+// default stream flag, the "_ptsz"/"_ptds" variant does (where one exists).
+// TODO: per-symbol version table (_v3).
+static void* lookupEntryPoint(const char* symbol, int cudaVersion, cuuint64_t flags) {
     static void* self = [] {
         Dl_info info{};
         if (!dladdr(reinterpret_cast<void*>(&cuInit), &info) || !info.dli_fname) return static_cast<void*>(nullptr);
         return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
     }();
     if (!self || std::strncmp(symbol, "cu", 2) != 0) return nullptr;
+    if (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) {
+        for (const char* suffix : {"_ptsz", "_ptds"})
+            if (void* p = dlsym(self, (std::string(symbol) + suffix).c_str())) return p;
+    }
     if (cudaVersion >= 3020) {
         if (void* p = dlsym(self, (std::string(symbol) + "_v2").c_str())) return p;
     }
@@ -127,7 +138,7 @@ CUresult CUDAAPI cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVer
                                      CUdriverProcAddressQueryResult* symbolStatus) {
     VULKANIZER_TRACE_API();
     if (!symbol || !pfn) return CUDA_ERROR_INVALID_VALUE;
-    *pfn = lookupEntryPoint(symbol, cudaVersion);
+    *pfn = lookupEntryPoint(symbol, cudaVersion, flags);
     if (symbolStatus) *symbolStatus = *pfn ? CU_GET_PROC_ADDRESS_SUCCESS : CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND;
     if (!*pfn) {
         // Very useful for discovering which entry points real applications need.
@@ -266,6 +277,18 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
             *pi = info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || info.isCpu();
             break;
         case CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING: *pi = 1; break;
+        case CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: {  // sparse buffers (api_vmm.cpp)
+            std::lock_guard<std::recursive_mutex> lock(Driver::get().mutex());
+            *pi = Driver::get().ensureDevice(*s) == CUDA_SUCCESS && s->vk->features().sparseBuffers;
+            break;
+        }
+        case CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED:
+        case CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED: *pi = 1; break;
+        case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM:
+        case CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED:
+        case CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED:
+        case CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED:
+        case CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES: *pi = 0; break;
         case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: *pi = major; break;
         case CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: *pi = minor; break;
         case CU_DEVICE_ATTRIBUTE_GLOBAL_L1_CACHE_SUPPORTED:

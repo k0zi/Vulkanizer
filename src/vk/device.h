@@ -41,6 +41,17 @@ struct Features {
     bool timelineSemaphore = false;
     bool integerDotProduct = false;  // SPV_KHR_integer_dot_product (Vulkan 1.3)
     bool fusedFma = false;           // fma() is evaluated with a single rounding (probed)
+    bool fusedFma64 = false;         // the same for f64 fma()
+    bool sparseBuffers = false;      // sparse residency buffers on the compute queue (CUDA VMM)
+    bool addressCaptureReplay = false;  // buffers can be placed at a requested device address
+};
+
+// One page range of a sparse buffer bound to `memory` (or unbound if VK_NULL_HANDLE).
+struct SparseBind {
+    const Buffer* buffer = nullptr;
+    VkDeviceSize offset = 0, size = 0;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memoryOffset = 0;
 };
 
 // Logical device with a single compute queue. Kernel dispatches are recorded into batches
@@ -61,6 +72,19 @@ public:
 
     VkResult allocateBuffer(VkDeviceSize size, Buffer& out);
     void freeBuffer(Buffer& buf);  // waits for recorded work first
+    // Frees the buffer once the work up to `serial` has executed, without waiting for it.
+    void freeBufferAfter(Buffer& buf, uint64_t serial);
+
+    // Virtual memory: sparse buffers (no memory of their own) whose pages are bound to memory
+    // objects. `opaqueAddress` places the buffer (0: anywhere; needs addressCaptureReplay), and
+    // `opaqueOut` receives the value that places another buffer right here.
+    VkDeviceSize sparsePageSize() const { return sparsePageSize_; }
+    VkDeviceSize maxSparseBufferSize() const { return maxSparseBufferSize_; }
+    VkResult createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, Buffer& out, uint64_t& opaqueOut);
+    VkResult allocateMemory(VkDeviceSize size, VkDeviceMemory& out);  // for sparse binding
+    void freeMemory(VkDeviceMemory memory);
+    // Takes effect for the work recorded afterwards; unbinding first waits for the recorded work.
+    VkResult bindSparse(const std::vector<SparseBind>& binds);
 
     // All of these run in queue order with the recorded work. read waits for it and returns the
     // data; write returns once `src` was consumed (small writes are staged and recorded, large
@@ -108,6 +132,7 @@ private:
         VkDeviceSize arenaUsed = 0;
         VkQueryPool profile = VK_NULL_HANDLE;  // VULKANIZER_PROFILE: start/end timestamps per dispatch
         std::vector<const char*> labels;
+        std::vector<const char*> kernels;  // dispatched kernels, named when the device is lost
     };
     static constexpr uint32_t kBatches = 8;
     static constexpr uint32_t kMaxCommandsPerBatch = 64;
@@ -124,6 +149,10 @@ private:
     // Records into the open batch, starting one if needed.
     VkResult record(const std::function<void(VkCommandBuffer)>& commands);
     bool probeFusedFma();
+    bool probeFusedFma64();
+    void probeSparse();
+    void destroyBuffer(Buffer& buf);
+    void reapDeferredFrees();
     VkResult beginBatch();
     bool idleLocked();  // no open batch and every submitted one finished
     VkResult flushLocked();
@@ -149,6 +178,10 @@ private:
     std::vector<int32_t> freeTimestamps_;
     std::vector<uint64_t> timestampSerial_;
     bool profiling_ = false;
+    std::vector<std::pair<uint64_t, Buffer>> deferredFrees_;  // (serial, buffer)
+    VkDeviceSize sparsePageSize_ = 0;
+    VkDeviceSize maxSparseBufferSize_ = 0;
+    uint32_t sparseMemoryTypes_ = 0;
     std::recursive_mutex mutex_;
 };
 

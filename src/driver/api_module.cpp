@@ -235,6 +235,7 @@ compiler::Target targetFor(const DeviceSlot& slot) {
     t.integerDotProduct = f.integerDotProduct;
     t.fusedFma = f.fusedFma || envFlag("VULKANIZER_FAST_FMA");
     t.fmaInF64 = envFlag("VULKANIZER_FMA_F64");
+    t.fusedFma64 = f.fusedFma64 || envFlag("VULKANIZER_FAST_FMA");
     return t;
 }
 
@@ -542,6 +543,114 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
                                         static_cast<uint32_t>(push.size()), f->entry->name.c_str());
     if (vr == VK_SUCCESS && printf) flushDevicePrintf(*s.slot, *f->module);  // read() waits for the kernel
     return toCuResult(vr);
+}
+
+CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+    VULKANIZER_TRACE_API();
+    if (!config || (config->numAttrs && !config->attrs)) return CUDA_ERROR_INVALID_VALUE;
+    for (unsigned int i = 0; i < config->numAttrs; ++i) {
+        const CUlaunchAttribute& a = config->attrs[i];
+        if (a.id == CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION &&
+            uint64_t(a.value.clusterDim.x) * a.value.clusterDim.y * a.value.clusterDim.z > 1)
+            return CUDA_ERROR_NOT_SUPPORTED;  // thread block clusters (sm_90)
+        if (a.id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE && a.value.cooperative)
+            VULKANIZER_WARN_ONCE("cuLaunchKernelEx: cooperative launches run without grid-wide synchronization");
+        // Everything else is a scheduling hint, or ordering that the single queue gives anyway.
+    }
+    return cuLaunchKernel(f, config->gridDimX, config->gridDimY, config->gridDimZ, config->blockDimX, config->blockDimY,
+                          config->blockDimZ, config->sharedMemBytes, config->hStream, kernelParams, extra);
+}
+
+CUresult CUDAAPI cuLaunchKernelEx_ptsz(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
+    return cuLaunchKernelEx(config, f, kernelParams, extra);
+}
+
+CUresult CUDAAPI cuLaunchKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                     unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                                     unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
+    return cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream,
+                          kernelParams, extra);
+}
+
+// The shared memory limit is the device's in any case (cuLaunchKernel checks it); the other
+// attributes are hints.
+CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value) {
+    VULKANIZER_TRACE_API();
+    if (!validHandle(hfunc)) return CUDA_ERROR_INVALID_HANDLE;
+    if (attrib == CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) {
+        int limit = 0;
+        if (CUresult r = cuFuncGetAttribute(&limit, attrib, hfunc)) return r;
+        if (value < 0 || value > limit) return CUDA_ERROR_INVALID_VALUE;
+    }
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config) {
+    VULKANIZER_TRACE_API();
+    return validHandle(hfunc) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_HANDLE;
+}
+
+// Resident blocks per multiprocessor by threads and shared memory, as the runtime computes it.
+CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* numBlocks, CUfunction func, int blockSize,
+                                                                      size_t dynamicSMemSize, unsigned int flags) {
+    VULKANIZER_TRACE_API();
+    if (!numBlocks || blockSize <= 0) return CUDA_ERROR_INVALID_VALUE;
+    if (!validHandle(func)) return CUDA_ERROR_INVALID_HANDLE;
+    int threadsPerSm = 0, smemPerSm = 0, staticSmem = 0;
+    const CUdevice dev = func->module->ctx->device;
+    if (CUresult r = cuDeviceGetAttribute(&threadsPerSm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev)) return r;
+    if (CUresult r = cuDeviceGetAttribute(&smemPerSm, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, dev))
+        return r;
+    if (CUresult r = cuFuncGetAttribute(&staticSmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func)) return r;
+    constexpr int kBlocksPerSm = 32;
+    int n = std::min(threadsPerSm / blockSize, kBlocksPerSm);
+    if (const size_t smem = size_t(staticSmem) + dynamicSMemSize) n = std::min<int>(n, int(size_t(smemPerSm) / smem));
+    *numBlocks = std::max(n, 0);
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, CUfunction func, int blockSize,
+                                                             size_t dynamicSMemSize) {
+    return cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, func, blockSize, dynamicSMemSize, 0);
+}
+
+// Clusters of one block (the only size there is): one per multiprocessor at least.
+CUresult CUDAAPI cuOccupancyMaxActiveClusters(int* numClusters, CUfunction func, const CUlaunchConfig* config) {
+    VULKANIZER_TRACE_API();
+    if (!numClusters || !config) return CUDA_ERROR_INVALID_VALUE;
+    if (!validHandle(func)) return CUDA_ERROR_INVALID_HANDLE;
+    for (unsigned int i = 0; i < config->numAttrs; ++i) {
+        const CUlaunchAttribute& a = config->attrs[i];
+        if (a.id == CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION &&
+            uint64_t(a.value.clusterDim.x) * a.value.clusterDim.y * a.value.clusterDim.z > 1) {
+            *numClusters = 0;
+            return CUDA_SUCCESS;
+        }
+    }
+    int perSm = 0, sms = 0;
+    const unsigned threads = config->blockDimX * config->blockDimY * config->blockDimZ;
+    if (CUresult r = cuOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, func, int(threads), config->sharedMemBytes))
+        return r;
+    if (CUresult r = cuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, func->module->ctx->device))
+        return r;
+    *numClusters = perSm * sms;
+    return CUDA_SUCCESS;
+}
+
+// Tensor memory accelerator descriptors (sm_90+): never needed below compute capability 9.0.
+CUresult CUDAAPI cuTensorMapEncodeTiled(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
+                                        const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
+                                        CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill) {
+    VULKANIZER_TRACE_API();
+    return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+CUresult CUDAAPI cuTensorMapEncodeIm2col(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
+                                         const cuuint64_t*, const int*, const int*, cuuint32_t, cuuint32_t,
+                                         const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                                         CUtensorMapL2promotion, CUtensorMapFloatOOBfill) {
+    VULKANIZER_TRACE_API();
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 }  // extern "C"

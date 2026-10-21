@@ -45,6 +45,7 @@ VULKANIZER_BUILD_DIR="$BUILD" "$ROOT/build.sh" --release >/dev/null
 LIB="$BUILD/lib"
 export PYTHONPATH="$ROOT/tools/torch${PYTHONPATH:+:$PYTHONPATH}"
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda
 export LD_PRELOAD="$LIB/libcuda.so.1:$LIB/libcudart.so.12:$LIB/libcublas.so.12:$LIB/libcublasLt.so.12${LD_PRELOAD:+:$LD_PRELOAD}"
 if [[ $GDB -eq 1 ]]; then exec gdb --args "$ENV/bin/python" "$@"; fi
 exec "$ENV/bin/python" "$@"

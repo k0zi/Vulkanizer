@@ -124,6 +124,37 @@ void testOperands() {
     EXPECT(in[7].operands[1].name == "k_p0" && in[7].operands[1].offset == 4);
 }
 
+// A nested scope redeclaring outer registers (CUDA's f64 trig reduction does this in inline
+// asm): inside it the names refer to fresh registers, outside to the original ones.
+void testShadowingScopes() {
+    Parsed p;
+    parse(p, kernel(R"(
+        .reg .b32 %r<4>;
+        mov.u32 %r3, 7;
+        {
+        .reg .u32 %r3, %t;
+        mov.u32 %r3, 1;
+        @%r3 add.u32 %t, %r3, %r1;
+        {
+        .reg .u32 %r3;
+        mov.b64 {%r3, %t}, %r2;
+        }
+        add.u32 %r1, %r3, %t;
+        }
+        add.u32 %r2, %r3, 1;
+    )"));
+    const auto& in = p.fn.instructions;
+    EXPECT(in.size() == 6);
+    const std::string_view inner = in[1].operands[0].name, innermost = in[3].operands[0].elems[0].name;
+    EXPECT(in[0].operands[0].name == "%r3");
+    EXPECT(inner != "%r3" && innermost != "%r3" && inner != innermost);
+    EXPECT(in[2].guard == inner && in[2].operands[1].name == inner && in[2].operands[0].name == "%t");
+    EXPECT(in[2].operands[2].name == "%r1");  // not redeclared: the outer register
+    EXPECT(in[4].operands[1].name == inner && in[4].operands[0].name == "%r1");
+    EXPECT(in[5].operands[1].name == "%r3");  // the scopes are closed again
+    EXPECT(p.fn.regs.size() == 4 + 3);       // %r0..%r3, %t and the two renamed %r3
+}
+
 void testStructurizer() {
     // if-then
     EXPECT(structured(R"(
@@ -228,6 +259,7 @@ int main() {
     testModuleLayout();
     testVectorAdd();
     testOperands();
+    testShadowingScopes();
     testStructurizer();
     std::printf("OK\n");
     return 0;
