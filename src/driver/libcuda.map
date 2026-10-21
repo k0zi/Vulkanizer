@@ -1,0 +1,8 @@
+/* Exported from libcuda.so: the CUDA Driver API and Vulkanizer's extensions (vulkanizer/vulkanizer_ext.h). */
+{
+  global:
+    cu*;
+    vulkanizer*;
+  local:
+    *;
+};

@@ -1,0 +1,8 @@
+/build/
+/.cache/
+compile_commands.json
+/build-ci/
+/.cuda/
+/.work/
+/build-rel/
+__pycache__/

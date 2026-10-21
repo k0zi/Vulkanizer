@@ -1,0 +1,5 @@
+/* Same symbol version as the official libcublasLt.so.12. */
+libcublasLt.so.12 {
+  global: cublasLt*;
+  local: *;
+};

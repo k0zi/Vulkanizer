@@ -1,0 +1,137 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// C = alpha * op(A) * op(B) + beta * C in cuBLAS's column-major convention, for one matrix of a
+// batch (gl_WorkGroupID.z). A, B, C are f32, f16 or bf16; accumulation is f32.
+// Workgroup: 16 x 16 threads, each computing a 4 x 4 block of a 64 x 64 tile of C.
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+// Single elements addressed with 64-bit arithmetic (GLSL array indices are 32-bit).
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ptr { uint64_t v; };
+
+layout(push_constant, std430) uniform Params {
+    uint64_t a, b, c;                 // matrices, or arrays of matrix pointers (kPointerArrays)
+    int64_t strideA, strideB, strideC; // elements between batch entries
+    int m, n, k;
+    int lda, ldb, ldc;
+    float alpha, beta;
+    uint flags;                        // kTransA | kTransB | types | kPointerArrays
+    int batchOffset;                   // first batch entry of this dispatch
+} p;
+
+const uint kTransA = 1u, kTransB = 2u, kPointerArrays = 0x10000u;
+const uint kF32 = 0u, kF16 = 1u, kBF16 = 2u;
+uint typeA() { return (p.flags >> 4) & 15u; }
+uint typeB() { return (p.flags >> 8) & 15u; }
+uint typeC() { return (p.flags >> 12) & 15u; }
+uint elemSize(uint t) { return t == kF32 ? 4u : 2u; }
+
+float load(uint64_t base, int64_t index, uint type) {
+    if (type == kF32) return F32(base + uint64_t(index) * 4ul).v;
+    const uint bits = uint(U16(base + uint64_t(index) * 2ul).v);
+    if (type == kBF16) return uintBitsToFloat(bits << 16);
+    return unpackHalf2x16(bits).x;
+}
+
+uint roundToBits(float f, bool brain) {
+    const uint u = floatBitsToUint(f);
+    if (brain) return isnan(f) ? 0x7FC0u : (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+    // f32 -> f16, round to nearest even
+    const uint sign = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+    if (a > 0x7F800000u) return sign | 0x7E00u;
+    if (a >= 0x477FF000u) return sign | 0x7C00u;
+    uint h;
+    if (a < 0x38800000u) {  // subnormal half
+        const uint e = a >> 23;
+        if (e < 102u) return sign;
+        const uint mant = (a & 0x7FFFFFu) | 0x800000u, s = 126u - e;
+        h = mant >> s;
+        const uint rem = mant & ((1u << s) - 1u), half_ = 1u << (s - 1u);
+        if (rem > half_ || (rem == half_ && (h & 1u) != 0u)) ++h;
+    } else {
+        const uint x = a - (112u << 23);
+        h = x >> 13;
+        const uint rem = x & 0x1FFFu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;
+    }
+    return sign | h;
+}
+
+void store(uint64_t base, int64_t index, uint type, float v) {
+    if (type == kF32) F32(base + uint64_t(index) * 4ul).v = v;
+    else U16(base + uint64_t(index) * 2ul).v = uint16_t(roundToBits(v, type == kBF16));
+}
+
+const int BM = 64, BN = 64, BK = 16;
+shared float As[BK][BM + 1];
+shared float Bs[BK][BN + 1];
+
+void main() {
+    const int batch = int(gl_WorkGroupID.z) + p.batchOffset;
+    uint64_t A = p.a, B = p.b, C = p.c;
+    if ((p.flags & kPointerArrays) != 0u) {
+        A = Ptr(p.a + uint64_t(batch) * 8ul).v;
+        B = Ptr(p.b + uint64_t(batch) * 8ul).v;
+        C = Ptr(p.c + uint64_t(batch) * 8ul).v;
+    } else {
+        A += uint64_t(p.strideA * batch) * elemSize(typeA());
+        B += uint64_t(p.strideB * batch) * elemSize(typeB());
+        C += uint64_t(p.strideC * batch) * elemSize(typeC());
+    }
+    const bool transA = (p.flags & kTransA) != 0u, transB = (p.flags & kTransB) != 0u;
+    const int tileM = int(gl_WorkGroupID.x) * BM, tileN = int(gl_WorkGroupID.y) * BN;
+    const int tx = int(gl_LocalInvocationID.x), ty = int(gl_LocalInvocationID.y);
+    const int tid = ty * 16 + tx;
+
+    float acc[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) acc[i][j] = 0.0;
+
+    for (int k0 = 0; k0 < p.k; k0 += BK) {
+        for (int e = tid; e < BM * BK; e += 256) {
+            // consecutive threads walk along k when A is transposed (contiguous in memory)
+            const int kk = transA ? e % BK : e / BM, mm = transA ? e / BK : e % BM;
+            const int gm = tileM + mm, gk = k0 + kk;
+            float v = 0.0;
+            if (gm < p.m && gk < p.k)
+                v = load(A, transA ? int64_t(gk) + int64_t(gm) * p.lda : int64_t(gm) + int64_t(gk) * p.lda, typeA());
+            As[kk][mm] = v;
+        }
+        for (int e = tid; e < BN * BK; e += 256) {
+            const int kk = transB ? e / BN : e % BK, nn = transB ? e % BN : e / BK;
+            const int gn = tileN + nn, gk = k0 + kk;
+            float v = 0.0;
+            if (gn < p.n && gk < p.k)
+                v = load(B, transB ? int64_t(gn) + int64_t(gk) * p.ldb : int64_t(gk) + int64_t(gn) * p.ldb, typeB());
+            Bs[kk][nn] = v;
+        }
+        barrier();
+        for (int kk = 0; kk < BK; ++kk) {
+            float av[4], bv[4];
+            for (int i = 0; i < 4; ++i) av[i] = As[kk][ty * 4 + i];
+            for (int j = 0; j < 4; ++j) bv[j] = Bs[kk][tx * 4 + j];
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) acc[i][j] += av[i] * bv[j];
+        }
+        barrier();
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        const int gm = tileM + ty * 4 + i;
+        if (gm >= p.m) continue;
+        for (int j = 0; j < 4; ++j) {
+            const int gn = tileN + tx * 4 + j;
+            if (gn >= p.n) continue;
+            const int64_t idx = int64_t(gm) + int64_t(gn) * p.ldc;
+            float v = p.alpha * acc[i][j];
+            if (p.beta != 0.0) v += p.beta * load(C, idx, typeC());  // beta == 0: C may hold garbage
+            store(C, idx, typeC(), v);
+        }
+    }
+}

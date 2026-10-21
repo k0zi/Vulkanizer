@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Does this driver evaluate fma() with a single rounding? With a = 1 + 2^-12 and
+// c = -(1 + 2^-11), a fused fma(a, a, c) is 2^-24; a multiply-then-add gives 0.
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Out { float v; };
+layout(push_constant, std430) uniform Params {
+    Out out_;
+    float a, c;
+} p;
+
+void main() {
+    precise float r = fma(p.a, p.a, p.c);
+    p.out_.v = r;
+}

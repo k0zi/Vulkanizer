@@ -1,0 +1,237 @@
+# Vulkanizer – CUDA Driver API Vulkanon
+
+> Cél: egy `libcuda.so` drop-in csere, ami az alkalmazás felé NVIDIA CUDA drivernek látszik,
+> de minden memóriaműveletet és kernelt Vulkan compute-on futtat. Így CUDA-alapú szoftverek
+> (végső soron AI toolok, pl. PyTorch) olyan GPU-kon is futhatnak, amik nem támogatják a CUDA-t / ROCm-et.
+
+## 1. Architektúra
+
+```
+CUDA alkalmazás (nvcc -cudart shared)
+   ▼
+libcudart.so.12 ◄── Vulkanizer (src/runtime)       ← Runtime API: cudaMalloc, kernel<<<>>>, regisztráció
+   ▼
+libcuda.so.1  ◄── Vulkanizer (src/driver)          ← Driver API: cuInit, cuMemAlloc, cuLaunchKernel, ...
+   ├─ src/vk        Vulkan réteg: instance, device, bufferek (BDA), submit, compute pipeline-ok
+   ├─ src/ptx       PTX lexer + parser (modul → entry-k, paraméterek, később utasítások)
+   ├─ src/compiler  PTX → SPIR-V (Vulkan "Shader" execution model) fordító
+   └─ (később) libcublas.so / libcudnn.so / ... shim-ek saját Vulkan kernelekkel
+```
+
+Betöltés: `LD_LIBRARY_PATH=build/lib` → az app a mi `libcudart.so.12`-nket és `libcuda.so.1`-ünket kapja.
+Az exportált szimbólumokat version script szabályozza (`src/driver/libcuda.map`, csak `cu*`).
+
+### Kulcsdöntések
+
+| Téma | Döntés |
+|---|---|
+| Nyelv | C++20, CMake, nincs külső függőség a Vulkan SDK-n kívül |
+| Header | Saját, clean-room `include/cuda.h` (csak a nyilvános dokumentáció alapján; az enum értékek ABI-kompatibilisek) |
+| Device pointer | `CUdeviceptr` = Vulkan buffer device address (`VK_KHR_buffer_device_address`), így a pointer-aritmetika a kernelben természetes |
+| Allokáció | Egyelőre 1 cuMemAlloc = 1 VkBuffer + dedikált VkDeviceMemory; címtartomány-térkép a pointer → buffer kereséshez |
+| Kernel ABI | A CUDA paraméter-buffer bájtra pontosan a push constant blokkba kerül (≤128/256 B); fölötte később UBO / BDA-s param buffer |
+| Block méret | Specialization constant (ID 0,1,2 = blockDim.x/y/z) → pipeline cache blockDim-enként |
+| Dinamikus shared mem | Specialization constant-tal méretezett workgroup tömb (ID 3, 32 bites szavakban) |
+| Block packing | Barrier és shared memory nélküli kernelnél (natív warpokkal) több kis CUDA block osztozik egy workgroupon: spec constant 4 = K, a workgroup `(K·blockDim.x, y, z)`, a grid `ceil(gridDim.x / K)`; a rács utáni blockok azonnal kilépnek |
+| Végrehajtás | Most minden szinkron (submit + fence wait). Később stream = saját command buffer sor + timeline semaphore |
+| Warp | A CUDA warp mindig 32. Subgroup 32 → direkt map; 64 → subgroup = 2 warp, maszkolt ballot/shuffle; <32 → emuláció shared memorián keresztül (részleges) |
+| Compute capability | Alapból 7.5-öt jelentünk (`VULKANIZER_CC=86` stb. felülírja) – minél alacsonyabb, annál kevesebb PTX feature kell |
+
+### Teszt hardver (fejlesztő gép)
+
+- AMD Radeon (Renoir, Vega/GCN5) iGPU, Mesa RADV – subgroup **64** fix, UMA memória (DEVICE_LOCAL|HOST_VISIBLE)
+- llvmpipe (CPU Vulkan) – subgroup **8** – második, nagyon eltérő célpont (`VULKANIZER_DEVICE=llvmpipe`)
+- Nincs `nvcc` → a teszt PTX-ek a repóban vannak (`tests/data/*.ptx`). Később: `clang -x cuda --cuda-device-only -nocudainc -nocudalib -S` PTX generálásra CUDA SDK nélkül.
+
+## 2. Fázisok és lépések
+
+Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben a javasolt munkasorrend.
+
+### Fázis 0 – Váz ✅
+- [x] CMake projekt, build/test/run/clean scriptek
+- [x] Clean-room `cuda.h` (subset)
+- [x] Vulkan réteg: device választás, BDA bufferek, copy/fill, compute pipeline + dispatch
+- [x] Driver API: init, device query, context (primary + saját), memória, stream/event (szinkron), cuGetProcAddress
+- [x] PTX lexer + modul-szintű parser (.version/.target/.entry + paraméter layout, globálisok)
+- [x] `cuLaunchKernel` végig bekötve – csak a fordító hiányzik (stub)
+- [x] Tesztek: device query, memória, PTX modul, Vulkan BDA dispatch (GLSL), vectorAdd (disabled amíg nincs fordító)
+
+### Fázis 0.5 – Infrastruktúra ✅
+- [x] **0.5.1** `git init`, első commit.
+  Kész, ha: a repo tiszta, a `build/` ignorálva.
+- [x] **0.5.2** `ci.sh`: `./test.sh --all-devices --asan`, majd `--release` build + teszt. GitHub Actions később (llvmpipe-on).
+  Kész, ha: `./ci.sh` egy paranccsal végigfut és 0-val tér vissza.
+- [x] **0.5.3** Opcionális eszközök a README-ben: `clang` (PTX generálás CUDA SDK nélkül), `vulkan-validationlayers`, `ninja`.
+  Kész, ha: a README felsorolja őket telepítési paranccsal.
+- [x] **0.5.4** `tests/data/` konvenció: minden `.ptx` mellé `.cu` forrás és a generáló parancs (fejléc-kommentben).
+  Kész, ha: a `vector_add.ptx` mellett ott a `vector_add.cu`.
+- [x] **0.5.5** `tools/vulkanizer-ptxc`: PTX → SPIR-V CLI, opcionálisan `spirv-dis`/`spirv-val` futtatással. Ez a fordító fő fejlesztői eszköze.
+  Kész, ha: `vulkanizer-ptxc x.ptx -o x.spv` lefut (eleinte a stub hibájával).
+
+### Fázis 1 – Első valódi kernel (`vectorAdd`) ✅
+- [x] **1.1 PTX utasítás-parser**
+  - `.reg` deklarációk (`%r<10>` tartományok is), címkék.
+  - Utasítások: opcode + módosítók (`.s32`, `.rn`, `.global`, `.wide`…), predikátum (`@%p1`, `@!%p1`).
+  - Operandusok: reg, imm, `[addr+off]`, vektor `{a,b}`.
+  Kész, ha: a `tests/ptx_parse.cpp` a `vector_add.ptx` minden utasítását helyesen bontja.
+- [x] **1.2 IR**: alapblokkok utasítás-listával, regiszter = Function storage változó (nincs SSA), CFG (succ/pred).
+  Kész, ha: az IR dumpolható (`vulkanizer-ptxc --dump-ir`), és a CFG helyes a tesztkernelekre.
+- [x] **1.3 SPIR-V emitter alap** (`src/compiler/spirv_builder.{h,cpp}`, SPIRV-Headers `spirv.hpp`)
+  - típus/konstans dedup, `PhysicalStorageBuffer64`;
+  - push constant struct a paraméter-layoutból (`Entry::params`);
+  - spec constant `LocalSize`, builtinek (`%tid`, `%ntid`, `%ctaid`, `%nctaid`).
+  Kész, ha: egy üres kernel `spirv-val`-on átmegy, és a pipeline létrejön.
+- [x] **1.4 Alap utasítások**: `ld.param`, `ld/st.global`, `mov`, `add/sub/mul(.lo/.hi/.wide)/mad`, `setp`, `selp`, `cvt` (int↔int, int↔float), `cvta.to.global`, `shl/shr/and/or/xor/not`, `bra`, `ret`.
+  Kész, ha: mindegyikre van legalább egy PTX teszt.
+- [x] **1.5 Vezérlési folyam strukturálása**
+  - Első kör: if/else és egyszerű loop minták (dominátor-fa + `OpSelectionMerge`/`OpLoopMerge`).
+  - Fallback: "loop + switch" állapotgép tetszőleges CFG-re.
+  Kész, ha: a predikált kilépés és a grid-stride loop helyes eredményt ad.
+- [x] **1.6 Validálás**: debug buildben minden fordítás után `spirv-val --target-env vulkan1.2` (CLI-n át, `VULKANIZER_SPIRV_VAL=1`).
+  Kész, ha: érvénytelen SPIR-V esetén a hiba a logban és a `cuModuleLoadDataEx` error logban is megjelenik.
+- [x] **1.7 Mérföldkő:** a `vector_add` teszt engedélyezve van.
+  Kész, ha: zöld RADV-n és llvmpipe-on.
+- [x] **1.8 Tesztek bővítése**: saxpy, 2D index (`ctaid.y`), predikált kilépés, grid-stride loop, int64 aritmetika.
+  Kész, ha: mind zöld mindkét device-on, ASAN-nal is.
+- [x] **1.9 Fatbin**
+  - a `__cudaFatBinaryWrapper` és a fatbin header parse-olása;
+  - a PTX bejegyzés kiválasztása (a legmagasabb `sm_XX`, ami ≤ a jelentett CC);
+  - LZ4-tömörített változat (saját kis dekóder).
+  Kész, ha: egy kézzel összerakott fatbin (`tests/data`) betölthető és futtatható.
+
+### Fázis 2 – CUDA Runtime kompatibilitás (előrehozva)
+Enélkül egyetlen nvcc-vel fordított, normál bináris sem indul el, ezért a valódi kernel-feature-ök elé került.
+
+**Döntés (2026-10-20):** az NVIDIA libcudart a drivertől két nem dokumentált belső táblát kér
+(`cuGetExportTable`, UUID `6bd5fb6c…` és `f8cff951…`), ezek nélkül nem inicializál. Ezek helyett
+**saját libcudart** készül (`src/runtime`, `libcudart.so.12`), csak a nyilvános Runtime API-ra és az
+nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statikusan linkelő binárisok
+(nvcc alapértelmezés) nem futnak; `-cudart shared`-del fordítottak (és pl. a PyTorch) igen.
+
+- [x] **2.1** `cuGetExportTable` probe: logolja a kért interfészeket és hibát ad.
+- [x] **2.2** Valódi nvcc toolchain helyben (`tools/setup_cuda.sh`, GPU és driver nélkül), az nvcc által generált host stubok
+  (`__cudaRegisterFatBinary`, `__cudaRegisterFunction`, `__cudaPush/PopCallConfiguration`, `cudaLaunchKernel`) feltérképezve.
+- [x] **2.3** Saját libcudart: regisztráció, lusta modul-betöltés eszközönként, launch, eszközök (`cudaDeviceProp`),
+  memória, streamek, eventek, hibakezelés. A típusok clean-room-ok; az ABI-egyezést a `cudart_abi` teszt ellenőrzi a hivatalos fejlécek ellen.
+- [x] **2.4 Mérföldkő:** nvcc-vel fordított programok (`tests/cuda/*.cu`) változtatás nélkül futnak RADV-n és llvmpipe-on.
+- [ ] **2.5** További Runtime API a célalkalmazások igénye szerint:
+  - [x] `__device__`/`__constant__` változók: `__cudaRegisterVar`, `cudaMemcpyTo/FromSymbol`, `cudaGetSymbolAddress/Size`;
+  - [ ] `cudaMallocManaged`, `cudaMemcpy2D`, `cudaPointerGetAttributes`, `cudaOccupancy*`, `cudaLaunchHostFunc`.
+  Kész, ha: a kiválasztott célalkalmazás (4.3) indulásakor nincs hiányzó runtime szimbólum.
+
+### Fázis 3 – Valódi kernelek
+- [x] **3.1** Shared memory: statikus és dinamikus (`extern`, spec constant 3), sub-word store atomikusan; `bar.sync`, `membar`/`fence`.
+- [x] **3.2** Atomics: `atom`/`red` global és shared tárra (add/min/max/inc/dec/exch/cas/and/or/xor, 32/64 bit, f32 CAS-ciklussal).
+  Hiányzik: 64 bites atomics shared memórián.
+- [x] **3.3** Local memory (per-szál word tömb), `.func` hívások PTX-szintű inline-olása, `.global`/`.const` modulváltozók inicializálóval, `cuModuleGetGlobal`, generikus címek (shared/local ablak tag-gel).
+  Hiányzik: rekurzió, indirekt hívás.
+- [x] **3.4 Warp műveletek**: `shfl.sync`, `vote.sync`, `activemask`, `match`, `%lanemask_*`.
+  - subgroup 32 és 64 (RADV): a warp a subgroup 32-es szelete;
+  - subgroup < 32 (llvmpipe): shared memórián át, workgroup barrierrel. Csak akkor helyes, ha az egész blokk egységesen hajtja végre.
+  Hiányzik: `redux` (sm_80).
+- [x] **3.5 Math**
+  - `sqrt/rsqrt/rcp/ex2/lg2/sin/cos/tanh`, `copysign`, `testp`, `popc/clz/brev/bfind/bfe/bfi/prmt/lop3/shf`, carry-láncok, `sad/cnot/slct/set`;
+  - f16/bf16 konverzió és aritmetika (f32-ben, pontos RNE).
+  - Minden float művelet `NoContraction` (a Mesa különben átrendezi, ami elrontotta az `expf`-et).
+  - Az f32 `fma` f64-ben számol (sem a RADV, sem az llvmpipe nem fused, ami elrontotta a `sinf`-et).
+- [ ] **3.6** Textúrák / surface-ek. Alacsony prioritás, csak ha egy célalkalmazás igényli.
+- [x] **3.7 Aszinkron végrehajtás**: a kernelek batch-ekben futnak (command buffer ring, köztük barrier). A host-oldali műveletek előtte kiürítik a sort. Az eventek GPU timestamp-et használnak, a streamek egy queue-n osztoznak.
+  Eredmény: 66 → 7 µs/launch a Renoir iGPU-n.
+  Hiányzik: valódi párhuzamos streamek, host callbackek (`cuLaunchHostFunc`), aszinkron memcpy.
+- [x] **3.8** Ha a grid nagyobb a `maxComputeWorkGroupCount`-nál: `vkCmdDispatchBase`-szel darabolva, a `%nctaid` push constantból jön.
+- [x] **3.9** Ha a paraméter-buffer nem fér el a push constantban: batch-enkénti feltöltési aréna, a push constantban csak a cím megy át. Dinamikus `ld.param` is működik.
+- [ ] **3.10** Kernel cache lemezen. Halasztva: a Mesa saját shader cache-e már gyorsítótárazza a pipeline-okat, a PTX → SPIR-V fordítás pedig gyors. Előbb mérni kell egy nagy alkalmazáson.
+- [x] **3.11 Teszt korpusz** (`tests/cuda/rt_kernels.cu`, CPU referenciával): reduction, tiled matmul, histogram, atomics, warp-műveletek, változók és generikus pointerek, math, bitműveletek, half, device függvényhívások, launch limitek. Plusz `rt_printf`.
+- [x] **3.12** Device oldali `printf` (launch-onkénti buffer, host oldali formázás).
+- [x] **3.13 Korán kilépő szálak és `__syncthreads`**
+  - CUDA-ban a kilépett szálak "megérkezettnek" számítanak a későbbi barriereknél. Vulkanban a barrier csak egységes vezérlésben definiált.
+  - Egy wave-en (AMD: 64 lane = 2 CUDA warp) belül egy szelekció két ágát a driver tetszőleges sorrendben futtathatja.
+    A ggml `flash_attn_tile` kernelében a páratlan warpok shared memóriába írnak, a párosak `__syncthreads` után olvassák;
+    az ACO a barrieres ágat futtatta előbb.
+  - Megoldás: barrieres kernelben ha egy `if`-nek csak az egyik ága szinkronizál (és egyik ág sem ugrik ki magából),
+    a másik ág fut előbb, `if (!c) E; if (c) T` alakban; ha az egyik ág mindig visszatér, az kerül külön szelekcióba előre.
+    Plusz release-fence a kilépéskor.
+  - Eredmény: FLASH_ATTN_EXT 4001/4001 RADV-n; `tools/build_llama.sh --fa`. A tile-kernel pp-ben lassabb (pp512 347 → 209 t/s),
+    tg-ben kicsit gyorsabb (31 → 32), ezért az FA build opcionális.
+
+### Fázis 4 – Könyvtárak és első AI workload
+- [x] **4.1** `libcublas.so.12` shim: saját `cublas_v2.h`, handle/stream/math mode, `Sgemm`, `GemmEx`, batched és strided batched változatok, `StrsmBatched`.
+  A kernelek GLSL-ben vannak (`src/cublas/shaders`), és a `vulkanizerCreateSpirvFunction` driver-bővítésen át futnak.
+  Hiányzik: gyors GEMM (cooperative matrix, jobb tiling), `cublasLt`.
+- [ ] **4.2** `libcublasLt` (kész: matmul, batch, bias/ReLU/GELU epilógus), `libcurand`, `libcufft`. Majd ha a PyTorch kéri.
+- [x] **4.3** Célalkalmazás: a llama.cpp CUDA backendje (`tools/build_llama.sh`).
+- [x] **4.4 Mérföldkő:** a SmolLM2-135M (Q8_0 és Q4_0) szöveget generál a Renoir iGPU-n.
+  - `llama-bench`: pp64 ≈ 227 t/s, tg32 ≈ 25 t/s.
+  - A ggml `test-backend-ops` 12570+ műveletet hasonlít a CPU-hoz, és mind helyes.
+  - Közben előjött hibák: zstd-s fatbin, `dp4a`, `bar.red`, a CUB architektúra-lekérdezése, és egy inicializálatlan kilépési változó a strukturált vezérlésben.
+- [x] **4.5** PyTorch: a `torch.cuda.is_available()` igazra vált, majd egy egyszerű MLP lefut.
+  - A hivatalos wheelekben nincs PTX (csak SASS sm_75…sm_120), ezért a conda-forge CUDA buildje kell
+    (`tools/setup_torch.sh`, PTX `compute_120`); futtatás: `./run_torch.sh`.
+  - Kellett hozzá: a libcudart teljes PyTorch-felülete (stream prioritás, memory pool, library API,
+    driver entry pointok, ...), cuBLAS stubok + `Sgemv`/`SgemmEx`, saját `libcublasLt` (matmul + bias/ReLU/GELU
+    epilógus), `__assertfail` → trap, `.ptr .align` paraméterlayout, f16/bf16 (x2) atomikus add,
+    lusta PTX-törzs tokenizálás (15 MB modul: 300 → 22 ms).
+  - Eredmény: MLP tanítás (Adam, 50 lépés) a CPU-val 6e-8 loss / 5e-7 súly eltéréssel; conv2d, softmax,
+    LayerNorm, embedding, attention (math), Transformer réteg, f16 matmul, scatter/index_add helyes
+    (`tests/torch/`). cuDNN és a fused attention ki van kapcsolva; `cudaErrorAssert` nincs modellezve.
+- [ ] **4.6** llama.cpp teljesítmény: flash attention, CUDA graphs (vagy egyenértékű batch-elés), gyorsabb GEMM/MMQ, összevetés a ggml Vulkan backendjével.
+  - Kész: vektorizált f16 TN GEMM kernel packed-f16 szorzással `COMPUTE_16F`-hez (213 → ~900 GFLOPS);
+    a 64 bites div/rem gyorsútja `DontFlatten`-nel (a driver különben mindig lefuttatta a 64 bites ciklust,
+    pl. soft_max 12 → 3,2 ms); `.relaxed/.acquire/.cg/.cv` hozzáférések volatile-ként (CUB look-back GPU hang).
+  - TinyLlama-1.1B Q4_0 Renoir-on: pp512 125 → ~320 t/s (natív Vulkan 401), tg ~23 t/s (natív 56).
+  - tg: f32-ből emulált fma (a RADV GFX9-en a `precise fma` is mul+add), `dp4a` packed 16 bites
+    szorzással (ahol nincs hardveres dot4), a tétlen sorba írt kis HtoD közvetlen memcpy, block packing
+    a kis, barrier nélküli kerneleknek. TinyLlama tg64 23 → ~30 t/s.
+  - cuBLAS GEMV út (`gemv.comp`) az n = 1 / m = 1 GEMM-ekhez, minden transzponálással, típussal és batch-módban
+    (ggml f16 k=128 batched: 24 → 6,7 ms; a natív 2,5 ms, mert a broadcastolt A-t egyszer olvassa).
+  - Hátra: mmvq (Q4_0 ~1,4×, Q6_K lassabb a natívnál), dequantize + GEMM összevonása,
+    flash attention gyorsítása (a tile kernel pp-ben lassú).
+
+### Fázis 5 – Széles kompatibilitás és teljesítmény
+- [ ] **5.1** cuDNN shim: konvolúció, batchnorm/layernorm, softmax, attention.
+- [ ] **5.2** Unified/managed memory, host-mapped memória (`VK_EXT_external_memory_host`), valódi pinned memória.
+- [ ] **5.3** CUDA Graphs (rögzített command bufferek), cooperative groups, multi-GPU, IPC.
+- [ ] **5.4 Teljesítmény**
+  - sub-allokátor (nagy VkDeviceMemory blokkok);
+  - HOST_CACHED staging a DtoH-hoz;
+  - async copy queue;
+  - profilozó mód (`VULKANIZER_PROFILE`).
+- [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
+
+## 3. Ismert korlátok / kockázatok
+
+- **Statikusan linkelt libcudart** (az nvcc alapértelmezése) nem fut: az NVIDIA runtime a driver nem dokumentált belső tábláit igényli. Megoldás: `-cudart shared` újrafordítás, vagy később a táblák pótlása.
+- **Csak-SASS binárisok** (PTX nélkül) nem futtathatók – nincs reális SASS → SPIR-V út.
+- **Vulkan shader modell**: nincs rekurzió, nincs függvénypointer, structured CF kötelező, kernelből `malloc`/`printf` nincs (printf később emulálható bufferrel).
+- **Warp size ≠ 32** eszközökön a warp-szintű kód lassú vagy részlegesen támogatott.
+- **UVA**: több Vulkan device címtere ütközhet; jelenleg a pointer-keresés a current context device-án belül történik.
+- **DtoH olvasás** write-combined (nem HOST_CACHED) memóriából lassú → később cached staging.
+- **libcudart privát export table-jei** (`cuGetExportTable`) nem dokumentáltak, CUDA verziónként változhatnak → verzió-specifikus kezelés, sok trace-elés.
+- **Jogi**: NVIDIA EULA (CUDA ≥ 11.6) tiltja az SDK kimenetének visszafejtését/átfordítását nem-NVIDIA platformra. Clean-room API implementáció; NVIDIA headert/binárist nem teszünk a repóba. Publikálás előtt jogi átnézés.
+
+## 4. Konfiguráció (környezeti változók)
+
+| Változó | Jelentés |
+|---|---|
+| `VULKANIZER_LOG` | `off`/`error`/`warn` (default)/`info`/`debug`/`trace` – `trace` minden API hívást logol |
+| `VULKANIZER_DEVICE` | Device név részlet (case-insensitive), pl. `radv`, `llvmpipe` |
+| `VULKANIZER_ALLOW_CPU` | `1` = CPU Vulkan device-ok (llvmpipe) is látszanak |
+| `VULKANIZER_VALIDATION` | `1` = Vulkan validation layer bekapcsolása |
+| `VULKANIZER_CC` | Jelentett compute capability, pl. `75`, `86` |
+| `VULKANIZER_SPIRV_VAL` | `1` = minden generált SPIR-V `spirv-val`-on megy át (hibás modul → a kernel nem indítható) |
+| `VULKANIZER_DUMP` | Könyvtár, ahova a generált SPIR-V (`<kernel>.spv`) és a modulok PTX-e (`<hash>.ptx`) kiíródik |
+| `VULKANIZER_CACHE_DIR` | Kernel cache helye (alap: `$XDG_CACHE_HOME/vulkanizer`, `~/.cache/vulkanizer`); `off` kikapcsolja |
+| `VULKANIZER_EAGER` | `1` = a nagy modulok kerneleit is betöltéskor fordítja (alapból csak a ≤16 kerneleseket) |
+| `VULKANIZER_PROFILE` | `1` = kilépéskor kiírja a kernelenkénti GPU-időt és az API-hívásonkénti host-időt |
+| `VULKANIZER_FAST_FMA` | `1` = az f32 `fma` a driver natív (esetleg nem fused) `Fma`-ja, ott is, ahol a próba szerint nem fused (gyorsabb, kevésbé pontos) |
+| `VULKANIZER_FMA_F64` | `1` = a nem fused eszközön az f32 `fma` f64-ben számolódik (alapból f32 TwoProduct/TwoSum emuláció) |
+| `VULKANIZER_NO_PACK` | `1` = nincs block packing (minden CUDA block külön workgroup) |
+| `VULKANIZER_GEMM_F32` | `1` = a cuBLAS `COMPUTE_16F` GEMM-ek is f32 szorzással futnak (alapból packed f16, ha az eszköz tud f16 aritmetikát) |
+
+## 5. Referenciák
+
+- ZLUDA (CUDA → ROCm, Driver API szintű csere) – architektúra minta
+- chipStar (CUDA/HIP → OpenCL/Level Zero SPIR-V)
+- PTX ISA dokumentáció, CUDA Driver API dokumentáció
+- SPIR-V spec + Vulkan environment, SPIRV-Tools (`spirv-val`, `spirv-opt`, `spirv-dis`)
+- VkFFT, llama.cpp/ggml Vulkan backend (GEMM kernel ötletek)

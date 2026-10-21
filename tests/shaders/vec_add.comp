@@ -1,0 +1,24 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// Hand-written stand-in for what the PTX compiler will emit for vecAdd:
+// parameters arrive in the push constant block with the CUDA parameter-buffer
+// layout, pointers are buffer device addresses, blockDim is a spec constant.
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatPtr {
+    float v[];
+};
+
+layout(push_constant, std430) uniform Params {
+    FloatPtr a;  // offset 0
+    FloatPtr b;  // offset 8
+    FloatPtr c;  // offset 16
+    int n;       // offset 24
+} p;
+
+void main() {
+    int i = int(gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x);
+    if (i < p.n) p.c.v[i] = p.a.v[i] + p.b.v[i];
+}
