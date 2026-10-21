@@ -3,6 +3,7 @@
 #include "common/log.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -225,16 +226,26 @@ VkResult Device::init() {
         }
     }
 
-    if (const char* env = std::getenv("VULKANIZER_PROFILE"); env && *env && std::strcmp(env, "0") != 0 && timestamps_) {
+    // Every dispatch is timed: the measurements size the batches and feed VULKANIZER_PROFILE.
+    if (timestamps_) {
         VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qpi.queryCount = 2 * kMaxCommandsPerBatch;
-        profiling_ = true;
+        timing_ = true;
         for (Batch& b : batches_)
-            if (vkCreateQueryPool(device_, &qpi, nullptr, &b.profile) != VK_SUCCESS) profiling_ = false;
-        static std::once_flag once;
-        if (profiling_) std::call_once(once, [] { std::atexit(printProfile); });
+            if (vkCreateQueryPool(device_, &qpi, nullptr, &b.timing) != VK_SUCCESS) timing_ = false;
     }
+    if (const char* env = std::getenv("VULKANIZER_PROFILE"); env && *env && std::strcmp(env, "0") != 0 && timing_) {
+        profiling_ = true;
+        static std::once_flag once;
+        std::call_once(once, [] { std::atexit(printProfile); });
+    }
+    double budgetMs = 50;
+    if (const char* env = std::getenv("VULKANIZER_BATCH_MS"); env && *env) budgetMs = std::atof(env);
+    if (timing_ && budgetMs > 0) batchBudgetNs_ = budgetMs * 1e6;
+    // As with NVIDIA's driver: every launch waits for completion, so errors (and GPU hangs) show
+    // at the launch that caused them.
+    if (const char* env = std::getenv("CUDA_LAUNCH_BLOCKING"); env && std::strcmp(env, "1") == 0) launchBlocking_ = true;
 
     features_.fusedFma = probeFusedFma();
     features_.fusedFma64 = features_.shaderFloat64 && probeFusedFma64();
@@ -260,7 +271,7 @@ Device::~Device() {
     }
     if (timestamps_) vkDestroyQueryPool(device_, timestamps_, nullptr);
     for (Batch& b : batches_)
-        if (b.profile) vkDestroyQueryPool(device_, b.profile, nullptr);
+        if (b.timing) vkDestroyQueryPool(device_, b.timing, nullptr);
     if (fence_) vkDestroyFence(device_, fence_, nullptr);
     if (pool_) vkDestroyCommandPool(device_, pool_, nullptr);
     vkDestroyDevice(device_, nullptr);
@@ -567,7 +578,8 @@ VkResult Device::beginBatch() {
     b.serial = nextSerial_++;
     b.arenaUsed = 0;
     b.kernels.clear();
-    if (profiling_) vkCmdResetQueryPool(b.cmd, b.profile, 0, 2 * kMaxCommandsPerBatch);
+    b.estimateNs = 0;
+    if (timing_) vkCmdResetQueryPool(b.cmd, b.timing, 0, 2 * kMaxCommandsPerBatch);
     open_ = int32_t(nextBatch_);
     nextBatch_ = (nextBatch_ + 1) % kBatches;
     commands_ = 0;
@@ -589,38 +601,61 @@ VkResult Device::flushLocked() {
     return VK_SUCCESS;
 }
 
-void Device::collectProfile(Batch& b) {
-    if (b.labels.empty()) return;
-    std::vector<uint64_t> ticks(2 * b.labels.size());
-    if (vkGetQueryPoolResults(device_, b.profile, 0, uint32_t(ticks.size()), ticks.size() * 8, ticks.data(), 8,
+void Device::collectTimings(Batch& b) {
+    if (b.timed.empty()) return;
+    std::vector<uint64_t> ticks(2 * b.timed.size());
+    if (vkGetQueryPoolResults(device_, b.timing, 0, uint32_t(ticks.size()), ticks.size() * 8, ticks.data(), 8,
                               VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-        std::lock_guard<std::mutex> lock(profileMutex());
-        for (size_t i = 0; i < b.labels.size(); ++i) {
-            ProfileEntry& e = profile()[displayName(b.labels[i])];
-            ++e.count;
-            e.ns += double(ticks[2 * i + 1] - ticks[2 * i]) * timestampPeriodNs_;
-            if (i) profileSpan().gapNs += double(int64_t(ticks[2 * i] - ticks[2 * i - 1])) * timestampPeriodNs_;
+        for (size_t i = 0; i < b.timed.size(); ++i) {
+            const Timed& t = b.timed[i];
+            const double ns = double(int64_t(ticks[2 * i + 1] - ticks[2 * i])) * timestampPeriodNs_;
+            double& rate = nsPerGroup_[t.pipeline];
+            rate = std::max(rate, ns / double(std::max(t.groups, kRateGroups)));
         }
-        ++profileSpan().batches;
-        profileSpan().busyNs += double(ticks.back() - ticks.front()) * timestampPeriodNs_;
+        if (profiling_) {
+            std::lock_guard<std::mutex> lock(profileMutex());
+            for (size_t i = 0; i < b.timed.size(); ++i) {
+                ProfileEntry& e = profile()[displayName(b.timed[i].label)];
+                ++e.count;
+                e.ns += double(ticks[2 * i + 1] - ticks[2 * i]) * timestampPeriodNs_;
+                if (i) profileSpan().gapNs += double(int64_t(ticks[2 * i] - ticks[2 * i - 1])) * timestampPeriodNs_;
+            }
+            ++profileSpan().batches;
+            profileSpan().busyNs += double(ticks.back() - ticks.front()) * timestampPeriodNs_;
+        }
     }
-    b.labels.clear();
+    b.timed.clear();
 }
 
 VkResult Device::waitBatch(Batch& b) {
     const VkResult r = vkWaitForFences(device_, 1, &b.fence, VK_TRUE, UINT64_MAX);
-    if (r == VK_ERROR_DEVICE_LOST) {
-        // Usually a kernel that hung (the kernel driver resets the GPU after its timeout).
+    if (r == VK_ERROR_DEVICE_LOST && !deviceLost_) {
+        // Usually a kernel that hung (the kernel driver resets the GPU after its timeout). The
+        // culprit is the oldest unfinished batch, not necessarily the one waited for.
+        deviceLost_ = true;
+        const Batch* lost = &b;
+        for (const Batch& o : batches_)
+            if (o.pending && o.serial < lost->serial && vkGetFenceStatus(device_, o.fence) != VK_SUCCESS) lost = &o;
         std::string names;
-        for (const char* k : b.kernels) {
-            const std::string n = k ? displayName(k) : std::string("(internal)");
-            if (names.find(n) == std::string::npos) names += "\n  " + n;
+        if (!lost->timed.empty()) {  // every dispatch, with its size
+            for (const Timed& t : lost->timed) {
+                char size[96];
+                std::snprintf(size, sizeof size, "\n  %8llu groups, estimated %8.3f ms: ", (unsigned long long)t.groups,
+                              t.estimateNs * 1e-6);
+                names += size + (t.label ? displayName(t.label) : std::string("(internal)"));
+            }
+        } else {
+            for (const char* k : lost->kernels) {
+                const std::string n = k ? displayName(k) : std::string("(internal)");
+                if (names.find(n) == std::string::npos) names += "\n  " + n;
+            }
         }
-        VULKANIZER_ERROR("Vulkan device lost; the lost batch ran these kernels:%s", names.c_str());
+        VULKANIZER_ERROR("Vulkan device lost; the oldest unfinished batch ran these kernels:%s\n"
+                         "(if the GPU was reset for a timeout, a lower VULKANIZER_BATCH_MS may help)", names.c_str());
     }
     if (r != VK_SUCCESS) return r;
     b.pending = false;
-    collectProfile(b);
+    collectTimings(b);
     completedSerial_ = std::max(completedSerial_, b.serial);
     return VK_SUCCESS;
 }
@@ -676,7 +711,7 @@ bool Device::idleLocked() {
         if (!b.pending) continue;
         if (vkGetFenceStatus(device_, b.fence) != VK_SUCCESS) return false;
         b.pending = false;
-        collectProfile(b);
+        collectTimings(b);
         completedSerial_ = std::max(completedSerial_, b.serial);
     }
     return true;
@@ -690,7 +725,7 @@ bool Device::isComplete(uint64_t serial) {
         if (!b.pending || b.serial > serial) continue;
         if (vkGetFenceStatus(device_, b.fence) != VK_SUCCESS) return false;
         b.pending = false;
-        collectProfile(b);
+        collectTimings(b);
         completedSerial_ = std::max(completedSerial_, b.serial);
     }
     return true;
@@ -914,6 +949,10 @@ VkResult Device::createComputePipeline(const uint32_t* code, size_t wordCount, c
 
 void Device::destroyComputePipeline(ComputePipeline& p) {
     finish();  // recorded dispatches may still use it
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        nsPerGroup_.erase(p.pipeline);  // the handle may be reused
+    }
     if (p.pipeline) vkDestroyPipeline(device_, p.pipeline, nullptr);
     if (p.layout) vkDestroyPipelineLayout(device_, p.layout, nullptr);
     if (p.module) vkDestroyShaderModule(device_, p.module, nullptr);
@@ -921,24 +960,97 @@ void Device::destroyComputePipeline(ComputePipeline& p) {
 }
 
 VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ,
-                          const void* pushData, uint32_t pushSize, const char* label) {
-    if (pushSize > p.pushConstantSize) return VK_ERROR_FEATURE_NOT_PRESENT;
+                          const void* pushData, uint32_t pushSize, const char* label, const void* params,
+                          size_t paramsSize) {
+    if (pushSize > p.pushConstantSize || (params && pushSize < sizeof(VkDeviceAddress))) return VK_ERROR_FEATURE_NOT_PRESENT;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::vector<uint8_t> push(static_cast<const uint8_t*>(pushData), static_cast<const uint8_t*>(pushData) + pushSize);
+    uint64_t uploaded = 0;
+    const uint32_t grid[3] = {groupsX, groupsY, groupsZ};
+    if (!batchBudgetNs_) {
+        if (params) {
+            if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
+        }
+        if (VkResult r = recordDispatch(p, std::array<uint32_t, 3>{}.data(), grid, push.data(), pushSize, label, 0))
+            return r;
+        return launchBlocking_ ? finish() : VK_SUCCESS;
+    }
+
+    // Workgroups per chunk: as many as fit in the budget, or a probe on its own for a new pipeline.
+    auto known = nsPerGroup_.find(p.pipeline);
+    const bool probe = known == nsPerGroup_.end();
+    uint64_t chunk = kRateGroups;
+    if (probe) {
+        if (VkResult r = flushLocked()) return r;
+    } else if (known->second > 0) {
+        chunk = std::max<uint64_t>(1, uint64_t(batchBudgetNs_ / known->second));
+    } else {
+        chunk = UINT64_MAX;
+    }
+    // Chunks are boxes of whole planes, whole rows or part of a row, in blockIdx order.
+    const uint64_t row = groupsX, plane = row * groupsY;
+    uint32_t step[3] = {groupsX, groupsY, groupsZ};
+    if (chunk < plane) {
+        step[2] = 1;
+        if (chunk < row) step[1] = 1, step[0] = uint32_t(chunk);
+        else step[1] = uint32_t(chunk / row);
+    } else {
+        step[2] = uint32_t(std::min<uint64_t>(groupsZ, chunk / plane));
+    }
+    bool first = true;
+    for (uint32_t z = 0; z < groupsZ; z += step[2])
+        for (uint32_t y = 0; y < groupsY; y += step[1])
+            for (uint32_t x = 0; x < groupsX; x += step[0]) {
+                const uint32_t base[3] = {x, y, z};
+                const uint32_t count[3] = {std::min(step[0], groupsX - x), std::min(step[1], groupsY - y),
+                                           std::min(step[2], groupsZ - z)};
+                double estimate = 0;
+                if (!probe || !first) {
+                    const uint64_t groups = uint64_t(count[0]) * count[1] * count[2];
+                    estimate = nsPerGroup_[p.pipeline] * double(std::max(groups, kRateGroups));
+                    if (open_ >= 0 && commands_ && batches_[open_].estimateNs + estimate > batchBudgetNs_) {
+                        if (VkResult r = flushLocked()) return r;
+                    }
+                }
+                if (params) {  // each batch keeps its own copy (its arena is reused once it has run)
+                    if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
+                }
+                if (VkResult r = recordDispatch(p, base, count, push.data(), pushSize, label, estimate)) return r;
+                if (probe && first) {
+                    if (VkResult r = finish()) return r;  // measures it
+                }
+                first = false;
+            }
+    return launchBlocking_ ? finish() : VK_SUCCESS;
+}
+
+VkResult Device::uploadParams(const void* params, size_t size, std::vector<uint8_t>& push, uint64_t& uploadedSerial) {
+    if (open_ >= 0 && batches_[open_].serial == uploadedSerial) return VK_SUCCESS;
+    VkDeviceAddress addr;
+    if (VkResult r = upload(params, size, addr)) return r;
+    std::memcpy(push.data(), &addr, sizeof addr);
+    uploadedSerial = batches_[open_].serial;
+    return VK_SUCCESS;
+}
+
+VkResult Device::recordDispatch(const ComputePipeline& p, const uint32_t base[3], const uint32_t count[3],
+                                const void* pushData, uint32_t pushSize, const char* label, double estimateNs) {
     return record([&](VkCommandBuffer cb) {
         Batch& b = batches_[open_];
-        const uint32_t query = uint32_t(2 * b.labels.size());
-        if (profiling_) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.profile, query);
+        const uint32_t query = uint32_t(2 * b.timed.size());
+        if (timing_) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.timing, query);
         b.kernels.push_back(label);
+        b.estimateNs += estimateNs;
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
         if (pushSize) vkCmdPushConstants(cb, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize, pushData);
         // CUDA allows 2^31-1 blocks in x; split along x when the device allows fewer. The base
         // offset keeps WorkgroupId (blockIdx) global.
         const uint32_t limit = info_.props.limits.maxComputeWorkGroupCount[0];
-        for (uint32_t base = 0; base < groupsX; base += limit)
-            vkCmdDispatchBase(cb, base, 0, 0, std::min(limit, groupsX - base), groupsY, groupsZ);
-        if (profiling_) {
-            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.profile, query + 1);
-            b.labels.push_back(label);
+        for (uint32_t x = 0; x < count[0]; x += limit)
+            vkCmdDispatchBase(cb, base[0] + x, base[1], base[2], std::min(limit, count[0] - x), count[1], count[2]);
+        if (timing_) {
+            vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.timing, query + 1);
+            b.timed.push_back({label, p.pipeline, uint64_t(count[0]) * count[1] * count[2], estimateNs});
         }
     });
 }

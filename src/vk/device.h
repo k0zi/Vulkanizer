@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace vulkanizer::vk {
@@ -57,7 +58,9 @@ struct SparseBind {
 // Logical device with a single compute queue. Kernel dispatches are recorded into batches
 // (one command buffer each, a memory barrier between commands) and submitted lazily:
 // when a batch fills up, at flush()/finish(), or before any operation that touches memory from
-// the host (write/read/copy/fill wait for all recorded work first). All methods are thread-safe.
+// the host (write/read/copy/fill wait for all recorded work first). A batch also closes once its
+// estimated GPU time reaches VULKANIZER_BATCH_MS: the kernel driver resets the GPU when a
+// submission runs too long (amdgpu: 2 s). All methods are thread-safe.
 class Device {
 public:
     static VkResult create(const PhysicalDeviceInfo& info, std::unique_ptr<Device>& out);
@@ -102,10 +105,14 @@ public:
                                    uint32_t pushConstantSize, const uint32_t spec[5], ComputePipeline& out);
     void destroyComputePipeline(ComputePipeline& p);  // waits for recorded work first
 
-    // Asynchronous: recorded into the current batch.
+    // Asynchronous: recorded into the current batch. A grid that would run longer than the batch
+    // budget is split over several batches (CUDA blocks are independent).
     // `label` names the kernel in VULKANIZER_PROFILE=1 reports (must outlive the device).
+    // `params` (optional) is uploaded into each batch the dispatch is recorded in, and its address
+    // goes into the first 8 bytes of the push constants.
     VkResult dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ,
-                      const void* pushData, uint32_t pushSize, const char* label = nullptr);
+                      const void* pushData, uint32_t pushSize, const char* label = nullptr,
+                      const void* params = nullptr, size_t paramsSize = 0);
     // Copies data into memory that stays valid until the work recorded next has executed.
     VkResult upload(const void* data, VkDeviceSize size, VkDeviceAddress& address);
 
@@ -123,6 +130,12 @@ public:
     bool readTimestampNs(int32_t slot, double& ns);  // false until the timestamp's batch completed
 
 private:
+    struct Timed {  // a dispatch with start/end timestamps
+        const char* label;
+        VkPipeline pipeline;
+        uint64_t groups;
+        double estimateNs;  // 0: not estimated (a pipeline's first launch)
+    };
     struct Batch {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
@@ -130,14 +143,18 @@ private:
         bool pending = false;  // submitted, fence not yet observed
         Buffer arena;          // upload memory of this batch
         VkDeviceSize arenaUsed = 0;
-        VkQueryPool profile = VK_NULL_HANDLE;  // VULKANIZER_PROFILE: start/end timestamps per dispatch
-        std::vector<const char*> labels;
+        VkQueryPool timing = VK_NULL_HANDLE;  // start/end timestamps per dispatch
+        std::vector<Timed> timed;
+        double estimateNs = 0;  // expected GPU time of the recorded dispatches
         std::vector<const char*> kernels;  // dispatched kernels, named when the device is lost
     };
     static constexpr uint32_t kBatches = 8;
     static constexpr uint32_t kMaxCommandsPerBatch = 64;
     static constexpr uint32_t kTimestamps = 1024;
     static constexpr VkDeviceSize kAsyncWriteLimit = 256 * 1024;
+    // A pipeline's first launch runs this many workgroups on their own to measure it. Rates are
+    // taken per this many workgroups at least, as smaller grids leave the GPU partly idle.
+    static constexpr uint64_t kRateGroups = 256;
 
     explicit Device(const PhysicalDeviceInfo& info) : info_(info) {}
     VkResult init();
@@ -158,7 +175,12 @@ private:
     VkResult flushLocked();
     VkResult waitBatch(Batch& b);
     bool hasRecordedWork() const;
-    void collectProfile(Batch& b);
+    void collectTimings(Batch& b);
+    VkResult recordDispatch(const ComputePipeline& p, const uint32_t base[3], const uint32_t count[3],
+                            const void* pushData, uint32_t pushSize, const char* label, double estimateNs);
+    // Uploads `params` into the open batch unless already done (uploadedSerial) and patches the
+    // address into push[0..8).
+    VkResult uploadParams(const void* params, size_t size, std::vector<uint8_t>& push, uint64_t& uploadedSerial);
 
     PhysicalDeviceInfo info_;
     Features features_;
@@ -177,7 +199,13 @@ private:
     double timestampPeriodNs_ = 0;
     std::vector<int32_t> freeTimestamps_;
     std::vector<uint64_t> timestampSerial_;
-    bool profiling_ = false;
+    bool timing_ = false;     // dispatches are timed (batch budget, profiling)
+    bool profiling_ = false;  // VULKANIZER_PROFILE
+    bool deviceLost_ = false;  // reported once
+    bool launchBlocking_ = false;  // CUDA_LAUNCH_BLOCKING=1
+    double batchBudgetNs_ = 0;  // 0: no limit
+    // GPU time per workgroup of each pipeline: the highest seen, so estimates err on the long side.
+    std::unordered_map<VkPipeline, double> nsPerGroup_;
     std::vector<std::pair<uint64_t, Buffer>> deferredFrees_;  // (serial, buffer)
     VkDeviceSize sparsePageSize_ = 0;
     VkDeviceSize maxSparseBufferSize_ = 0;

@@ -271,6 +271,8 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 | `VULKANIZER_CACHE_DIR` | Kernel cache helye (alap: `$XDG_CACHE_HOME/vulkanizer`, `~/.cache/vulkanizer`); `off` kikapcsolja |
 | `VULKANIZER_EAGER` | `1` = a nagy modulok kerneleit is betöltéskor fordítja (alapból csak a ≤16 kerneleseket) |
 | `VULKANIZER_PROFILE` | `1` = kilépéskor kiírja a kernelenkénti GPU-időt és az API-hívásonkénti host-időt |
+| `VULKANIZER_BATCH_MS` | Egy submit becsült GPU-ideje legfeljebb ennyi ms (alap: 50); a hosszabb dispatch több submitra bomlik. Az amdgpu 2 s után reseteli a GPU-t. `0` = nincs korlát |
+| `CUDA_LAUNCH_BLOCKING` | `1` = minden kernelindítás megvárja a GPU-t (hiba/lefagyás az okozó indításnál jelentkezik) |
 | `VULKANIZER_FAST_FMA` | `1` = az f32 `fma` a driver natív (esetleg nem fused) `Fma`-ja, ott is, ahol a próba szerint nem fused (gyorsabb, kevésbé pontos) |
 | `VULKANIZER_FMA_F64` | `1` = a nem fused eszközön az f32 `fma` f64-ben számolódik (alapból f32 TwoProduct/TwoSum emuláció) |
 | `VULKANIZER_NO_VMM` | `1` = nincs sparse binding, így nincs CUDA VMM (`cuMemAddressReserve` stb. `NOT_SUPPORTED`) |

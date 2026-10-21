@@ -490,9 +490,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
     }
     std::vector<uint8_t> push(f->binary.pushConstantSize, 0);
     if (f->binary.paramsInBuffer) {
-        VkDeviceAddress addr;
-        if (VkResult vr = s.dev->upload(params.data(), params.size(), addr)) return toCuResult(vr);
-        std::memcpy(push.data(), &addr, sizeof addr);
+        // The parameter buffer's address goes into push[0..8): vk::Device::dispatch uploads it.
     } else {
         std::memcpy(push.data(), params.data(), std::min(params.size(), push.size()));
     }
@@ -539,8 +537,10 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
         if (pack > 1) VULKANIZER_DEBUG("'%s': %u blocks of %u threads per workgroup", e.name.c_str(), pack, threads);
         it = f->pipelines.emplace(block, pipeline).first;
     }
+    const bool buffered = f->binary.paramsInBuffer;
     const VkResult vr = s.dev->dispatch(it->second, (gridDimX + pack - 1) / pack, gridDimY, gridDimZ, push.data(),
-                                        static_cast<uint32_t>(push.size()), f->entry->name.c_str());
+                                        static_cast<uint32_t>(push.size()), f->entry->name.c_str(),
+                                        buffered ? params.data() : nullptr, buffered ? params.size() : 0);
     if (vr == VK_SUCCESS && printf) flushDevicePrintf(*s.slot, *f->module);  // read() waits for the kernel
     return toCuResult(vr);
 }

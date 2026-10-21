@@ -123,6 +123,46 @@ and disables everything that requires NVIDIA hardware or libraries: cuDNN, the f
 (so `scaled_dot_product_attention` runs on the math path) and the Triton/CuTe DSL kernels of `torch._native`
 (`TORCH_DISABLE_NATIVE_JIT=1`), which compile to SASS. `VULKANIZER_TORCH_DEFAULTS=0` skips this.
 
+### 6. ComfyUI
+
+ComfyUI runs through `run_torch.sh` too, in its own conda-forge environment inside the ComfyUI checkout:
+
+```sh
+VK=~/Develop/GitHub/Vulkanizer             # this repository, built with ./build.sh --release
+cd ~/Develop/GitHub                        # wherever ComfyUI should live
+git clone https://github.com/comfyanonymous/ComfyUI && cd ComfyUI
+
+# PyTorch (CUDA 12.9 build with PTX) and torchvision's native dependencies
+export MAMBA_ROOT_PREFIX=$VK/.work/mamba-root CONDA_OVERRIDE_CUDA=12.9
+[ -x $VK/.work/micromamba/bin/micromamba ] || { mkdir -p $VK/.work/micromamba && curl -fsSL \
+    https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C $VK/.work/micromamba bin/micromamba; }
+$VK/.work/micromamba/bin/micromamba create -y -p $PWD/venv-vulkanizer -c conda-forge \
+    python=3.13 "pytorch=2.14.1=cuda129_generic*" pip pillow giflib libwebp-base libjpeg-turbo libpng \
+    "libnvjpeg>=12.4,<13" "libcusolver<12" "libcusparse<13"
+# torchvision by URL, without solving: its CUDA 12.9 build asks for a newer cuDNN that needs the
+# __cuda_arch virtual package (a real driver). cuDNN is off under Vulkanizer anyway.
+$VK/.work/micromamba/bin/micromamba install -y -p $PWD/venv-vulkanizer --file <(printf '@EXPLICIT\n%s\n' \
+    https://conda.anaconda.org/conda-forge/linux-64/torchvision-0.29.1-cuda129_py313_hcd9f930_0.conda)
+
+# the rest of ComfyUI's requirements; pip must not replace torch/torchvision with the SASS-only wheels
+venv-vulkanizer/bin/pip install -r <(grep -vE '^(torch|torchvision)$' requirements.txt) -r manager_requirements.txt
+
+# start it
+$VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-malloc --disable-dynamic-vram
+```
+
+Then open <http://127.0.0.1:8188>. Models go into `models/` as usual. Notes:
+
+- `--disable-cuda-malloc`: ComfyUI's `cudaMallocAsync` allocator backend is not used.
+- `--disable-dynamic-vram`: DynamicVRAM (comfy-aimdo) needs virtual memory management (VMM), which is still
+  being tested ([plan.md 4.9](plan.md)).
+- `tools/torch/sitecustomize.py` applies the PyTorch settings only when ComfyUI imports torch, and keeps
+  the fused attention backends off even though ComfyUI re-enables them: attention runs on the math path.
+- The ComfyUI-Manager "PyTorch is not installed" message comes from the missing `torchaudio` (conda-forge has
+  no build for torch 2.14); image generation does not need it.
+- The first generation is slow while the kernels are compiled to SPIR-V; later runs load them from the cache.
+- `$VK/run_torch.sh --log info --env venv-vulkanizer main.py ...` shows which Vulkan GPU is used.
+
 ### Useful environment variables
 
 | Variable | Effect |
@@ -131,6 +171,8 @@ and disables everything that requires NVIDIA hardware or libraries: cuDNN, the f
 | `VULKANIZER_DEVICE=<name>` | Select a Vulkan device by name fragment (`radv`, `llvmpipe`, ...) |
 | `VULKANIZER_ALLOW_CPU=1` | Allow CPU Vulkan devices (llvmpipe) |
 | `VULKANIZER_PROFILE=1` | On exit, per-kernel GPU time and per-API-call host time |
+| `VULKANIZER_BATCH_MS=<ms>` | GPU time budget of one queue submission (default 50; `0` = no limit). Longer kernels are split, so the kernel driver's GPU timeout (amdgpu: 2 s) is not hit |
+| `CUDA_LAUNCH_BLOCKING=1` | Every kernel launch waits for the GPU, so errors and hangs show at the launch that caused them |
 | `VULKANIZER_FAST_FMA=1` | Faster, less precise f32 `fma` |
 | `VULKANIZER_GEMM_F32=1` | cuBLAS `COMPUTE_16F` GEMMs also run with f32 multiplication |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | Location of the kernel cache, or disable it |
@@ -148,6 +190,7 @@ Full list: [plan.md, section 4](plan.md).
   processing is slower with it, so it is off by default.
 - PyTorch: no cuDNN, NCCL or fused attention kernels; a device-side `assert` failure only stops the
   thread (no `cudaErrorAssert`).
+- ComfyUI: no DynamicVRAM yet (`--disable-dynamic-vram`), no CUDA 13 (cu130) optimized paths.
 
 ## Scripts
 
