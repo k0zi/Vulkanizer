@@ -95,3 +95,21 @@ if(EXISTS ${VULKANIZER_CUDA_TOOLKIT}/bin/nvcc)
 else()
   message(STATUS "No CUDA toolkit in ${VULKANIZER_CUDA_TOOLKIT}: nvcc tests disabled (run tools/setup_cuda.sh)")
 endif()
+
+# libtorch tests against the conda-forge PyTorch environment (tools/setup_torch.sh). Not part of
+# ctest: they need run_torch.sh's environment and take a while (./run_torch.sh torch_ops).
+set(VULKANIZER_TORCH_ENV ${PROJECT_SOURCE_DIR}/.work/torch-cf CACHE PATH "PyTorch environment for the libtorch tests")
+if(EXISTS ${VULKANIZER_TORCH_ENV}/lib/libtorch_cuda.so)
+  foreach(name torch_ops torch_mlp torch_split)
+    add_executable(${name} torch/${name}.cpp)
+    target_include_directories(${name} SYSTEM PRIVATE ${VULKANIZER_TORCH_ENV}/include
+                               ${VULKANIZER_TORCH_ENV}/include/torch/csrc/api/include)
+    # libtorch_cuda registers the CUDA backend from static initializers: keep it although nothing references it
+    target_link_libraries(${name} PRIVATE -Wl,--no-as-needed ${VULKANIZER_TORCH_ENV}/lib/libtorch_cuda.so -Wl,--as-needed
+                          ${VULKANIZER_TORCH_ENV}/lib/libtorch.so ${VULKANIZER_TORCH_ENV}/lib/libtorch_cpu.so
+                          ${VULKANIZER_TORCH_ENV}/lib/libc10.so)
+    set_target_properties(${name} PROPERTIES BUILD_RPATH ${VULKANIZER_TORCH_ENV}/lib)
+  endforeach()
+else()
+  message(STATUS "No PyTorch in ${VULKANIZER_TORCH_ENV}: libtorch tests disabled (run tools/setup_torch.sh)")
+endif()

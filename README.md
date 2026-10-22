@@ -111,11 +111,14 @@ runtime; it adds the `--cuda` flag automatically. Relative model paths are also 
 ```sh
 tools/setup_torch.sh                       # conda-forge PyTorch CUDA environment in .work/torch-cf (~9 GB)
 ./run_torch.sh -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-./run_torch.sh tests/torch/mlp.py          # trains an MLP on GPU and CPU and compares them
-./run_torch.sh tests/torch/ops.py          # conv, softmax, LayerNorm, attention, Transformer layer, ...
-./run_torch.sh tests/torch/triton_add.py   # a hand-written Triton kernel
+./run_torch.sh torch_mlp                   # trains an MLP on GPU and CPU and compares them (libtorch, C++)
+./run_torch.sh torch_ops                   # conv, softmax, LayerNorm, attention, Transformer layer, ...
+./run_torch.sh tests/torch/triton_ops.py   # a hand-written Triton kernel and torch._native's Triton bmm
 ./run_torch.sh tests/torch/compile.py      # torch.compile (Inductor -> Triton) MLP forward and backward
 ```
+
+`torch_mlp`, `torch_ops` and `torch_split` are C++ tests against the environment's libtorch
+(`tests/torch/*.cpp`); CMake builds them when `.work/torch-cf` exists at configure time.
 
 The official PyTorch wheels contain only native NVIDIA machine code (SASS), no PTX, so Vulkanizer cannot
 run their kernels. The conda-forge CUDA builds also ship PTX (`compute_120`):
@@ -234,8 +237,7 @@ src/cublas            libcublas.so.12 (GEMM/TRSM with GLSL kernels), include/cub
 tests/                Driver API tests + internal Vulkan test
 tests/cuda            Runtime API programs compiled with nvcc
 tests/cudart_abi      ABI match of the clean-room runtime types against the official headers
-tests/data            test PTX files with their .cu sources alongside; gen_ptx.sh regenerates them (clang),
-                      make_fatbin.py builds the test fatbins (python3-lz4)
+tests/data            test PTX files with their .cu sources alongside; gen_ptx.sh regenerates them (clang)
 tools/                vulkanizer-info (device list), vulkanizer-ptxc (offline compiler), setup_cuda.sh,
                       build_llama.sh (llama.cpp CUDA build against Vulkanizer)
 ```

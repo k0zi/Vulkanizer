@@ -191,7 +191,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - [x] **4.7** ComfyUI (Z-Image Turbo) teljes képgenerálás.
   - Már kész: a conda-forge környezetben fut (`venv-vulkanizer`, a torchvision feloldás nélkül, URL-ről).
     Indítás: `run_torch.sh` + `--disable-cuda-malloc` (a 4.9 óta DynamicVRAM-mal is). A `torch._native` Triton/CuTe DSL
-    kernelei `TORCH_DISABLE_NATIVE_JIT=1`-gyel ki vannak kapcsolva (`tools/torch/sitecustomize.py`).
+    kernelei `TORCH_DISABLE_NATIVE_JIT=1`-gyel ki vannak kapcsolva (`run_torch.sh`).
   - GPU-n kész (2026-10-21): a sablon 1024×1024-en, seed 42-vel végigfut a Renoiron, 117,8 s/lépés (8 lépés, összesen ~21 perc).
     Közben előjött hibák:
     - A 64 parancsos batchek 1024×1024-en 2 s-nál tovább futottak, és az amdgpu reseteli a GPU-t (`lockup_timeout`,
@@ -202,7 +202,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     - A pufferben átadott kernelparaméterek (`paramsInBuffer`, >256 bájt, pl. a TensorIterator offset calculatorai)
       a batch arénájában voltak. A több batchre bontott dispatch későbbi darabjai újrahasznosított slot arénájára
       mutattak, amit a következő indítás felülírhatott. Most a `Device::dispatch` minden batchbe saját másolatot tölt fel.
-      Regressziós teszt: `VULKANIZER_BATCH_MS=0.01 ./run_torch.sh tests/torch/split.py`. Ez a hibát a régi kóddal sem
+      Regressziós teszt: `VULKANIZER_BATCH_MS=0.01 ./run_torch.sh torch_split`. Ez a hibát a régi kóddal sem
       váltotta ki (ritka slot/offset-egybeesés kell hozzá), de a javítás után a ComfyUI-s futás timeout nélkül ment végig.
     - Diagnosztika: device lostnál a legrégebbi befejezetlen batch dispatch-ei listázódnak méretükkel és becsült
       idejükkel, egyszer. A `CUDA_LAUNCH_BLOCKING=1` minden indítás után megvárja a GPU-t.
@@ -247,9 +247,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     `TRITON_PTXAS_PATH`, ami PTX-et ad vissza; a `cuModuleLoadData` PTX-et is elfogad).
   - Kellhet még: `cuLaunchKernelEx`, `cuFuncSetAttribute`, `cuOccupancyMaxActiveClusters` stb.
   - **Kész, ha:** `TORCH_DISABLE_NATIVE_JIT` nélkül is helyes a `tests/torch/ops.py`, és lefut egy `torch.compile`-olt MLP.
-  - Tesztelve (2026-10-22): `tests/torch/triton_add.py` (kézi `@triton.jit`), `tests/torch/compile.py`
+  - Tesztelve (2026-10-22): `tests/torch/triton_ops.py` (kézi `@triton.jit`, és a `torch._native` Triton-os bmm outer productja), `tests/torch/compile.py`
     (`torch.compile`-olt MLP előre és vissza, 5 Inductor Triton kernel, rel. hiba 2e-7), és
-    `TORCH_DISABLE_NATIVE_JIT=0`-val a `tests/torch/ops.py` (benne a `torch._native` Triton-os bmm outer productja).
+    `TORCH_DISABLE_NATIVE_JIT=0`-val a korábbi Python `ops.py` (most `torch_ops`, C++).
     Egy hiba jött elő: a Triton a skalár `ld`/`st` adatát egyelemű vektorként írja (`ld.global.b32 {%r1}, [..]`);
     most elfogadjuk (`tests/data/kernels.ptx`, `vec4`).
   - A `TORCH_DISABLE_NATIVE_JIT=1` alapértelmezés marad: ugyanez a kapcsoló tiltja a CuTe DSL kerneleket, amik SASS-ra
@@ -257,7 +257,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - Hátra: a comfy-kitchen triton backendje (a ComfyUI-ban „available, disabled”), ezt a ComfyUI maga kapcsolja.
   - Kész:
     - `tools/triton/ptxas`: a PTX-et adja tovább „cubin”-ként, a verziója (12.8) határozza meg a PTX ISA verziót.
-    - A `sitecustomize` beállítja a `TRITON_PTXAS_PATH`-ot, és a Triton `driver.c`-je a saját `include/cuda.h`-val fordul;
+    - A `run_torch.sh` beállítja a `TRITON_PTXAS_PATH`-ot, és a Triton `driver.c`-je a saját `include/cuda.h`-val fordul (`C_INCLUDE_PATH`);
       ehhez a header kapott launch config, tensor map, limit és pointer-attribútum típusokat.
     - Driver: `cuLaunchKernelEx` (`_ptsz`), `cuFuncSetAttribute/SetCacheConfig`, `cuCtxSet/GetLimit`, `cuPointerGetAttribute(s)`,
       `cuOccupancy*`. A `cuTensorMapEncode*` `NOT_SUPPORTED` (TMA, sm_90).

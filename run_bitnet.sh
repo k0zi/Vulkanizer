@@ -66,26 +66,17 @@ rsync -a --delete --exclude .git --exclude '*.o' --exclude /models --exclude /bi
 
 # Upstream only builds for sm_120: two plain MoE kernels sit inside the sm_120-only MXFP4 block
 # while being used outside it. Move them out of it (idempotent).
-python3 - "$WORK/src/gpu_cuda.cu" <<'EOF'
-import re, sys
-path = sys.argv[1]
-src = open(path).read()
-guard = "#ifdef BN_CUDA_MXFP4_SM120"
-for name in ("moe_routed_activation_pair_kernel", "moe_routed_ordered_reduce_kernel"):
-    m = re.search(r"static __global__ void " + name + r"\(", src)
-    if not m:
-        continue
-    before = src[:m.start()]
-    # inside the guard: its last #ifdef BN_CUDA_MXFP4_SM120 before the kernel is still open
-    opened = before.rfind(guard)
-    if opened < 0 or before.rfind("#endif") > opened:
-        continue
-    # the kernel ends at the first line that is just "}" after its start
-    end = src.index("\n}\n", m.start()) + 3
-    src = src[:m.start()] + "#endif  /* run_bitnet.sh: kernel used outside the MXFP4 block */\n" + \
-        src[m.start():end] + guard + "\n" + src[end:]
-open(path, "w").write(src)
-EOF
+awk '
+  /#ifdef BN_CUDA_MXFP4_SM120/ { open = 1 }
+  /#endif/ { open = 0 }
+  open && /static __global__ void (moe_routed_activation_pair_kernel|moe_routed_ordered_reduce_kernel)\(/ {
+    print "#endif  /* run_bitnet.sh: kernel used outside the MXFP4 block */"
+    moving = 1
+  }
+  { print }
+  moving && $0 == "}" { print "#ifdef BN_CUDA_MXFP4_SM120"; moving = 0; open = 1 }
+' "$WORK/src/gpu_cuda.cu" > "$WORK/src/gpu_cuda.cu.tmp"
+mv "$WORK/src/gpu_cuda.cu.tmp" "$WORK/src/gpu_cuda.cu"
 # keep the source's mtime, so make only rebuilds gpu_cuda.o when bitnet.c itself changed
 touch -r "$BITNET_SRC/src/gpu_cuda.cu" "$WORK/src/gpu_cuda.cu"
 

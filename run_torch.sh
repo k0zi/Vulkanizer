@@ -2,6 +2,7 @@
 # Runs Python with PyTorch on Vulkan through Vulkanizer (no NVIDIA GPU or driver needed).
 #
 #   ./run_torch.sh script.py args...      a PyTorch script ("cuda" is the Vulkan GPU)
+#   ./run_torch.sh torch_ops               a libtorch test from the build (torch_ops, torch_mlp, torch_split)
 #   ./run_torch.sh -c "import torch; print(torch.cuda.is_available())"
 #   ./run_torch.sh                         interactive Python
 #
@@ -13,16 +14,16 @@
 #   --gdb            run under gdb
 #
 # Vulkanizer's libcuda, libcudart, libcublas and libcublasLt are preloaded, so PyTorch uses them
-# instead of the NVIDIA libraries in its environment. tools/torch/sitecustomize.py turns off what
-# needs NVIDIA hardware or libraries (cuDNN, fused attention); VULKANIZER_TORCH_DEFAULTS=0 keeps
-# PyTorch's own defaults.
+# instead of the NVIDIA libraries in its environment. What needs NVIDIA hardware or libraries is
+# turned off (cuDNN and fused attention in tools/torch/sitecustomize.py, the rest below);
+# VULKANIZER_TORCH_DEFAULTS=0 keeps PyTorch's own defaults.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${VULKANIZER_BUILD_DIR:-$ROOT/build-rel}"
 ENV="$ROOT/.work/torch-cf"
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
 
 GDB=0
 while [[ $# -gt 0 ]]; do
@@ -43,9 +44,24 @@ done
 VULKANIZER_BUILD_DIR="$BUILD" "$ROOT/build.sh" --release >/dev/null
 
 LIB="$BUILD/lib"
-export PYTHONPATH="$ROOT/tools/torch${PYTHONPATH:+:$PYTHONPATH}"
+if [[ "${VULKANIZER_TORCH_DEFAULTS:-1}" != 0 ]]; then
+  export PYTHONPATH="$ROOT/tools/torch${PYTHONPATH:+:$PYTHONPATH}"  # sitecustomize.py: cuDNN, fused attention
+  # torch._native's CuTe DSL kernels compile to SASS; the same switch also turns off its (working) Triton ones
+  export TORCH_DISABLE_NATIVE_JIT="${TORCH_DISABLE_NATIVE_JIT:-1}"
+  # Triton: PTX is handed through instead of assembled, the launcher is built against our cuda.h
+  export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$ROOT/tools/triton/ptxas}"
+  export TRITON_PTXAS_BLACKWELL_PATH="${TRITON_PTXAS_BLACKWELL_PATH:-$ROOT/tools/triton/ptxas}"
+  export C_INCLUDE_PATH="$ROOT/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+fi
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda
 export LD_PRELOAD="$LIB/libcuda.so.1:$LIB/libcudart.so.12:$LIB/libcublas.so.12:$LIB/libcublasLt.so.12${LD_PRELOAD:+:$LD_PRELOAD}"
-if [[ $GDB -eq 1 ]]; then exec gdb --args "$ENV/bin/python" "$@"; fi
-exec "$ENV/bin/python" "$@"
+# a libtorch test by name (torch_ops, ...) or any other program instead of Python
+PROGRAM=("$ENV/bin/python")
+if [[ $# -gt 0 && "$1" != */* && -x "$BUILD/bin/$1" ]]; then
+  PROGRAM=("$BUILD/bin/$1"); shift
+elif [[ $# -gt 0 && -x "$1" && ! -d "$1" && "$1" != *.py ]]; then
+  PROGRAM=("$1"); shift
+fi
+if [[ $GDB -eq 1 ]]; then exec gdb --args "${PROGRAM[@]}" "$@"; fi
+exec "${PROGRAM[@]}" "$@"
