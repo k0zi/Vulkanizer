@@ -212,6 +212,8 @@ Full list: [plan.md, section 4](plan.md).
 - Not (yet) supported: textures, cuDNN, NCCL, multi-GPU.
 - Managed, pinned and registered memory are host memory the GPU uses in place at the same address; managed memory
   never migrates to the GPU (on an integrated GPU it is the same memory anyway).
+- While registered host memory (`cuMemHostRegister`) exists, every GPU submission is slower (the kernel revalidates
+  the imported pages, ~4 ms per 256 MB); pinned and managed memory are not affected.
 - llama.cpp flash attention runs correctly (`tools/build_llama.sh --fa`), but without tensor cores prompt
   processing is slower with it, so it is off by default.
 - PyTorch: no cuDNN, NCCL or fused attention kernels; a device-side `assert` failure only stops the
@@ -229,6 +231,7 @@ Full list: [plan.md, section 4](plan.md).
 | `./ci.sh` | Full check: Debug+ASAN and Release, on every device (builds into `build-ci/`) |
 | `build/bin/vulkanizer-info` | Lists the Vulkan devices Vulkanizer can see |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | Copy bandwidth (HtoD/DtoH/DtoD, pageable and pinned) and allocation cost: `vulkanizer-bandwidth [MiB]` |
 
 Examples:
 
@@ -253,6 +256,6 @@ tests/                Driver API tests + internal Vulkan test
 tests/cuda            Runtime API programs compiled with nvcc
 tests/cudart_abi      ABI match of the clean-room runtime types against the official headers
 tests/data            test PTX files with their .cu sources alongside; gen_ptx.sh regenerates them (clang)
-tools/                vulkanizer-info (device list), vulkanizer-ptxc (offline compiler), setup_cuda.sh,
+tools/                vulkanizer-info (device list), vulkanizer-ptxc (offline compiler), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (llama.cpp CUDA build against Vulkanizer)
 ```

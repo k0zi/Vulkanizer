@@ -214,6 +214,8 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 - (Noch) nicht unterstützt: Texturen, cuDNN, NCCL, Multi-GPU.
 - Managed-, Pinned- und registrierter Speicher sind Host-Speicher, den die GPU direkt unter derselben Adresse nutzt;
   Managed-Speicher wird nie auf die GPU migriert (auf einer integrierten GPU ist es ohnehin derselbe Speicher).
+- Solange registrierter Host-Speicher (`cuMemHostRegister`) existiert, ist jede GPU-Übermittlung langsamer (der Kernel
+  prüft die importierten Seiten erneut, ~4 ms pro 256 MB); Pinned- und Managed-Speicher sind nicht betroffen.
 - Flash Attention in llama.cpp läuft korrekt (`tools/build_llama.sh --fa`), aber ohne Tensor Cores ist die
   Prompt-Verarbeitung damit langsamer, daher ist sie standardmäßig aus.
 - PyTorch: keine cuDNN-, NCCL- oder fusionierten Attention-Kernel; ein fehlgeschlagenes `assert` auf dem Gerät hält
@@ -231,6 +233,7 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 | `./ci.sh` | Vollständige Prüfung: Debug+ASAN und Release, auf jedem Gerät (baut nach `build-ci/`) |
 | `build/bin/vulkanizer-info` | Listet die Vulkan-Geräte, die Vulkanizer sieht |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | Kopierbandbreite (HtoD/DtoH/DtoD, auslagerbar und pinned) und Allokationskosten: `vulkanizer-bandwidth [MiB]` |
 
 Beispiele:
 
@@ -255,6 +258,6 @@ tests/                Driver-API-Tests + interner Vulkan-Test
 tests/cuda            mit nvcc kompilierte Runtime-API-Programme
 tests/cudart_abi      ABI-Abgleich der Clean-Room-Runtime-Typen mit den offiziellen Headern
 tests/data            Test-PTX-Dateien mit ihren .cu-Quellen daneben; gen_ptx.sh erzeugt sie neu (clang)
-tools/                vulkanizer-info (Geräteliste), vulkanizer-ptxc (Offline-Compiler), setup_cuda.sh,
+tools/                vulkanizer-info (Geräteliste), vulkanizer-ptxc (Offline-Compiler), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (llama.cpp-CUDA-Build gegen Vulkanizer)
 ```

@@ -212,6 +212,8 @@ Lista completa: [plan.md, seção 4](plan.md).
 - (Ainda) não suportado: texturas, cuDNN, NCCL, múltiplas GPUs.
 - A memória managed, fixada (pinned) e registrada é memória do host que a GPU usa no lugar, no mesmo endereço;
   a memória managed nunca migra para a GPU (numa GPU integrada é a mesma memória de qualquer forma).
+- Enquanto existir memória do host registrada (`cuMemHostRegister`), cada submissão à GPU fica mais lenta (o kernel
+  revalida as páginas importadas, ~4 ms por 256 MB); a memória fixada e a managed não são afetadas.
 - A flash attention do llama.cpp funciona corretamente (`tools/build_llama.sh --fa`), mas sem tensor cores o
   processamento do prompt fica mais lento com ela, por isso vem desativada.
 - PyTorch: sem kernels de cuDNN, NCCL ou atenção fundida; um `assert` que falha no dispositivo só para a thread
@@ -229,6 +231,7 @@ Lista completa: [plan.md, seção 4](plan.md).
 | `./ci.sh` | Verificação completa: Debug+ASAN e Release, em todos os dispositivos (compila em `build-ci/`) |
 | `build/bin/vulkanizer-info` | Lista os dispositivos Vulkan que o Vulkanizer enxerga |
 | `build/bin/vulkanizer-ptxc` | PTX → SPIR-V offline: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | Largura de banda de cópia (HtoD/DtoH/DtoD, paginável e fixada) e custo de alocação: `vulkanizer-bandwidth [MiB]` |
 
 Exemplos:
 
@@ -253,6 +256,6 @@ tests/                testes da API Driver + teste interno de Vulkan
 tests/cuda            programas da API Runtime compilados com nvcc
 tests/cudart_abi      conformidade ABI dos tipos clean-room do runtime com os cabeçalhos oficiais
 tests/data            arquivos PTX de teste com seus fontes .cu ao lado; gen_ptx.sh os regenera (clang)
-tools/                vulkanizer-info (lista de dispositivos), vulkanizer-ptxc (compilador offline), setup_cuda.sh,
+tools/                vulkanizer-info (lista de dispositivos), vulkanizer-ptxc (compilador offline), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (compilação CUDA do llama.cpp contra o Vulkanizer)
 ```

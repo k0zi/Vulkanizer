@@ -313,10 +313,15 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - [x] **5.2** Unified/managed memory, host-mapped memória (`VK_EXT_external_memory_host`), valódi pinned memória.
   - Kész (`src/driver/api_host.cpp`, `tests/host_memory.cpp`, `rt_kernels managed`): a pinned (`cuMemAllocHost`,
     `cuMemHostAlloc`), a regisztrált (`cuMemHostRegister`) és a managed (`cuMemAllocManaged`) memória host-lap, amit a
-    device ugyanazon a pointeren ér el. A lapokat egy sparse bufferhez kötjük, amit capture/replay-jel a
-    `h | 0xFFFF800000000000` device-címre teszünk (`vk::Device::importHostMemory`); a kernelek a címek felső bitjeit
-    OR-ral állítják be (a sign extension helyett), így a h host-pointer is érvényes device-cím. A rögzítés csak sparse
-    bufferrel működik: az importált memória saját capture-címét a RADV figyelmen kívül hagyja.
+    device ugyanazon a pointeren ér el: a `h | 0xFFFF800000000000` device-címen; a kernelek a címek felső bitjeit
+    OR-ral állítják be (a sign extension helyett), így a h host-pointer is érvényes device-cím.
+    - Pinned és managed: a device saját host-cached memóriája (`vk::Device::allocateHostMemory`), amit
+      `VK_EXT_map_memory_placed`-del egy általunk választott, 2 MiB-re igazított h címre mappelünk, a memória
+      capture-címe pedig h | bitek (sima buffer; ha nem sikerül, sparse buffer).
+    - Regisztrált: az alkalmazás lapjai importálva (`VK_EXT_external_memory_host`, `importHostMemory`), sparse
+      bufferhez kötve; az importált memória saját capture-címét a RADV figyelmen kívül hagyja.
+    - Sparse bufferhez kötött rendszermemória (és minden userptr) minden submitot lassít (a kernel minden CS-nél
+      újraellenőrzi a lapjait, ~4 ms / 256 MB): ezért nem import a pinned memória.
   - A managed memória nem migrál: host-memória marad, amit a device helyben ír-olvas (integrált GPU-n ez ugyanaz a
     memória). `cuMemAdvise`, `cuMemPrefetchAsync`, `cuStreamAttachMemAsync` elfogadja és nem csinál semmit.
     `CONCURRENT_MANAGED_ACCESS` = 0: a host a device munkájának végét várja meg.
@@ -337,10 +342,14 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     (`cuMemAllocAsync` capture alatt), `cudaGraphAddNode` általános paraméterekkel, feltételes csomópontok.
 - [ ] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
 - [ ] **5.4 Teljesítmény**
-  - sub-allokátor (nagy VkDeviceMemory blokkok);
-  - HOST_CACHED staging a DtoH-hoz;
-  - async copy queue;
-  - profilozó mód (`VULKANIZER_PROFILE`).
+  - [x] DtoH: a write-combined device-memóriából a CPU ~0,2 GB/s-mal olvas. A `Device::read` a GPU-val másol egy
+    host-cached staging bufferbe (2 × 8 MiB, a GPU és a CPU másolása átfedve), 4 KiB alatt közvetlenül olvas.
+    A pinned/managed memória és a device közti másolás GPU-n fut, az `*Async` változatok nem várnak.
+    Mérés (`vulkanizer-bandwidth`, 256 MiB): DtoH pageable 0,17 → ~3,8 GB/s, DtoH pinned 0,25 → ~12 GB/s.
+  - [x] profilozó mód (`VULKANIZER_PROFILE`).
+  - [ ] sub-allokátor (nagy VkDeviceMemory blokkok): `cuMemAlloc`+`cuMemFree` ~30–80 µs, 16 MiB ~0,8 ms (a kernel
+    nullázza a lapokat).
+  - [ ] async copy queue (külön transfer queue; integrált GPU-n kevés haszon).
 - [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
 
 ## 3. Ismert korlátok / kockázatok
@@ -354,10 +363,12 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - **Warp size ≠ 32** eszközökön a warp-szintű kód lassú vagy részlegesen támogatott.
 - **Device-címek**: a RADV a buffereket a 48 bites címtér felső felébe teszi (0xffff8...), ami int64-ként negatív
   (a PyTorch CUDA graph tree-je, `ctypes` ettől elbukik). A Vulkanizer ezért a bitek 63..48 nélkül adja ki a címeket
-  (`vk::kAddressMask`, 0x8000... alakúak, pozitívak), a kernelek pedig minden elérés előtt visszaállítják őket bit 47-ből
-  (a PTX-fordító a báziscímen, egyetlen 32 bites bit-field extracttal; a GLSL shaderek `canon()`-nal). Mérhető ára nincs.
+  (`vk::kAddressMask`, 0x8000... alakúak, pozitívak), a kernelek pedig minden elérés előtt visszaállítják a felső
+  biteket (a PTX-fordító a báziscímen, egyetlen 32 bites OR-ral 0xFFFF8000-val; a GLSL shaderek `canon()`-nal), így a
+  host-memória h címe is érvényes device-cím (lásd 5.2). Mérhető ára nincs.
 - **UVA**: több Vulkan device címtere ütközhet; jelenleg a pointer-keresés a current context device-án belül történik.
-- **DtoH olvasás** write-combined (nem HOST_CACHED) memóriából lassú → később cached staging.
+- **Regisztrált host-memória** (`cuMemHostRegister`): amíg él, minden GPU-submit lassabb (a kernel minden submitnál
+  újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát ez nem érinti.
 - **libcudart privát export table-jei** (`cuGetExportTable`) nem dokumentáltak, CUDA verziónként változhatnak → verzió-specifikus kezelés, sok trace-elés.
 - **Jogi**: NVIDIA EULA (CUDA ≥ 11.6) tiltja az SDK kimenetének visszafejtését/átfordítását nem-NVIDIA platformra. Clean-room API implementáció; NVIDIA headert/binárist nem teszünk a repóba. Publikálás előtt jogi átnézés.
 

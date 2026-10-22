@@ -1,5 +1,6 @@
-// Device memory: allocation, copies and memsets. All operations are synchronous
-// for now, so the *Async variants simply run in order on the calling thread.
+// Device memory: allocation, copies and memsets. Everything runs in order on the single device
+// queue; the *Async variants differ only in not waiting for copies into host memory the device
+// accesses (pinned, registered, managed).
 
 #include "driver/driver.h"
 
@@ -19,7 +20,7 @@ using namespace vulkanizer::driver;
 // the result right away. Waits for the work when `dst` is such memory.
 static CUresult finishIfHostTarget(vk::Device& dev, const std::vector<AllocPiece>& dst) {
     for (const AllocPiece& p : dst)
-        if (p.ref.buffer->importedHost) return toCuResult(dev.finish());
+        if (p.ref.buffer->hostAddressed) return toCuResult(dev.finish());
     return CUDA_SUCCESS;
 }
 
@@ -70,8 +71,11 @@ static CUresult readPieces(vk::Device& dev, const std::vector<AllocPiece>& src, 
     return CUDA_SUCCESS;
 }
 
-// Copies between two piece lists of the same total size, one overlap at a time.
-static CUresult copyPieces(vk::Device& dev, const std::vector<AllocPiece>& src, const std::vector<AllocPiece>& dst) {
+// Copies between two piece lists of the same total size, one overlap at a time. Either side may be
+// host memory the device accesses (pinned, registered, managed): a synchronous copy then waits
+// for the GPU, as in CUDA, an asynchronous one stays in queue order.
+static CUresult copyPieces(vk::Device& dev, const std::vector<AllocPiece>& src, const std::vector<AllocPiece>& dst,
+                           bool sync = true) {
     size_t i = 0, j = 0, at = 0;
     while (i < src.size() && j < dst.size()) {
         const AllocPiece &a = src[i], &b = dst[j];
@@ -82,7 +86,27 @@ static CUresult copyPieces(vk::Device& dev, const std::vector<AllocPiece>& src, 
         if (at == a.at + a.size) ++i;
         if (at == b.at + b.size) ++j;
     }
+    if (!sync) return CUDA_SUCCESS;
+    if (CUresult r = finishIfHostTarget(dev, src)) return r;
     return finishIfHostTarget(dev, dst);
+}
+
+// Unified addressing: each side is device memory if it falls inside an allocation (device memory,
+// or host memory the device accesses), other host memory otherwise. `dstDevice` and `srcDevice`
+// require that side to be device memory (cuMemcpyHtoD and the like).
+static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_t bytes, bool sync,
+                            bool dstDevice = false, bool srcDevice = false) {
+    if (bytes == 0) return CUDA_SUCCESS;
+    if (!dst || !src) return CUDA_ERROR_INVALID_VALUE;
+    std::vector<AllocPiece> d, sr;
+    const bool dstDev = findPieces(*s.slot, dst, bytes, d);
+    const bool srcDev = findPieces(*s.slot, src, bytes, sr);
+    if ((dstDevice && !dstDev) || (srcDevice && !srcDev)) return CUDA_ERROR_INVALID_VALUE;
+    if (dstDev && srcDev) return copyPieces(*s.dev, sr, d, sync);
+    if (dstDev) return writePieces(*s.dev, d, reinterpret_cast<const void*>(src));
+    if (srcDev) return readPieces(*s.dev, sr, reinterpret_cast<void*>(dst));
+    std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
+    return CUDA_SUCCESS;
 }
 
 extern "C" {
@@ -156,53 +180,32 @@ CUresult CUDAAPI cuMemGetAddressRange_v2(CUdeviceptr* pbase, size_t* psize, CUde
     return CUDA_ERROR_NOT_FOUND;
 }
 
-CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {
-    VULKANIZER_TRACE_API();
+// The synchronous copies return once the copy is done; the asynchronous ones only order it on the
+// device queue when both sides are device-accessible (otherwise the host copies right away).
+static CUresult memcpyEntry(CUdeviceptr dst, CUdeviceptr src, size_t bytes, bool sync, bool dstDevice, bool srcDevice) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
-    if (ByteCount == 0) return CUDA_SUCCESS;
-    if (!srcHost) return CUDA_ERROR_INVALID_VALUE;
-    std::vector<AllocPiece> dst;
-    if (!findPieces(*s.slot, dstDevice, ByteCount, dst)) return CUDA_ERROR_INVALID_VALUE;
-    return writePieces(*s.dev, dst, srcHost);
+    return copyUnified(s, dst, src, bytes, sync, dstDevice, srcDevice);
+}
+
+CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {
+    VULKANIZER_TRACE_API();
+    return memcpyEntry(dstDevice, reinterpret_cast<CUdeviceptr>(srcHost), ByteCount, true, true, false);
 }
 
 CUresult CUDAAPI cuMemcpyDtoH_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) {
     VULKANIZER_TRACE_API();
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    if (ByteCount == 0) return CUDA_SUCCESS;
-    if (!dstHost) return CUDA_ERROR_INVALID_VALUE;
-    std::vector<AllocPiece> src;
-    if (!findPieces(*s.slot, srcDevice, ByteCount, src)) return CUDA_ERROR_INVALID_VALUE;
-    return readPieces(*s.dev, src, dstHost);
+    return memcpyEntry(reinterpret_cast<CUdeviceptr>(dstHost), srcDevice, ByteCount, true, false, true);
 }
 
 CUresult CUDAAPI cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount) {
     VULKANIZER_TRACE_API();
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    if (ByteCount == 0) return CUDA_SUCCESS;
-    std::vector<AllocPiece> src, dst;
-    if (!findPieces(*s.slot, srcDevice, ByteCount, src) || !findPieces(*s.slot, dstDevice, ByteCount, dst))
-        return CUDA_ERROR_INVALID_VALUE;
-    return copyPieces(*s.dev, src, dst);
+    return memcpyEntry(dstDevice, srcDevice, ByteCount, true, true, true);
 }
 
-// Unified addressing: each side is a device pointer if it falls inside an allocation, a host pointer otherwise.
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
     VULKANIZER_TRACE_API();
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    if (ByteCount == 0) return CUDA_SUCCESS;
-    std::vector<AllocPiece> d, sr;
-    const bool dstDev = findPieces(*s.slot, dst, ByteCount, d);
-    const bool srcDev = findPieces(*s.slot, src, ByteCount, sr);
-    if (dstDev && srcDev) return copyPieces(*s.dev, sr, d);
-    if (dstDev) return writePieces(*s.dev, d, reinterpret_cast<const void*>(src));
-    if (srcDev) return readPieces(*s.dev, sr, reinterpret_cast<void*>(dst));
-    std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), ByteCount);
-    return CUDA_SUCCESS;
+    return memcpyEntry(dst, src, ByteCount, true, false, false);
 }
 
 // A captured copy becomes a memcpy node, which repeats cuMemcpy on replay.
@@ -215,31 +218,32 @@ static CUresult captureCopy(CUstream hStream, CUdeviceptr dst, CUdeviceptr src, 
     return captureNode(hStream, std::move(node));
 }
 
-CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream) {
+static CUresult memcpyAsyncEntry(CUdeviceptr dst, CUdeviceptr src, size_t bytes, CUstream hStream, bool dstDevice,
+                                 bool srcDevice) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
-    if (CUstream cs = capturingStream(hStream)) return captureCopy(cs, dst, src, ByteCount);
-    return cuMemcpy(dst, src, ByteCount);
+    if (CUstream cs = capturingStream(hStream)) return captureCopy(cs, dst, src, bytes);
+    return memcpyEntry(dst, src, bytes, false, dstDevice, srcDevice);
+}
+
+CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream) {
+    VULKANIZER_TRACE_API();
+    return memcpyAsyncEntry(dst, src, ByteCount, hStream, false, false);
 }
 
 CUresult CUDAAPI cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream hStream) {
-    if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
-    if (CUstream cs = capturingStream(hStream))
-        return captureCopy(cs, dstDevice, reinterpret_cast<CUdeviceptr>(srcHost), ByteCount);
-    return cuMemcpyHtoD_v2(dstDevice, srcHost, ByteCount);
+    VULKANIZER_TRACE_API();
+    return memcpyAsyncEntry(dstDevice, reinterpret_cast<CUdeviceptr>(srcHost), ByteCount, hStream, true, false);
 }
 
 CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream) {
-    if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
-    if (CUstream cs = capturingStream(hStream))
-        return captureCopy(cs, reinterpret_cast<CUdeviceptr>(dstHost), srcDevice, ByteCount);
-    return cuMemcpyDtoH_v2(dstHost, srcDevice, ByteCount);
+    VULKANIZER_TRACE_API();
+    return memcpyAsyncEntry(reinterpret_cast<CUdeviceptr>(dstHost), srcDevice, ByteCount, hStream, false, true);
 }
 
 CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount,
                                       CUstream hStream) {
-    if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
-    if (CUstream cs = capturingStream(hStream)) return captureCopy(cs, dstDevice, srcDevice, ByteCount);
-    return cuMemcpyDtoD_v2(dstDevice, srcDevice, ByteCount);
+    VULKANIZER_TRACE_API();
+    return memcpyAsyncEntry(dstDevice, srcDevice, ByteCount, hStream, true, true);
 }
 
 CUresult CUDAAPI cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {

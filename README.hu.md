@@ -213,6 +213,8 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 - (Még) nem támogatott: textúrák, cuDNN, NCCL, több GPU.
 - A managed, a pinned és a regisztrált memória host-memória, amit a GPU helyben, ugyanazon a címen használ; a managed
   memória sosem migrál a GPU-ra (integrált GPU-n ez amúgy is ugyanaz a memória).
+- Amíg regisztrált host-memória (`cuMemHostRegister`) létezik, minden GPU-submit lassabb (a kernel újraellenőrzi az
+  importált lapokat, ~4 ms / 256 MB); a pinned és a managed memóriát ez nem érinti.
 - A llama.cpp flash attention helyesen fut (`tools/build_llama.sh --fa`), de tensor core-ok nélkül vele lassabb a
   prompt feldolgozása, ezért alapból ki van kapcsolva.
 - PyTorch: nincsenek cuDNN-, NCCL- és fúzionált attention kernelek; egy eszközoldali `assert` hibája csak a szálat
@@ -230,6 +232,7 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 | `./ci.sh` | Teljes ellenőrzés: Debug+ASAN és Release, minden eszközön (a `build-ci/`-be fordít) |
 | `build/bin/vulkanizer-info` | Kilistázza a Vulkanizer által látott Vulkan eszközöket |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | Másolási sávszélesség (HtoD/DtoH/DtoD, lapozható és pinned) és foglalási költség: `vulkanizer-bandwidth [MiB]` |
 
 Példák:
 
@@ -254,6 +257,6 @@ tests/                Driver API tesztek + belső Vulkan teszt
 tests/cuda            nvcc-vel fordított Runtime API programok
 tests/cudart_abi      a clean-room runtime típusok ABI-egyezése a hivatalos headerekkel
 tests/data            teszt-PTX fájlok, mellettük a .cu forrásaik; a gen_ptx.sh újragenerálja őket (clang)
-tools/                vulkanizer-info (eszközlista), vulkanizer-ptxc (offline fordító), setup_cuda.sh,
+tools/                vulkanizer-info (eszközlista), vulkanizer-ptxc (offline fordító), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (a llama.cpp CUDA-buildje a Vulkanizer ellen)
 ```

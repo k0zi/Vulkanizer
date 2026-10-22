@@ -212,6 +212,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - （まだ）未対応：テクスチャ、cuDNN、NCCL、マルチ GPU。
 - マネージド、ピン留め、登録済みのメモリはホストメモリであり、GPU は同じアドレスでその場で使います。マネージドメモリが
   GPU に移動することはありません（統合 GPU ではいずれにせよ同じメモリです）。
+- 登録済みホストメモリ（`cuMemHostRegister`）が存在する間は、GPU への投入がすべて遅くなります（カーネルがインポートされた
+  ページを毎回再検証するため、256 MB あたり約 4 ms）。ピン留めメモリとマネージドメモリは影響を受けません。
 - llama.cpp の flash attention は正しく動作します（`tools/build_llama.sh --fa`）が、tensor core がない環境では
   プロンプト処理が遅くなるため、既定では無効です。
 - PyTorch：cuDNN、NCCL、融合 attention のカーネルはありません。デバイス側の `assert` が失敗してもそのスレッドが
@@ -229,6 +231,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `./ci.sh` | 完全チェック：Debug+ASAN と Release を全デバイスで実行（`build-ci/` にビルド） |
 | `build/bin/vulkanizer-info` | Vulkanizer から見える Vulkan デバイスを一覧表示 |
 | `build/bin/vulkanizer-ptxc` | オフラインの PTX → SPIR-V：`vulkanizer-ptxc k.ptx --list`、`-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | コピー帯域幅（HtoD/DtoH/DtoD、ページング可能とピン留め）と割り当てコスト：`vulkanizer-bandwidth [MiB]` |
 
 例：
 

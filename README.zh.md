@@ -205,6 +205,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - （尚）不支持：纹理、cuDNN、NCCL、多 GPU。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU
   （在集成 GPU 上本来就是同一块内存）。
+- 只要存在已注册的主机内存（`cuMemHostRegister`），每次 GPU 提交都会变慢（内核会重新验证导入的页面，每 256 MB 约 4 ms）；
+  锁页内存和托管内存不受影响。
 - llama.cpp 的 flash attention 可以正确运行（`tools/build_llama.sh --fa`），但在没有 tensor core 的情况下，
   它会让提示词处理变慢，因此默认关闭。
 - PyTorch：没有 cuDNN、NCCL 和融合 attention 内核；设备端 `assert` 失败只会停止该线程（没有 `cudaErrorAssert`）。
@@ -221,6 +223,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `./ci.sh` | 完整检查：Debug+ASAN 和 Release，在每个设备上运行（构建到 `build-ci/`） |
 | `build/bin/vulkanizer-info` | 列出 Vulkanizer 能看到的 Vulkan 设备 |
 | `build/bin/vulkanizer-ptxc` | 离线 PTX → SPIR-V：`vulkanizer-ptxc k.ptx --list`、`-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | 复制带宽（HtoD/DtoH/DtoD，可分页与锁页）和分配开销：`vulkanizer-bandwidth [MiB]` |
 
 示例：
 

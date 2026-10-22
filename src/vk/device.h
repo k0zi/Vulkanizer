@@ -21,7 +21,9 @@ struct Buffer {
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
     void* mapped = nullptr;  // set when the memory is host-visible and coherent
-    bool importedHost = false;  // `mapped` is application host memory imported into the device
+    bool hostCached = false;  // host reads of `mapped` are cached (otherwise write-combined: very slow)
+    bool hostAddressed = false;  // host memory at its own address (address == mapped)
+    bool placedMapping = false;  // our memory, mapped at a chosen address (allocateHostMemory)
 };
 
 struct ComputePipeline {
@@ -51,6 +53,7 @@ struct Features {
     bool sparseBuffers = false;      // sparse residency buffers on the compute queue (CUDA VMM)
     bool addressCaptureReplay = false;  // buffers can be placed at a requested device address
     bool hostMemoryImport = false;  // host memory at device address h | kHostAddressBits (importHostMemory)
+    bool hostMemoryAlloc = false;   // the same for memory of our own (allocateHostMemory)
 };
 
 // One page range of a sparse buffer bound to `memory` (or unbound if VK_NULL_HANDLE).
@@ -95,6 +98,11 @@ public:
     // bound to it). `host` and `size` must be multiples of hostImportAlignment(). out.address and
     // out.mapped are `host`. Fails if the device address range is taken.
     VkResult importHostMemory(void* host, VkDeviceSize size, Buffer& out);
+    // Host-cached memory of the device, mapped at a host address h of its choosing and usable by
+    // the device at h | kHostAddressBits, like imported memory (out.address = out.mapped = h). Unlike
+    // imported memory (userptr), it costs nothing per submit: the kernel revalidates every
+    // imported page on each submission. `size` is rounded up to whole sparsePageSize() units.
+    VkResult allocateHostMemory(VkDeviceSize size, Buffer& out);
     VkResult createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, Buffer& out, uint64_t& opaqueOut);
     VkResult allocateMemory(VkDeviceSize size, VkDeviceMemory& out);  // for sparse binding
     void freeMemory(VkDeviceMemory memory);
@@ -164,6 +172,10 @@ private:
     static constexpr uint32_t kMaxCommandsPerBatch = 64;
     static constexpr uint32_t kTimestamps = 1024;
     static constexpr VkDeviceSize kAsyncWriteLimit = 256 * 1024;
+    // Reads from uncached mapped memory larger than this go through readStaging_ (a GPU copy into
+    // host-cached memory), in chunks of kReadChunk: uncached host reads run at ~0.2 GB/s.
+    static constexpr VkDeviceSize kDirectReadLimit = 4 * 1024;
+    static constexpr VkDeviceSize kReadChunk = 8 << 20;
     // A pipeline's first launch runs this many workgroups on their own to measure it. Rates are
     // taken per this many workgroups at least, as smaller grids leave the GPU partly idle.
     static constexpr uint64_t kRateGroups = 256;
@@ -219,11 +231,19 @@ private:
     // GPU time per workgroup of each pipeline: the highest seen, so estimates err on the long side.
     std::unordered_map<VkPipeline, double> nsPerGroup_;
     std::vector<std::pair<uint64_t, Buffer>> deferredFrees_;  // (serial, buffer)
+    Buffer readStaging_;  // host-cached, two kReadChunk halves (read)
     VkDeviceSize sparsePageSize_ = 0;
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
     VkDeviceSize hostImportAlignment_ = 0;
     PFN_vkGetMemoryHostPointerPropertiesEXT getHostPointerProperties_ = nullptr;
+    PFN_vkMapMemory2KHR mapMemory2_ = nullptr;
+    PFN_vkUnmapMemory2KHR unmapMemory2_ = nullptr;
+    // A sparse buffer of `size` at device address h | kHostAddressBits (fails if that is taken).
+    VkResult createAtHostAddress(uint64_t h, VkDeviceSize size, bool imported, Buffer& out);
+    // allocateHostMemory's buffer and host-visible memory at h | kHostAddressBits, not yet mapped:
+    // a plain buffer on memory placed there, or a sparse buffer placed there.
+    VkResult placeHostMemory(uint64_t h, VkDeviceSize size, bool sparse, Buffer& out);
     std::recursive_mutex mutex_;
 };
 

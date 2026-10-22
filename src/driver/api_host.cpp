@@ -1,11 +1,16 @@
 // Host memory the device can use: pinned (cuMemAllocHost/cuMemHostAlloc), registered
-// (cuMemHostRegister) and managed (cuMemAllocManaged) memory. All three are host pages imported
-// into the device at device address h | kHostAddressBits (vk::Device::importHostMemory), and
+// (cuMemHostRegister) and managed (cuMemAllocManaged) memory. All three are host memory the device
+// uses at device address h | kHostAddressBits, and
 // kernels set those bits on every address, so the host pointer h is also the device pointer, as
 // with CUDA's unified addressing. The imported range is an ordinary allocation of the slot
 // (keyed by h), so copies, memsets and pointer queries treat it like device memory.
 //
 // Managed memory never migrates: it stays host memory the device reads and writes in place
+// Pinned and managed memory is the device's own host-cached memory mapped at an address of our
+// choosing (vk::Device::allocateHostMemory); registered memory is the application's pages imported
+// (vk::Device::importHostMemory). Imported pages cost time on every GPU submission (the kernel
+// revalidates them), so they are only used where the application owns the memory.
+//
 // (on an integrated GPU that is the same memory anyway). Advice and prefetches are accepted and
 // ignored. Registration of pages that are already imported (two registrations sharing a page) and
 // devices without the import support fall back to plain host memory the device cannot access.
@@ -81,15 +86,25 @@ void releasePages(ApiScope& s, HostRange& r) {
     r.pages = 0;
 }
 
-// Fresh, page-aligned host memory of our own, imported if possible.
+// Fresh, page-aligned host memory of our own: the device's host memory at its own address, or
+// else anonymous memory, imported if possible.
 CUresult allocateHost(ApiScope& s, size_t bytesize, HostKind kind, unsigned int flags, bool needDevice, void** out) {
-    const size_t align = importAlignment(s), mapped = (bytesize + align - 1) / align * align;
-    void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) return CUDA_ERROR_OUT_OF_MEMORY;
     HostRange r;
     r.kind = kind;
     r.size = bytesize;
     r.flags = flags;
+    vk::Buffer buf;
+    if (s.dev->allocateHostMemory(bytesize, buf) == VK_SUCCESS) {
+        s.slot->allocations[buf.address] = buf;
+        r.pages = buf.address;
+        r.pagesSize = buf.size;
+        hostRanges()[buf.address] = r;
+        *out = buf.mapped;
+        return CUDA_SUCCESS;
+    }
+    const size_t align = importAlignment(s), mapped = (bytesize + align - 1) / align * align;
+    void* p = mmap(nullptr, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return CUDA_ERROR_OUT_OF_MEMORY;
     r.mapping = p;
     r.mappingSize = mapped;
     if (!importPages(s, uintptr_t(p), bytesize, r) && needDevice) {

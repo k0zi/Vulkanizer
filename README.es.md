@@ -214,6 +214,8 @@ Lista completa: [plan.md, sección 4](plan.md).
 - (Aún) no compatible: texturas, cuDNN, NCCL, varias GPU.
 - La memoria managed, fijada (pinned) y registrada es memoria del anfitrión que la GPU usa en su sitio, en la misma
   dirección; la memoria managed nunca migra a la GPU (en una GPU integrada es la misma memoria de todos modos).
+- Mientras exista memoria del anfitrión registrada (`cuMemHostRegister`), cada envío a la GPU es más lento (el kernel
+  revalida las páginas importadas, ~4 ms por 256 MB); la memoria fijada y la managed no se ven afectadas.
 - La flash attention de llama.cpp funciona correctamente (`tools/build_llama.sh --fa`), pero sin tensor cores el
   procesamiento del prompt es más lento con ella, por eso está desactivada por defecto.
 - PyTorch: sin kernels de cuDNN, NCCL ni de atención fusionada; un `assert` fallido en el dispositivo solo detiene el
@@ -231,6 +233,7 @@ Lista completa: [plan.md, sección 4](plan.md).
 | `./ci.sh` | Comprobación completa: Debug+ASAN y Release, en cada dispositivo (compila en `build-ci/`) |
 | `build/bin/vulkanizer-info` | Lista los dispositivos Vulkan que ve Vulkanizer |
 | `build/bin/vulkanizer-ptxc` | PTX → SPIR-V sin conexión: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
+| `build/bin/vulkanizer-bandwidth` | Ancho de banda de copia (HtoD/DtoH/DtoD, paginable y fijada) y coste de asignación: `vulkanizer-bandwidth [MiB]` |
 
 Ejemplos:
 
@@ -255,6 +258,6 @@ tests/                pruebas de la API Driver + prueba interna de Vulkan
 tests/cuda            programas de la API Runtime compilados con nvcc
 tests/cudart_abi      conformidad ABI de los tipos clean-room del runtime con las cabeceras oficiales
 tests/data            archivos PTX de prueba con sus fuentes .cu al lado; gen_ptx.sh los regenera (clang)
-tools/                vulkanizer-info (lista de dispositivos), vulkanizer-ptxc (compilador sin conexión), setup_cuda.sh,
+tools/                vulkanizer-info (lista de dispositivos), vulkanizer-ptxc (compilador sin conexión), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (compilación CUDA de llama.cpp contra Vulkanizer)
 ```

@@ -10,6 +10,7 @@
 #include <cxxabi.h>
 #include <map>
 #include <string>
+#include <sys/mman.h>
 
 namespace vulkanizer::vk {
 
@@ -150,17 +151,40 @@ VkResult Device::init() {
         e12.bufferDeviceAddressCaptureReplay = s12.bufferDeviceAddressCaptureReplay;
     }
     // Host memory the device can use at a chosen address (CUDA pinned, registered and managed
-    // memory): imported host pages bound to a sparse buffer placed with capture/replay.
+    // memory): imported host pages (registered memory) or memory of our own mapped at a chosen
+    // address (VK_EXT_map_memory_placed), bound to a sparse buffer placed with capture/replay.
     std::vector<const char*> extensions;
-    {
+    bool hostImport = false;
+    VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+    if (en.features.sparseBinding && e12.bufferDeviceAddressCaptureReplay) {
         uint32_t count = 0;
         vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, nullptr);
         std::vector<VkExtensionProperties> props(count);
         vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, props.data());
-        for (const VkExtensionProperties& p : props)
-            if (!std::strcmp(p.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && en.features.sparseBinding &&
-                e12.bufferDeviceAddressCaptureReplay)
-                extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        auto has = [&](const char* name) {
+            for (const VkExtensionProperties& p : props)
+                if (!std::strcmp(p.extensionName, name)) return true;
+            return false;
+        };
+        if (has(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+            extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            hostImport = true;
+        }
+        if (has(VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) && has(VK_KHR_MAP_MEMORY_2_EXTENSION_NAME)) {
+            VkPhysicalDeviceMapMemoryPlacedFeaturesEXT supported{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &supported;
+            vkGetPhysicalDeviceFeatures2(info_.handle, &f2);
+            if (supported.memoryMapPlaced && supported.memoryUnmapReserve) {
+                extensions.push_back(VK_KHR_MAP_MEMORY_2_EXTENSION_NAME);
+                extensions.push_back(VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME);
+                placed.memoryMapPlaced = VK_TRUE;
+                placed.memoryUnmapReserve = VK_TRUE;
+                placed.pNext = en.pNext;
+                en.pNext = &placed;
+            }
+        }
     }
     if (has13) {
         e13.subgroupSizeControl = s13.subgroupSizeControl;
@@ -265,7 +289,12 @@ VkResult Device::init() {
     features_.fusedFma = probeFusedFma();
     features_.fusedFma64 = features_.shaderFloat64 && probeFusedFma64();
     if (features_.sparseBuffers) probeSparse();
-    if (!extensions.empty() && features_.sparseBuffers) {
+    if (placed.memoryMapPlaced && features_.sparseBuffers) {
+        mapMemory2_ = reinterpret_cast<PFN_vkMapMemory2KHR>(vkGetDeviceProcAddr(device_, "vkMapMemory2KHR"));
+        unmapMemory2_ = reinterpret_cast<PFN_vkUnmapMemory2KHR>(vkGetDeviceProcAddr(device_, "vkUnmapMemory2KHR"));
+        features_.hostMemoryAlloc = mapMemory2_ && unmapMemory2_;
+    }
+    if (hostImport && features_.sparseBuffers) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         p2.pNext = &hp;
@@ -286,6 +315,7 @@ Device::~Device() {
     if (!device_) return;
     vkDeviceWaitIdle(device_);
     for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
+    destroyBuffer(readStaging_);
     for (Batch& b : batches_) {
         if (b.fence) vkDestroyFence(device_, b.fence, nullptr);
         if (b.arena.buffer) {
@@ -373,6 +403,7 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     constexpr VkMemoryPropertyFlags kMappable = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if ((chosen & kMappable) == kMappable) {
         if (vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &out.mapped) != VK_SUCCESS) out.mapped = nullptr;
+        out.hostCached = (chosen & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
     }
     if (wantAddress) {
         VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -404,7 +435,16 @@ VkResult Device::allocateBuffer(VkDeviceSize size, Buffer& out) {
 }
 
 void Device::destroyBuffer(Buffer& buf) {
-    if (buf.mapped && !buf.importedHost) vkUnmapMemory(device_, buf.memory);
+    if (buf.placedMapping) {
+        // Back to a reserved range first: nothing else may be mapped there before the munmap.
+        VkMemoryUnmapInfoKHR ui{VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR};
+        ui.flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT;
+        ui.memory = buf.memory;
+        unmapMemory2_(device_, &ui);
+        munmap(buf.mapped, size_t(buf.size));
+    } else if (buf.mapped && !buf.hostAddressed) {
+        vkUnmapMemory(device_, buf.memory);
+    }
     if (buf.buffer) vkDestroyBuffer(device_, buf.buffer, nullptr);
     if (buf.memory) vkFreeMemory(device_, buf.memory, nullptr);
     buf = Buffer{};
@@ -480,19 +520,14 @@ VkResult Device::createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, B
     return VK_SUCCESS;
 }
 
-VkResult Device::importHostMemory(void* host, VkDeviceSize size, Buffer& out) {
+VkResult Device::createAtHostAddress(uint64_t h, VkDeviceSize size, bool imported, Buffer& out) {
     out = Buffer{};
-    if (!features_.hostMemoryImport) return VK_ERROR_FEATURE_NOT_PRESENT;
-    const uint64_t h = reinterpret_cast<uint64_t>(host);
-    if (h % hostImportAlignment_ || size % hostImportAlignment_ || !size || h >= (uint64_t(1) << 47) ||
-        size > maxSparseBufferSize_)
-        return VK_ERROR_INITIALIZATION_FAILED;
     const uint64_t wanted = h | kHostAddressBits;
     VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferOpaqueCaptureAddressCreateInfo oci{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
     oci.opaqueCaptureAddress = wanted;
-    oci.pNext = &ext;
+    oci.pNext = imported ? &ext : nullptr;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.pNext = &oci;
     bci.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT |
@@ -503,39 +538,149 @@ VkResult Device::importHostMemory(void* host, VkDeviceSize size, Buffer& out) {
     if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer)) return r;
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = out.buffer;
-    VkResult r = VK_SUCCESS;
     if (vkGetBufferDeviceAddress(device_, &bai) != wanted) {
-        r = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;  // the range is taken
-    } else {
-        VkMemoryHostPointerPropertiesEXT hpp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(device_, out.buffer, &req);
-        r = getHostPointerProperties_(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hpp);
-        const int32_t type = r == VK_SUCCESS ? findMemoryType(hpp.memoryTypeBits & req.memoryTypeBits, 0) : -1;
-        if (r == VK_SUCCESS && type < 0) r = VK_ERROR_FORMAT_NOT_SUPPORTED;
-        if (r == VK_SUCCESS) {
-            VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
-            imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-            imp.pHostPointer = host;
-            VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            mai.pNext = &imp;
-            mai.allocationSize = size;
-            mai.memoryTypeIndex = uint32_t(type);
-            r = vkAllocateMemory(device_, &mai, nullptr, &out.memory);
-        }
-        if (r == VK_SUCCESS) {
-            out.size = size;
-            r = bindSparse({{&out, 0, size, out.memory, 0}});
-        }
+        destroyBuffer(out);
+        return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;  // the range is taken
     }
+    out.size = size;
+    return VK_SUCCESS;
+}
+
+VkResult Device::importHostMemory(void* host, VkDeviceSize size, Buffer& out) {
+    out = Buffer{};
+    if (!features_.hostMemoryImport) return VK_ERROR_FEATURE_NOT_PRESENT;
+    const uint64_t h = reinterpret_cast<uint64_t>(host);
+    if (h % hostImportAlignment_ || size % hostImportAlignment_ || !size || h >= (uint64_t(1) << 47) ||
+        size > maxSparseBufferSize_)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (VkResult r = createAtHostAddress(h, size, true, out)) return r;
+    VkMemoryHostPointerPropertiesEXT hpp{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, out.buffer, &req);
+    VkResult r = getHostPointerProperties_(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &hpp);
+    const int32_t type = r == VK_SUCCESS ? findMemoryType(hpp.memoryTypeBits & req.memoryTypeBits, 0) : -1;
+    if (r == VK_SUCCESS && type < 0) r = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (r == VK_SUCCESS) {
+        VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        imp.pHostPointer = host;
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.pNext = &imp;
+        mai.allocationSize = size;
+        mai.memoryTypeIndex = uint32_t(type);
+        r = vkAllocateMemory(device_, &mai, nullptr, &out.memory);
+    }
+    if (r == VK_SUCCESS) r = bindSparse({{&out, 0, size, out.memory, 0}});
     if (r != VK_SUCCESS) {
         destroyBuffer(out);
         return r;
     }
     out.address = h;
     out.mapped = host;
-    out.importedHost = true;
+    out.hostAddressed = true;
+    out.hostCached = true;
     return VK_SUCCESS;
+}
+
+VkResult Device::allocateHostMemory(VkDeviceSize size, Buffer& out) {
+    out = Buffer{};
+    if (!features_.hostMemoryAlloc) return VK_ERROR_FEATURE_NOT_PRESENT;
+    // RADV places memory of 2 MiB or more only at 2 MiB aligned addresses.
+    constexpr VkDeviceSize align = 2 << 20;
+    const VkDeviceSize page = std::max<VkDeviceSize>(sparsePageSize_, 64 << 10);
+    size = (size + page - 1) / page * page;
+    if (!size || size > maxSparseBufferSize_) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    // An aligned range of the address space, reserved until the memory is mapped over it.
+    char* reserved = static_cast<char*>(
+        mmap(nullptr, size + align, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+    if (reserved == MAP_FAILED) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    char* host = reinterpret_cast<char*>((uintptr_t(reserved) + align - 1) / align * align);
+    if (host > reserved) munmap(reserved, size_t(host - reserved));
+    if (host + size < reserved + size + align) munmap(host + size, size_t(reserved + size + align - (host + size)));
+
+    // Preferably a plain buffer on memory placed at the address (the memory's capture/replay
+    // address), otherwise a sparse buffer placed there with the memory bound to it: on RADV,
+    // system memory bound to a sparse buffer makes every submission slower (~4 ms per 256 MB).
+    const uint64_t h = reinterpret_cast<uint64_t>(host);
+    VkResult r = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+    for (bool sparse : {false, true}) {
+        r = placeHostMemory(h, size, sparse, out);
+        VULKANIZER_DEBUG("host memory at 0x%llx (%llu bytes), %s buffer: %d", (unsigned long long)h, (unsigned long long)size, sparse ? "sparse" : "plain", r);
+        if (r != VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS) break;
+    }
+    if (r == VK_SUCCESS) {
+        VkMemoryMapPlacedInfoEXT placed{VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT};
+        placed.pPlacedAddress = host;
+        VkMemoryMapInfoKHR mi{VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR};
+        mi.pNext = &placed;
+        mi.flags = VK_MEMORY_MAP_PLACED_BIT_EXT;
+        mi.memory = out.memory;
+        mi.size = VK_WHOLE_SIZE;
+        void* mapped = nullptr;
+        r = mapMemory2_(device_, &mi, &mapped);
+        if (r == VK_SUCCESS && mapped != host) r = VK_ERROR_MEMORY_MAP_FAILED;  // not expected
+        if (r == VK_SUCCESS) {
+            out.mapped = host;
+            out.placedMapping = true;
+        } else {
+            destroyBuffer(out);
+        }
+    }
+    if (r != VK_SUCCESS) {
+        munmap(host, size);
+        return r;
+    }
+    out.address = h;
+    out.hostAddressed = true;
+    return VK_SUCCESS;
+}
+
+VkResult Device::placeHostMemory(uint64_t h, VkDeviceSize size, bool sparse, Buffer& out) {
+    const uint64_t wanted = h | kHostAddressBits;
+    VkResult r = VK_SUCCESS;
+    if (sparse) {
+        r = createAtHostAddress(h, size, false, out);
+    } else {
+        out = Buffer{};
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.flags = VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        bci.size = size;
+        bci.usage = kDeviceBufferUsage;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer);
+        out.size = size;
+    }
+    if (r != VK_SUCCESS) return r;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, out.buffer, &req);
+    constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    int32_t type = findMemoryType(req.memoryTypeBits, kHost | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (type < 0) type = findMemoryType(req.memoryTypeBits, kHost);
+    VkMemoryOpaqueCaptureAddressAllocateInfo cai{VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO};
+    cai.opaqueCaptureAddress = wanted;
+    VkMemoryAllocateFlagsInfo flagsInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    if (!sparse) {
+        flagsInfo.flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+        flagsInfo.pNext = &cai;
+    }
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.pNext = &flagsInfo;
+    mai.allocationSize = size;
+    mai.memoryTypeIndex = uint32_t(type);
+    r = type < 0 ? VK_ERROR_OUT_OF_HOST_MEMORY : vkAllocateMemory(device_, &mai, nullptr, &out.memory);
+    if (r == VK_SUCCESS) {
+        out.hostCached = info_.memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        if (sparse) {
+            r = bindSparse({{&out, 0, size, out.memory, 0}});
+        } else if ((r = vkBindBufferMemory(device_, out.buffer, out.memory, 0)) == VK_SUCCESS) {
+            VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bai.buffer = out.buffer;
+            if (vkGetBufferDeviceAddress(device_, &bai) != wanted) r = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+        }
+    }
+    if (r != VK_SUCCESS) destroyBuffer(out);
+    return r;
 }
 
 VkResult Device::allocateMemory(VkDeviceSize size, VkDeviceMemory& out) {
@@ -954,25 +1099,47 @@ VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, 
 
 VkResult Device::read(const Buffer& src, VkDeviceSize offset, void* dst, VkDeviceSize size) {
     if (size == 0) return VK_SUCCESS;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (VkResult r = finish()) return r;  // host access: recorded work comes first
-    if (src.mapped) {
+    if (src.mapped && (src.hostCached || size <= kDirectReadLimit)) {
         std::memcpy(dst, static_cast<const char*>(src.mapped) + offset, size);
         return VK_SUCCESS;
     }
-    Buffer staging;
-    VkResult r = createBuffer(size, kStagingUsage,
-                              {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT},
-                              staging);
-    if (r != VK_SUCCESS) return r;
-    r = submit([&](VkCommandBuffer cb) {
-        VkBufferCopy region{offset, 0, size};
-        vkCmdCopyBuffer(cb, src.buffer, staging.buffer, 1, &region);
-    });
-    if (r == VK_SUCCESS) std::memcpy(dst, staging.mapped, size);
-    freeBuffer(staging);
-    return r;
+    if (!readStaging_.buffer) {
+        constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if (VkResult r = createBuffer(2 * kReadChunk, kStagingUsage, {kHost | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, kHost},
+                                      readStaging_))
+            return r;
+        if (!readStaging_.mapped) {
+            destroyBuffer(readStaging_);
+            return VK_ERROR_MEMORY_MAP_FAILED;
+        }
+    }
+    // The GPU copies chunk i into one half of the staging buffer while the host copies chunk i - 1
+    // out of the other.
+    uint64_t prevSerial = 0;
+    VkDeviceSize prevAt = 0, prevSize = 0;
+    for (VkDeviceSize at = 0, i = 0;; at += prevSize, ++i) {
+        const VkDeviceSize n = std::min(kReadChunk, size - at);
+        if (n) {
+            const VkDeviceSize half = (i % 2) * kReadChunk;
+            if (VkResult r = record([&](VkCommandBuffer cb) {
+                    VkBufferCopy region{offset + at, half, n};
+                    vkCmdCopyBuffer(cb, src.buffer, readStaging_.buffer, 1, &region);
+                }))
+                return r;
+            if (VkResult r = flushLocked()) return r;
+        }
+        if (prevSize) {
+            if (VkResult r = wait(prevSerial)) return r;
+            std::memcpy(static_cast<char*>(dst) + prevAt,
+                        static_cast<const char*>(readStaging_.mapped) + ((i - 1) % 2) * kReadChunk, prevSize);
+        }
+        if (!n) return VK_SUCCESS;
+        prevSerial = nextSerial_ - 1;
+        prevAt = at;
+        prevSize = n;
+    }
 }
 
 VkResult Device::copy(const Buffer& src, VkDeviceSize srcOffset, const Buffer& dst, VkDeviceSize dstOffset,
