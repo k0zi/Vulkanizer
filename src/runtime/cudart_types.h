@@ -3,9 +3,14 @@
 // Clean-room declarations of the CUDA Runtime API types Vulkanizer's libcudart implements,
 // written from the public CUDA Runtime API reference. Values and layouts must match the
 // official headers bit for bit (applications are compiled against those);
-// tests/cudart_abi checks that when a CUDA toolkit is available (.cuda/).
+// tests/cudart_abi checks that when a CUDA toolkit is available (.cuda/, .cuda13/).
+// VULKANIZER_CUDART_MAJOR picks the ABI: 12 (libcudart.so.12) or 13 (libcudart.so.13).
 
 #include <cuda.h>
+
+#ifndef VULKANIZER_CUDART_MAJOR
+#define VULKANIZER_CUDART_MAJOR 12
+#endif
 
 #include <cstddef>
 
@@ -161,21 +166,31 @@ struct cudaDeviceProp {
     int maxThreadsPerBlock;
     int maxThreadsDim[3];
     int maxGridSize[3];
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int clockRate;
+#endif
     size_t totalConstMem;
     int major;
     int minor;
     size_t textureAlignment;
     size_t texturePitchAlignment;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int deviceOverlap;
+#endif
     int multiProcessorCount;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int kernelExecTimeoutEnabled;
+#endif
     int integrated;
     int canMapHostMemory;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int computeMode;
+#endif
     int maxTexture1D;
     int maxTexture1DMipmap;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int maxTexture1DLinear;
+#endif
     int maxTexture2D[2];
     int maxTexture2DMipmap[2];
     int maxTexture2DLinear[3];
@@ -202,7 +217,9 @@ struct cudaDeviceProp {
     int tccDriver;
     int asyncEngineCount;
     int unifiedAddressing;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int memoryClockRate;
+#endif
     int memoryBusWidth;
     int l2CacheSize;
     int persistingL2CacheMaxSize;
@@ -216,13 +233,17 @@ struct cudaDeviceProp {
     int isMultiGpuBoard;
     int multiGpuBoardGroupID;
     int hostNativeAtomicSupported;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int singleToDoublePrecisionPerfRatio;
+#endif
     int pageableMemoryAccess;
     int concurrentManagedAccess;
     int computePreemptionSupported;
     int canUseHostPointerForRegisteredMem;
     int cooperativeLaunch;
+#if VULKANIZER_CUDART_MAJOR < 13  // removed in CUDA 13
     int cooperativeMultiDeviceLaunch;
+#endif
     size_t sharedMemPerBlockOptin;
     int pageableMemoryAccessUsesHostPageTables;
     int directManagedMemAccessFromHost;
@@ -242,7 +263,23 @@ struct cudaDeviceProp {
     int ipcEventSupported;
     int clusterLaunch;
     int unifiedFunctionPointers;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    int deviceNumaConfig;
+    int deviceNumaId;
+    int mpsEnabled;
+    int hostNumaId;
+    unsigned int gpuPciDeviceID;
+    unsigned int gpuPciSubsystemID;
+    int hostNumaMultinodeIpcSupported;
+    int reserved[56];
+#else
     int reserved[63];
+#endif
+};
+
+struct cudaMemLocation {  // CUDA 13: cudaMemAdvise's target
+    int type;            // enum cudaMemLocationType
+    int id;
 };
 
 enum cudaStreamCaptureStatus {
@@ -329,7 +366,13 @@ struct cudaFuncAttributes {
     int requiredClusterDepth;
     int clusterSchedulingPolicyPreference;
     int nonPortableClusterSizeAllowed;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    int deviceNodeUpdateStatus;
+    int sharedMemoryMode;  // enum cudaSharedMemoryMode
+    int reserved[14];
+#else
     int reserved[16];
+#endif
 };
 
 }  // extern "C"

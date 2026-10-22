@@ -30,6 +30,8 @@ Optional (Ubuntu package names):
 Tests compiled with a real nvcc: `tools/setup_cuda.sh` downloads NVIDIA's nvcc + runtime
 redistributable packages into `.cuda/` (no driver, no GPU, no root needed). If `.cuda/` exists,
 CMake compiles the `tests/cuda/*.cu` programs with nvcc and ctest runs them against the Vulkanizer libraries.
+`tools/setup_cuda.sh --cuda13` does the same with CUDA 13.4 into `.cuda13/`: the programs are built again
+with nvcc 13 and run on `libcudart.so.13` (tests ending in `_13`).
 
 ## Usage
 
@@ -42,7 +44,9 @@ build/bin/vulkanizer-info                       # which Vulkan devices Vulkanize
 ./test.sh                                  # tests (optional)
 ```
 
-The built libraries are in `build/lib/`: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`.
+The built libraries are in `build/lib/`: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`.
+`build/lib/cuda13/` holds the CUDA 13 versions of the runtime and cuBLAS (`libcudart.so.13`, `libcublas.so.13`,
+`libcublasLt.so.13`), for programs built with CUDA 13; they use the same `libcuda.so.1`.
 
 ### 2. Running a CUDA program
 
@@ -115,10 +119,15 @@ tools/setup_torch.sh                       # conda-forge PyTorch CUDA environmen
 ./run_torch.sh torch_ops                   # conv, softmax, LayerNorm, attention, Transformer layer, ...
 ./run_torch.sh tests/torch/triton_ops.py   # a hand-written Triton kernel and torch._native's Triton bmm
 ./run_torch.sh tests/torch/compile.py      # torch.compile (Inductor -> Triton) MLP forward and backward
+
+tools/setup_torch.sh --cuda13              # the CUDA 13.4 build in .work/torch-cf13
+./run_torch.sh --env .work/torch-cf13 torch13_ops
 ```
 
 `torch_mlp`, `torch_ops` and `torch_split` are C++ tests against the environment's libtorch
-(`tests/torch/*.cpp`); CMake builds them when `.work/torch-cf` exists at configure time.
+(`tests/torch/*.cpp`); CMake builds them when `.work/torch-cf` exists at configure time, and as `torch13_*`
+against `.work/torch-cf13`. For an environment with `libcudart.so.13` (a CUDA 13 build), `run_torch.sh`
+loads the libraries from `build/lib/cuda13`.
 
 The official PyTorch wheels contain only native NVIDIA machine code (SASS), no PTX, so Vulkanizer cannot
 run their kernels. The conda-forge CUDA builds also ship PTX (`compute_120`):
@@ -232,8 +241,8 @@ src/vk                Vulkan instance/device, buffers, pipelines
 src/ptx               PTX lexer, module and instruction parser
 src/compiler          CFG + structurization, SPIR-V builder, PTX -> SPIR-V compiler
 src/driver            the libcuda.so API surface
-src/runtime           libcudart.so.12 (CUDA Runtime API built on the Driver API)
-src/cublas            libcublas.so.12 (GEMM/TRSM with GLSL kernels), include/cublas/cublas_v2.h
+src/runtime           libcudart.so.12 and .so.13 (CUDA Runtime API built on the Driver API, one source)
+src/cublas            libcublas.so.12/.13 (GEMM/TRSM with GLSL kernels), include/cublas/cublas_v2.h
 tests/                Driver API tests + internal Vulkan test
 tests/cuda            Runtime API programs compiled with nvcc
 tests/cudart_abi      ABI match of the clean-room runtime types against the official headers

@@ -6,6 +6,7 @@
 
 #define VULKANIZER_CU_VALUES(X)                                                                   \
     X(CUDA_ERROR_ALREADY_MAPPED) X(CUDA_ERROR_NOT_MAPPED) X(CUDA_ERROR_UNSUPPORTED_LIMIT)         \
+    X(CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY) X(CU_EXEC_AFFINITY_TYPE_SM_COUNT) X(CIG_DATA_TYPE_NV_BLOB) \
     X(CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED) X(CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED)         \
     X(CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM)                                \
     X(CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)                                                \
@@ -42,6 +43,8 @@
     X(offsetof(CUmemPoolProps, usage)) X(sizeof(CUaccessPolicyWindow))                            \
     X(sizeof(CUlaunchAttributeValue)) X(sizeof(CUlaunchAttribute)) X(offsetof(CUlaunchAttribute, value)) \
     X(sizeof(CUlaunchConfig)) X(offsetof(CUlaunchConfig, hStream)) X(offsetof(CUlaunchConfig, attrs)) \
-    X(offsetof(CUlaunchConfig, numAttrs)) X(sizeof(CUtensorMap)) X(alignof(CUtensorMap))
+    X(offsetof(CUlaunchConfig, numAttrs)) X(sizeof(CUtensorMap)) X(alignof(CUtensorMap))             \
+    X(sizeof(CUexecAffinityParam)) X(sizeof(CUctxCigParam)) X(sizeof(CUctxCreateParams))         \
+    X(offsetof(CUctxCreateParams, numExecAffinityParams)) X(offsetof(CUctxCreateParams, cigParams))
 
 

@@ -16,7 +16,8 @@
 using namespace vulkanizer;
 using namespace vulkanizer::driver;
 
-static constexpr int kDriverVersion = 12040;
+// What cuDriverGetVersion reports: new enough for the CUDA 13.4 runtime (libcudart.so.13).
+static constexpr int kDriverVersion = 13040;
 
 void vulkanizer::driver::computeCapability(int& major, int& minor) {
     static const int cc = [] {
@@ -66,6 +67,8 @@ static const ErrorInfo kErrors[] = {
     {CUDA_ERROR_CONTEXT_ALREADY_CURRENT, "CUDA_ERROR_CONTEXT_ALREADY_CURRENT", "context already current"},
     {CUDA_ERROR_NO_BINARY_FOR_GPU, "CUDA_ERROR_NO_BINARY_FOR_GPU", "no kernel image is available for execution on the device"},
     {CUDA_ERROR_INVALID_PTX, "CUDA_ERROR_INVALID_PTX", "a PTX JIT compilation failed"},
+    {CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY, "CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY",
+     "the provided execution affinity is not supported by the device"},
     {CUDA_ERROR_JIT_COMPILER_NOT_FOUND, "CUDA_ERROR_JIT_COMPILER_NOT_FOUND", "PTX JIT compiler library not found"},
     {CUDA_ERROR_UNSUPPORTED_PTX_VERSION, "CUDA_ERROR_UNSUPPORTED_PTX_VERSION", "the provided PTX was compiled with an unsupported toolchain"},
     {CUDA_ERROR_INVALID_SOURCE, "CUDA_ERROR_INVALID_SOURCE", "device kernel image is invalid"},
@@ -97,10 +100,39 @@ static const ErrorInfo* findError(CUresult error) {
     return nullptr;
 }
 
-// Resolves a driver entry point by name. For cudaVersion >= 3.2 the "_v2" ABI
-// variant wins when it exists, mirroring the cuda.h #define mapping; with the per-thread
-// default stream flag, the "_ptsz"/"_ptds" variant does (where one exists).
-// TODO: per-symbol version table (_v3).
+// Entry points whose ABI changed after CUDA 3.2: the variant a caller of that CUDA version
+// expects (from NVIDIA's cudaTypedefs.h PFN_<name>_v<version> typedefs), newest first. A
+// variant Vulkanizer lacks is "not found", never an older one with a different signature.
+struct VersionedEntry {
+    const char* symbol;
+    int since;
+    const char* variant;
+};
+constexpr VersionedEntry kVersionedEntries[] = {
+    {"cuCtxCreate", 12050, "cuCtxCreate_v4"},
+    {"cuCtxCreate", 11040, "cuCtxCreate_v3"},
+    {"cuCtxCreate", 3020, "cuCtxCreate_v2"},
+    {"cuCtxGetDevice", 13000, "cuCtxGetDevice_v2"},
+    {"cuCtxSynchronize", 13000, "cuCtxSynchronize_v2"},
+    {"cuDeviceGetUuid", 11040, "cuDeviceGetUuid_v2"},
+    {"cuEventElapsedTime", 12080, "cuEventElapsedTime_v2"},
+    {"cuGetProcAddress", 12000, "cuGetProcAddress_v2"},
+    {"cuMemAdvise", 12020, "cuMemAdvise_v2"},
+    {"cuMemPrefetchAsync", 12020, "cuMemPrefetchAsync_v2"},
+    {"cuStreamGetCaptureInfo", 12030, "cuStreamGetCaptureInfo_v3"},
+    {"cuStreamGetCaptureInfo", 11030, "cuStreamGetCaptureInfo_v2"},
+    {"cuGraphAddNode", 12030, "cuGraphAddNode_v2"},
+    {"cuGraphGetEdges", 12030, "cuGraphGetEdges_v2"},
+    {"cuGraphNodeGetDependencies", 12030, "cuGraphNodeGetDependencies_v2"},
+    {"cuGraphNodeGetDependentNodes", 12030, "cuGraphNodeGetDependentNodes_v2"},
+    {"cuGraphAddDependencies", 12030, "cuGraphAddDependencies_v2"},
+    {"cuGraphRemoveDependencies", 12030, "cuGraphRemoveDependencies_v2"},
+};
+
+// Resolves a driver entry point by name. Symbols in kVersionedEntries get the variant of the
+// caller's CUDA version; for the others, from 3.2 on the "_v2" ABI variant wins when it exists
+// (the cuda.h #define mapping). With the per-thread default stream flag, the "_ptsz"/"_ptds"
+// variant does (where one exists).
 static void* lookupEntryPoint(const char* symbol, int cudaVersion, cuuint64_t flags) {
     static void* self = [] {
         Dl_info info{};
@@ -112,7 +144,13 @@ static void* lookupEntryPoint(const char* symbol, int cudaVersion, cuuint64_t fl
         for (const char* suffix : {"_ptsz", "_ptds"})
             if (void* p = dlsym(self, (std::string(symbol) + suffix).c_str())) return p;
     }
-    if (cudaVersion >= 3020) {
+    bool versioned = false;
+    for (const VersionedEntry& e : kVersionedEntries) {
+        if (std::strcmp(e.symbol, symbol) != 0) continue;
+        versioned = true;
+        if (cudaVersion >= e.since) return dlsym(self, e.variant);
+    }
+    if (!versioned && cudaVersion >= 3020) {
         if (void* p = dlsym(self, (std::string(symbol) + "_v2").c_str())) return p;
     }
     return dlsym(self, symbol);

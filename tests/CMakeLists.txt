@@ -51,65 +51,90 @@ target_link_libraries(ptx_parse PRIVATE vulkanizer_core)
 target_compile_definitions(ptx_parse PRIVATE VULKANIZER_TEST_DATA_DIR="${VULKANIZER_TEST_DATA_DIR}")
 add_test(NAME ptx_parse COMMAND ptx_parse)
 
-# Tests that need a real CUDA toolkit in .cuda/ (tools/setup_cuda.sh): programs built with
-# nvcc against the CUDA Runtime, run on Vulkanizer's libcudart + libcuda, and an ABI check of
-# Vulkanizer's clean-room runtime types against the official headers.
-set(VULKANIZER_CUDA_TOOLKIT ${PROJECT_SOURCE_DIR}/.cuda CACHE PATH "CUDA toolkit used to build the nvcc tests")
-if(EXISTS ${VULKANIZER_CUDA_TOOLKIT}/bin/nvcc)
+# Tests that need a real CUDA toolkit (tools/setup_cuda.sh): programs built with nvcc against the
+# CUDA Runtime, run on Vulkanizer's libcudart + libcuda, and an ABI check of Vulkanizer's clean-room
+# runtime types against the official headers. Once per runtime major version: CUDA 12 in .cuda/
+# (libcudart.so.12), CUDA 13 in .cuda13/ (libcudart.so.13, lib/cuda13); CUDA 13 tests end in _13.
+function(vulkanizer_nvcc_tests toolkit major suffix libdir)
   find_program(VULKANIZER_NVCC_HOST_CXX NAMES g++-13 g++-12 g++-14 g++ REQUIRED)
-  set(nvcc_out ${CMAKE_CURRENT_BINARY_DIR}/cuda)
+  set(nvcc_out ${CMAKE_CURRENT_BINARY_DIR}/cuda${suffix})
   foreach(name rt_vector_add rt_features rt_kernels rt_printf rt_math_f64)
     set(src ${CMAKE_CURRENT_SOURCE_DIR}/cuda/${name}.cu)
     add_custom_command(
       OUTPUT ${nvcc_out}/${name}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${nvcc_out}
       # PTX only (no SASS) and a shared libcudart, like a JIT-friendly application build
-      COMMAND ${VULKANIZER_CUDA_TOOLKIT}/bin/nvcc -ccbin ${VULKANIZER_NVCC_HOST_CXX} -O2
+      COMMAND ${toolkit}/bin/nvcc -ccbin ${VULKANIZER_NVCC_HOST_CXX} -O2
               -gencode arch=compute_75,code=compute_75 -cudart shared -o ${nvcc_out}/${name} ${src}
       DEPENDS ${src}
-      COMMENT "nvcc ${name}.cu"
+      COMMENT "nvcc ${name}.cu (CUDA ${major})"
     )
-    add_custom_target(${name}_nvcc ALL DEPENDS ${nvcc_out}/${name})
-    add_dependencies(${name}_nvcc vulkanizer_cudart vulkanizer_cuda)
-    add_test(NAME ${name} COMMAND ${nvcc_out}/${name})
-    set(env "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/lib")
+    add_custom_target(${name}${suffix}_nvcc ALL DEPENDS ${nvcc_out}/${name})
+    add_dependencies(${name}${suffix}_nvcc vulkanizer_cudart vulkanizer_cudart13 vulkanizer_cuda)
+    add_test(NAME ${name}${suffix} COMMAND ${nvcc_out}/${name})
+    set(env "LD_LIBRARY_PATH=${libdir}:${CMAKE_BINARY_DIR}/lib")
     if(VULKANIZER_ASAN)  # nvcc's binaries are not instrumented, so the sanitizer runtime is preloaded
       execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libasan.so
                       OUTPUT_VARIABLE asan_lib OUTPUT_STRIP_TRAILING_WHITESPACE)
       list(APPEND env "LD_PRELOAD=${asan_lib}")
     endif()
-    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${env}")
+    set_tests_properties(${name}${suffix} PROPERTIES ENVIRONMENT "${env}")
   endforeach()
 
-  set_tests_properties(rt_printf PROPERTIES PASS_REGULAR_EXPRESSION
+  set_tests_properties(rt_printf${suffix} PROPERTIES PASS_REGULAR_EXPRESSION
     "hello from the GPU\nint -7, unsigned 4000000000, hex 0xff, char Z\nlong -1234567890123, float 3.142, double 0.0025, padded \\[   42\\]\nstring 'device', percent 100%\nthread 3 of 32\n.*done: no error")
 
-  add_executable(cudart_abi cudart_abi/main.cpp cudart_abi/nvidia.cpp cudart_abi/vulkanizer.cpp)
-  set_source_files_properties(cudart_abi/nvidia.cpp PROPERTIES INCLUDE_DIRECTORIES ${VULKANIZER_CUDA_TOOLKIT}/include)
-  target_include_directories(cudart_abi PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
-  add_test(NAME cudart_abi COMMAND cudart_abi)
+  # the official headers and Vulkanizer's clash, so each side is its own translation unit
+  add_library(cudart_abi_nvidia${suffix} OBJECT cudart_abi/nvidia.cpp)
+  target_include_directories(cudart_abi_nvidia${suffix} PRIVATE ${toolkit}/include)
+  target_compile_definitions(cudart_abi_nvidia${suffix} PRIVATE VULKANIZER_CUDART_MAJOR=${major})
+  add_executable(cudart_abi${suffix} cudart_abi/main.cpp cudart_abi/vulkanizer.cpp $<TARGET_OBJECTS:cudart_abi_nvidia${suffix}>)
+  target_include_directories(cudart_abi${suffix} PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)
+  target_compile_definitions(cudart_abi${suffix} PRIVATE VULKANIZER_CUDART_MAJOR=${major})
+  add_test(NAME cudart_abi${suffix} COMMAND cudart_abi${suffix})
+endfunction()
 
+set(VULKANIZER_CUDA_TOOLKIT ${PROJECT_SOURCE_DIR}/.cuda CACHE PATH "CUDA 12 toolkit used to build the nvcc tests")
+if(EXISTS ${VULKANIZER_CUDA_TOOLKIT}/bin/nvcc)
+  vulkanizer_nvcc_tests(${VULKANIZER_CUDA_TOOLKIT} 12 "" ${CMAKE_BINARY_DIR}/lib)
   add_executable(cuda_abi cuda_abi/main.cpp cuda_abi/nvidia.cpp cuda_abi/vulkanizer.cpp)
   set_source_files_properties(cuda_abi/nvidia.cpp PROPERTIES INCLUDE_DIRECTORIES ${VULKANIZER_CUDA_TOOLKIT}/include)
   add_test(NAME cuda_abi COMMAND cuda_abi)
 else()
   message(STATUS "No CUDA toolkit in ${VULKANIZER_CUDA_TOOLKIT}: nvcc tests disabled (run tools/setup_cuda.sh)")
 endif()
-
-# libtorch tests against the conda-forge PyTorch environment (tools/setup_torch.sh). Not part of
-# ctest: they need run_torch.sh's environment and take a while (./run_torch.sh torch_ops).
-set(VULKANIZER_TORCH_ENV ${PROJECT_SOURCE_DIR}/.work/torch-cf CACHE PATH "PyTorch environment for the libtorch tests")
-if(EXISTS ${VULKANIZER_TORCH_ENV}/lib/libtorch_cuda.so)
-  foreach(name torch_ops torch_mlp torch_split)
-    add_executable(${name} torch/${name}.cpp)
-    target_include_directories(${name} SYSTEM PRIVATE ${VULKANIZER_TORCH_ENV}/include
-                               ${VULKANIZER_TORCH_ENV}/include/torch/csrc/api/include)
-    # libtorch_cuda registers the CUDA backend from static initializers: keep it although nothing references it
-    target_link_libraries(${name} PRIVATE -Wl,--no-as-needed ${VULKANIZER_TORCH_ENV}/lib/libtorch_cuda.so -Wl,--as-needed
-                          ${VULKANIZER_TORCH_ENV}/lib/libtorch.so ${VULKANIZER_TORCH_ENV}/lib/libtorch_cpu.so
-                          ${VULKANIZER_TORCH_ENV}/lib/libc10.so)
-    set_target_properties(${name} PROPERTIES BUILD_RPATH ${VULKANIZER_TORCH_ENV}/lib)
-  endforeach()
+set(VULKANIZER_CUDA13_TOOLKIT ${PROJECT_SOURCE_DIR}/.cuda13 CACHE PATH "CUDA 13 toolkit used to build the nvcc tests")
+if(EXISTS ${VULKANIZER_CUDA13_TOOLKIT}/bin/nvcc)
+  vulkanizer_nvcc_tests(${VULKANIZER_CUDA13_TOOLKIT} 13 _13 ${CMAKE_BINARY_DIR}/lib/cuda13)
+  # the same libcuda.so.1 serves CUDA 13 programs: its types must match cuda.h 13 too
+  add_library(cuda_abi_nvidia_13 OBJECT cuda_abi/nvidia.cpp)
+  target_include_directories(cuda_abi_nvidia_13 PRIVATE ${VULKANIZER_CUDA13_TOOLKIT}/include)
+  add_executable(cuda_abi_13 cuda_abi/main.cpp cuda_abi/vulkanizer.cpp $<TARGET_OBJECTS:cuda_abi_nvidia_13>)
+  add_test(NAME cuda_abi_13 COMMAND cuda_abi_13)
 else()
-  message(STATUS "No PyTorch in ${VULKANIZER_TORCH_ENV}: libtorch tests disabled (run tools/setup_torch.sh)")
+  message(STATUS "No CUDA 13 toolkit in ${VULKANIZER_CUDA13_TOOLKIT}: CUDA 13 tests disabled (tools/setup_cuda.sh --cuda13)")
 endif()
+
+# libtorch tests against the conda-forge PyTorch environments (tools/setup_torch.sh): torch_* against
+# the CUDA 12 build in .work/torch-cf, torch13_* against the CUDA 13 one in .work/torch-cf13 (--cuda13).
+# Not part of ctest: they need run_torch.sh's environment and take a while (./run_torch.sh torch_ops,
+# ./run_torch.sh --env .work/torch-cf13 torch13_ops).
+function(vulkanizer_torch_tests env prefix)
+  if(NOT EXISTS ${env}/lib/libtorch_cuda.so)
+    message(STATUS "No PyTorch in ${env}: ${prefix}_* tests disabled (run tools/setup_torch.sh)")
+    return()
+  endif()
+  foreach(name ops mlp split)
+    set(target ${prefix}_${name})
+    add_executable(${target} torch/torch_${name}.cpp)
+    target_include_directories(${target} SYSTEM PRIVATE ${env}/include ${env}/include/torch/csrc/api/include)
+    # libtorch_cuda registers the CUDA backend from static initializers: keep it although nothing references it
+    target_link_libraries(${target} PRIVATE -Wl,--no-as-needed ${env}/lib/libtorch_cuda.so -Wl,--as-needed
+                          ${env}/lib/libtorch.so ${env}/lib/libtorch_cpu.so ${env}/lib/libc10.so)
+    set_target_properties(${target} PROPERTIES BUILD_RPATH ${env}/lib)
+  endforeach()
+endfunction()
+set(VULKANIZER_TORCH_ENV ${PROJECT_SOURCE_DIR}/.work/torch-cf CACHE PATH "CUDA 12 PyTorch environment for the libtorch tests")
+set(VULKANIZER_TORCH13_ENV ${PROJECT_SOURCE_DIR}/.work/torch-cf13 CACHE PATH "CUDA 13 PyTorch environment for the libtorch tests")
+vulkanizer_torch_tests(${VULKANIZER_TORCH_ENV} torch)
+vulkanizer_torch_tests(${VULKANIZER_TORCH13_ENV} torch13)

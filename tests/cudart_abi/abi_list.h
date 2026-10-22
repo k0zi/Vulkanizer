@@ -1,4 +1,12 @@
 // Generated from src/runtime/cudart_types.h: what tests/cudart_abi compares.
+// VULKANIZER_CUDART_MAJOR (12 or 13) selects the fields of that runtime version.
+#if VULKANIZER_CUDART_MAJOR >= 13
+#define VULKANIZER_PROP_12(X, f)
+#define VULKANIZER_PROP_13(X, f) X(f)
+#else
+#define VULKANIZER_PROP_12(X, f) X(f)
+#define VULKANIZER_PROP_13(X, f)
+#endif
 #define VULKANIZER_DEVICE_PROP_FIELDS(X) \
     X(name) \
     X(uuid) \
@@ -12,21 +20,21 @@
     X(maxThreadsPerBlock) \
     X(maxThreadsDim) \
     X(maxGridSize) \
-    X(clockRate) \
+    VULKANIZER_PROP_12(X, clockRate) \
     X(totalConstMem) \
     X(major) \
     X(minor) \
     X(textureAlignment) \
     X(texturePitchAlignment) \
-    X(deviceOverlap) \
+    VULKANIZER_PROP_12(X, deviceOverlap) \
     X(multiProcessorCount) \
-    X(kernelExecTimeoutEnabled) \
+    VULKANIZER_PROP_12(X, kernelExecTimeoutEnabled) \
     X(integrated) \
     X(canMapHostMemory) \
-    X(computeMode) \
+    VULKANIZER_PROP_12(X, computeMode) \
     X(maxTexture1D) \
     X(maxTexture1DMipmap) \
-    X(maxTexture1DLinear) \
+    VULKANIZER_PROP_12(X, maxTexture1DLinear) \
     X(maxTexture2D) \
     X(maxTexture2DMipmap) \
     X(maxTexture2DLinear) \
@@ -53,7 +61,7 @@
     X(tccDriver) \
     X(asyncEngineCount) \
     X(unifiedAddressing) \
-    X(memoryClockRate) \
+    VULKANIZER_PROP_12(X, memoryClockRate) \
     X(memoryBusWidth) \
     X(l2CacheSize) \
     X(persistingL2CacheMaxSize) \
@@ -67,13 +75,13 @@
     X(isMultiGpuBoard) \
     X(multiGpuBoardGroupID) \
     X(hostNativeAtomicSupported) \
-    X(singleToDoublePrecisionPerfRatio) \
+    VULKANIZER_PROP_12(X, singleToDoublePrecisionPerfRatio) \
     X(pageableMemoryAccess) \
     X(concurrentManagedAccess) \
     X(computePreemptionSupported) \
     X(canUseHostPointerForRegisteredMem) \
     X(cooperativeLaunch) \
-    X(cooperativeMultiDeviceLaunch) \
+    VULKANIZER_PROP_12(X, cooperativeMultiDeviceLaunch) \
     X(sharedMemPerBlockOptin) \
     X(pageableMemoryAccessUsesHostPageTables) \
     X(directManagedMemAccessFromHost) \
@@ -93,6 +101,13 @@
     X(ipcEventSupported) \
     X(clusterLaunch) \
     X(unifiedFunctionPointers) \
+    VULKANIZER_PROP_13(X, deviceNumaConfig) \
+    VULKANIZER_PROP_13(X, deviceNumaId) \
+    VULKANIZER_PROP_13(X, mpsEnabled) \
+    VULKANIZER_PROP_13(X, hostNumaId) \
+    VULKANIZER_PROP_13(X, gpuPciDeviceID) \
+    VULKANIZER_PROP_13(X, gpuPciSubsystemID) \
+    VULKANIZER_PROP_13(X, hostNumaMultinodeIpcSupported) \
     X(reserved)
 
 #define VULKANIZER_FUNC_ATTR_FIELDS(X) \
@@ -112,6 +127,8 @@
     X(requiredClusterDepth) \
     X(clusterSchedulingPolicyPreference) \
     X(nonPortableClusterSizeAllowed) \
+    VULKANIZER_PROP_13(X, deviceNodeUpdateStatus) \
+    VULKANIZER_PROP_13(X, sharedMemoryMode) \
     X(reserved)
 
 #define VULKANIZER_ERROR_VALUES(X) \

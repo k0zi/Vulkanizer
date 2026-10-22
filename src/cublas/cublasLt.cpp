@@ -415,4 +415,10 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t h, cublasLtMatmulDesc_t desc, con
     return st;
 }
 
+// cuBLASLt 13's grouped matmul layouts: not supported (arguments ignored, as in cublas_stubs.cpp).
+cublasStatus_t cublasLtGroupedMatrixLayoutCreate() {
+    VULKANIZER_WARN_ONCE("cublasLt: grouped matrix layouts are not implemented");
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+}
+
 }  // extern "C"

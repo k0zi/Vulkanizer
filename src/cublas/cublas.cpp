@@ -9,7 +9,9 @@
 #include "common/log.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <cstring>
 #include <mutex>
 
@@ -485,6 +487,38 @@ cublasStatus_t cublasSgemv_v2(cublasHandle_t h, cublasOperation_t trans, int m, 
     // op(A)^T as the GEMM's B (k = cols, n = rows): A^T stored as A, or A itself
     return run(h, {CUBLAS_OP_N, t ? CUBLAS_OP_N : CUBLAS_OP_T, 1, rows, cols, alpha, x, CUDA_R_32F, incx, 0, A,
                    CUDA_R_32F, lda, 0, beta, y, CUDA_R_32F, incy, 0, 1, false, CUBLAS_COMPUTE_32F});
+}
+
+// The 64-bit forms: the kernels index with 32 bits, so larger sizes are not supported.
+static bool fitsInt(std::initializer_list<int64_t> values) {
+    for (int64_t v : values)
+        if (v < INT32_MIN || v > INT32_MAX) return false;
+    return true;
+}
+
+cublasStatus_t cublasSgemm_v2_64(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int64_t m,
+                                 int64_t n, int64_t k, const float* alpha, const float* A, int64_t lda,
+                                 const float* B, int64_t ldb, const float* beta, float* C, int64_t ldc) {
+    if (!fitsInt({m, n, k, lda, ldb, ldc})) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return cublasSgemm_v2(h, transa, transb, int(m), int(n), int(k), alpha, A, int(lda), B, int(ldb), beta, C,
+                          int(ldc));
+}
+
+cublasStatus_t cublasSgemmStridedBatched_64(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb,
+                                            int64_t m, int64_t n, int64_t k, const float* alpha, const float* A,
+                                            int64_t lda, long long strideA, const float* B, int64_t ldb,
+                                            long long strideB, const float* beta, float* C, int64_t ldc,
+                                            long long strideC, int64_t batchCount) {
+    if (!fitsInt({m, n, k, lda, ldb, ldc, batchCount})) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return cublasSgemmStridedBatched(h, transa, transb, int(m), int(n), int(k), alpha, A, int(lda), strideA, B,
+                                     int(ldb), strideB, beta, C, int(ldc), strideC, int(batchCount));
+}
+
+cublasStatus_t cublasSgemv_v2_64(cublasHandle_t h, cublasOperation_t trans, int64_t m, int64_t n, const float* alpha,
+                                 const float* A, int64_t lda, const float* x, int64_t incx, const float* beta,
+                                 float* y, int64_t incy) {
+    if (!fitsInt({m, n, lda, incx, incy})) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return cublasSgemv_v2(h, trans, int(m), int(n), alpha, A, int(lda), x, int(incx), beta, y, int(incy));
 }
 
 cublasStatus_t cublasSgemmEx(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,

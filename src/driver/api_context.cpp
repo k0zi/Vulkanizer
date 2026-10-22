@@ -99,6 +99,18 @@ CUresult CUDAAPI cuCtxCreate_v2(CUcontext* pctx, unsigned int flags, CUdevice de
     return CUDA_SUCCESS;
 }
 
+CUresult CUDAAPI cuCtxCreate_v3(CUcontext* pctx, CUexecAffinityParam* paramsArray, int numParams, unsigned int flags,
+                                CUdevice dev) {
+    if (numParams > 0) return CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY;
+    return cuCtxCreate_v2(pctx, flags, dev);
+}
+
+CUresult CUDAAPI cuCtxCreate_v4(CUcontext* pctx, CUctxCreateParams* params, unsigned int flags, CUdevice dev) {
+    if (params && params->cigParams) return CUDA_ERROR_NOT_SUPPORTED;
+    if (params && params->numExecAffinityParams > 0) return CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY;
+    return cuCtxCreate_v2(pctx, flags, dev);
+}
+
 CUresult CUDAAPI cuCtxDestroy_v2(CUcontext ctx) {
     VULKANIZER_TRACE_API();
     if (CUresult r = requireInit()) return r;
@@ -159,6 +171,16 @@ CUresult CUDAAPI cuCtxGetDevice(CUdevice* device) {
     return CUDA_SUCCESS;
 }
 
+CUresult CUDAAPI cuCtxGetDevice_v2(CUdevice* device, CUcontext ctx) {
+    if (!ctx) return cuCtxGetDevice(device);
+    VULKANIZER_TRACE_API();
+    if (!device) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = requireInit()) return r;
+    if (!validHandle(ctx)) return CUDA_ERROR_INVALID_CONTEXT;
+    *device = ctx->device;
+    return CUDA_SUCCESS;
+}
+
 CUresult CUDAAPI cuCtxGetFlags(unsigned int* flags) {
     VULKANIZER_TRACE_API();
     if (!flags) return CUDA_ERROR_INVALID_VALUE;
@@ -174,6 +196,15 @@ CUresult CUDAAPI cuCtxSynchronize(void) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     return toCuResult(s.dev->finish());
+}
+
+CUresult CUDAAPI cuCtxSynchronize_v2(CUcontext ctx) {
+    if (!ctx) return cuCtxSynchronize();
+    if (CUresult r = cuCtxPushCurrent_v2(ctx)) return r;
+    const CUresult r = cuCtxSynchronize();
+    CUcontext popped;
+    cuCtxPopCurrent_v2(&popped);
+    return r;
 }
 
 CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int* version) {

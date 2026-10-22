@@ -114,6 +114,11 @@ CUresult CUDAAPI cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUeven
     return CUDA_SUCCESS;
 }
 
+// CUDA 12.8+: the same, under the name cuda.h 13 maps cuEventElapsedTime to.
+CUresult CUDAAPI cuEventElapsedTime_v2(float* pMilliseconds, CUevent hStart, CUevent hEnd) {
+    return cuEventElapsedTime(pMilliseconds, hStart, hEnd);
+}
+
 CUresult CUDAAPI cuEventDestroy_v2(CUevent hEvent) {
     VULKANIZER_TRACE_API();
     if (!validHandle(hEvent)) return CUDA_ERROR_INVALID_HANDLE;

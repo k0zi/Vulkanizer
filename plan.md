@@ -114,9 +114,10 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - [x] **2.3** Saját libcudart: regisztráció, lusta modul-betöltés eszközönként, launch, eszközök (`cudaDeviceProp`),
   memória, streamek, eventek, hibakezelés. A típusok clean-room-ok; az ABI-egyezést a `cudart_abi` teszt ellenőrzi a hivatalos fejlécek ellen.
 - [x] **2.4 Mérföldkő:** nvcc-vel fordított programok (`tests/cuda/*.cu`) változtatás nélkül futnak RADV-n és llvmpipe-on.
-- [ ] **2.5** További Runtime API a célalkalmazások igénye szerint:
+- [x] **2.5** További Runtime API a célalkalmazások igénye szerint:
   - [x] `__device__`/`__constant__` változók: `__cudaRegisterVar`, `cudaMemcpyTo/FromSymbol`, `cudaGetSymbolAddress/Size`;
-  - [ ] `cudaMallocManaged`, `cudaMemcpy2D`, `cudaPointerGetAttributes`, `cudaOccupancy*`, `cudaLaunchHostFunc`.
+  - [x] `cudaMemcpy2D`, `cudaPointerGetAttributes`, `cudaOccupancy*`, `cudaLaunchHostFunc`; a `cudaMallocManaged`
+    `cudaErrorNotSupported`-et ad, a managed memória az 5.2 része.
   Kész, ha: a kiválasztott célalkalmazás (4.3) indulásakor nincs hiányzó runtime szimbólum.
 
 ### Fázis 3 – Valódi kernelek
@@ -176,7 +177,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - Eredmény: MLP tanítás (Adam, 50 lépés) a CPU-val 6e-8 loss / 5e-7 súly eltéréssel; conv2d, softmax,
     LayerNorm, embedding, attention (math), Transformer réteg, f16 matmul, scatter/index_add helyes
     (`tests/torch/`). cuDNN és a fused attention ki van kapcsolva; `cudaErrorAssert` nincs modellezve.
-- [ ] **4.6** llama.cpp teljesítmény: flash attention, CUDA graphs (vagy egyenértékű batch-elés), gyorsabb GEMM/MMQ, összevetés a ggml Vulkan backendjével.
+- [x] **4.6** llama.cpp teljesítmény: flash attention, CUDA graphs (vagy egyenértékű batch-elés), gyorsabb GEMM/MMQ, összevetés a ggml Vulkan backendjével.
   - Kész: vektorizált f16 TN GEMM kernel packed-f16 szorzással `COMPUTE_16F`-hez (213 → ~900 GFLOPS);
     a 64 bites div/rem gyorsútja `DontFlatten`-nel (a driver különben mindig lefuttatta a 64 bites ciklust,
     pl. soft_max 12 → 3,2 ms); `.relaxed/.acquire/.cg/.cv` hozzáférések volatile-ként (CUB look-back GPU hang).
@@ -186,8 +187,22 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     a kis, barrier nélküli kerneleknek. TinyLlama tg64 23 → ~30 t/s.
   - cuBLAS GEMV út (`gemv.comp`) az n = 1 / m = 1 GEMM-ekhez, minden transzponálással, típussal és batch-módban
     (ggml f16 k=128 batched: 24 → 6,7 ms; a natív 2,5 ms, mert a broadcastolt A-t egyszer olvassa).
-  - Hátra: mmvq (Q4_0 ~1,4×, Q6_K lassabb a natívnál), dequantize + GEMM összevonása,
-    flash attention gyorsítása (a tile kernel pp-ben lassú).
+  - Összevetés (2026-10-22, TinyLlama-1.1B Q4_0, Renoir, `llama-bench -p 512 -n 64`): pp512 ~365–400 t/s
+    (natív Vulkan ~347), tg64 ~30 t/s (natív ~51). A pp utolérte a natívat, a tg-ben maradt a különbség.
+  - A tg idejének ~73%-a a `mul_mat_vec_q` (Q4_0). Egy 4096×14336-os matvec 1608 µs (20,5 GB/s), a natív 1039 µs.
+    Mikrobenchmarkkal (nyers Vulkan, GLSL) kizárva: a BDA (`global_load`) és a descriptoros (`buffer_load`) olvasás
+    egyformán ~35 GB/s; egy egyszerű PTX olvasó kernel a Vulkanizeren át is 35 GB/s; a memóriatípus (tiszta
+    `DEVICE_LOCAL` vs. host-visible) nem számít; a 16 bites betöltés ~10%. Az mmvq hozzáférési mintája
+    kézzel írt GLSL-ben is 20,7 GB/s, vagyis a fordítás nem veszít: a lassúság a CUDA-kernel felépítéséből jön.
+    A generikus paraméterekkel egy workgroup egy sort számol, így mind a 4096 workgroup újraolvassa a 16 KB-os
+    q8_1 aktivációvektort; enélkül ugyanez a minta 29 GB/s. A natív shader workgroup-onként több sort számol.
+    A sorok számát a llama.cpp fordítási időben, architektúra szerint választja (a GCN-táblát csak HIP-buildben),
+    ezt a Vulkanizer a forrás módosítása nélkül nem tudja befolyásolni.
+  - Kipróbálva és elvetve: kétszeres ciklus-unroll a fordítóban (több betöltés repül egyszerre; mmvq-n 2%,
+    tg-ben zajon belül); `VULKANIZER_FAST_FMA` (mmvq-n 1%).
+  - Nyitva, de nem a Vulkanizer szűk keresztmetszete: a flash attention tile kernel pp-ben lassú (tensor core
+    nélkül), ezért alapból ki van kapcsolva; a `cpy_q_f32` (q4_0 → f32) 3,4× lassabb a natívnál (szálanként egy
+    blokk, 128 bájtos lépésközű írások), de inferenciában nem fut.
 - [x] **4.7** ComfyUI (Z-Image Turbo) teljes képgenerálás.
   - Már kész: a conda-forge környezetben fut (`venv-vulkanizer`, a torchvision feloldás nélkül, URL-ről).
     Indítás: `run_torch.sh` + `--disable-cuda-malloc` (a 4.9 óta DynamicVRAM-mal is). A `torch._native` Triton/CuTe DSL
@@ -264,8 +279,26 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     - A fordító most már ismeri a `.shared::cta`, `.L1::evict_*` módosítókat, és emulálja az `mma.sync`-et
       (m16n8k8/k16, f16/bf16 → f32/f16) és az `ldmatrix`-ot (x1/x2/x4, `.trans`) warp shuffle-lel (`tests/warp_matrix.cpp`).
     - `tests/cuda_abi`: a driver típusai és enumjai az NVIDIA headerhez mérve.
-- [ ] **4.11** CUDA 13 runtime (`libcudart.so.13`, `libcublas.so.13`): a cu130-as PyTorch buildekhez és a ComfyUI
+- [x] **4.11** CUDA 13 runtime (`libcudart.so.13`, `libcublas.so.13`): a cu130-as PyTorch buildekhez és a ComfyUI
   „cu130 or higher” optimalizált útjaihoz. Az ABI-eltéréseket (`cudaDeviceProp`, eltávolított API-k) verziónként kell kezelni.
+  - Kész (2026-10-22): a runtime és a cuBLAS ugyanabból a forrásból kétszer fordul (`VULKANIZER_CUDART_MAJOR`), a 13-as
+    változat a `build/lib/cuda13`-ba kerül (külön könyvtár, hogy a `libcudart.so` linkek ne ütközzenek).
+    - Runtime 13: a `cudaDeviceProp` 8 mezője kiesett (`clockRate`, `computeMode`, ...), NUMA/PCI mezők jöttek; a
+      `cudaFuncAttributes` két új mezőt kapott. A 12-es `_v2`/`_v3` nevek (`cudaGetDeviceProperties_v2`,
+      `cudaStreamGetCaptureInfo_v3`, `cudaGraphAddNode_v2`, ...) a 13-ban a sima nevek; a `cudaMemAdvise` `cudaMemLocation`-t kap.
+    - cuBLAS 13: az API ugyanaz, csak a szimbólumverzió más. A cu134-es PyTorch a 64 bites (`_64`) formákat hívja:
+      `cublasSgemm_v2_64`, `cublasSgemmStridedBatched_64`, `cublasSgemv_v2_64` valódi (int-be férő méretekkel),
+      a többi stub, mint eddig.
+    - Driver: a `cuDriverGetVersion` 13040-et ad (a 13-as runtime ennél régebbit nem fogad el). A `cuGetProcAddress`
+      a hívó CUDA-verziója szerint adja a változatot (táblázat a `cudaTypedefs.h` PFN-jei alapján); új:
+      `cuCtxGetDevice_v2`, `cuCtxSynchronize_v2` (CUDA 13: kontextust kapnak), `cuCtxCreate_v3/_v4`, `cuEventElapsedTime_v2`.
+      Hiányzó változatra „not found”-ot ad, nem egy régebbi, más szignatúrájút.
+    - Tesztek: `tools/setup_cuda.sh --cuda13` (nvcc 13.4 a `.cuda13`-ba) után az `rt_*_13` nvcc-programok a
+      `libcudart.so.13`-on, `cudart_abi_13` és `cuda_abi_13` a CUDA 13 headerekhez mérve. PyTorch 2.14.1 cuda134
+      (`tools/setup_torch.sh --cuda13`): `torch13_ops`, `torch13_mlp`, `torch13_split`, `triton_ops.py`, `compile.py` helyes.
+  - A ComfyUI „cu130 optimized” útja (comfy-kitchen `cuda` backend) itt nem futhat: statikusan linkelt cudart, PTX csak
+    `sm_100f`/`sm_120f`-re, és sm ≥ 8.0 kell neki. cu13-as torch-csal a kitchen magától az `eager` backendre esik vissza
+    (kipróbálva), tehát nem törik el semmi.
 - Nem Vulkanizer-feladat: a `torchaudio` (nincs a torch 2.14-hez conda-forge build), a ComfyUI-Manager
   „PyTorch is not installed” üzenete emiatt jön.
 

@@ -164,6 +164,20 @@ cublasStatus_t CUBLASWINAPI cublasGemmStridedBatchedEx(
 cublasStatus_t CUBLASWINAPI cublasSgemv_v2(cublasHandle_t handle, cublasOperation_t trans, int m, int n,
                                            const float* alpha, const float* A, int lda, const float* x, int incx,
                                            const float* beta, float* y, int incy);
+// 64-bit forms (cuBLAS 12+): the same, with int64_t sizes; the sizes must still fit an int here.
+cublasStatus_t CUBLASWINAPI cublasSgemm_v2_64(cublasHandle_t handle, cublasOperation_t transa,
+                                              cublasOperation_t transb, int64_t m, int64_t n, int64_t k,
+                                              const float* alpha, const float* A, int64_t lda, const float* B,
+                                              int64_t ldb, const float* beta, float* C, int64_t ldc);
+cublasStatus_t CUBLASWINAPI cublasSgemmStridedBatched_64(cublasHandle_t handle, cublasOperation_t transa,
+                                                         cublasOperation_t transb, int64_t m, int64_t n, int64_t k,
+                                                         const float* alpha, const float* A, int64_t lda,
+                                                         long long int strideA, const float* B, int64_t ldb,
+                                                         long long int strideB, const float* beta, float* C,
+                                                         int64_t ldc, long long int strideC, int64_t batchCount);
+cublasStatus_t CUBLASWINAPI cublasSgemv_v2_64(cublasHandle_t handle, cublasOperation_t trans, int64_t m, int64_t n,
+                                              const float* alpha, const float* A, int64_t lda, const float* x,
+                                              int64_t incx, const float* beta, float* y, int64_t incy);
 cublasStatus_t CUBLASWINAPI cublasSgemmEx(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
                                           int m, int n, int k, const float* alpha, const void* A, cudaDataType Atype,
                                           int lda, const void* B, cudaDataType Btype, int ldb, const float* beta,

@@ -55,7 +55,10 @@ if [[ "${VULKANIZER_TORCH_DEFAULTS:-1}" != 0 ]]; then
 fi
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda
-export LD_PRELOAD="$LIB/libcuda.so.1:$LIB/libcudart.so.12:$LIB/libcublas.so.12:$LIB/libcublasLt.so.12${LD_PRELOAD:+:$LD_PRELOAD}"
+# a CUDA 13 build of PyTorch (tools/setup_torch.sh --cuda13) gets the .so.13 libraries from lib/cuda13
+CUDA_LIB="$LIB" CUDA_MAJOR=12
+if [[ -e "$ENV/lib/libcudart.so.13" ]]; then CUDA_LIB="$LIB/cuda13" CUDA_MAJOR=13; fi
+export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$CUDA_MAJOR:$CUDA_LIB/libcublas.so.$CUDA_MAJOR:$CUDA_LIB/libcublasLt.so.$CUDA_MAJOR${LD_PRELOAD:+:$LD_PRELOAD}"
 # a libtorch test by name (torch_ops, ...) or any other program instead of Python
 PROGRAM=("$ENV/bin/python")
 if [[ $# -gt 0 && "$1" != */* && -x "$BUILD/bin/$1" ]]; then

@@ -72,6 +72,7 @@ typedef enum cudaError_enum {
     CUDA_ERROR_INVALID_PTX = 218,
     CUDA_ERROR_JIT_COMPILER_NOT_FOUND = 221,
     CUDA_ERROR_UNSUPPORTED_PTX_VERSION = 222,
+    CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY = 224,
     CUDA_ERROR_INVALID_SOURCE = 300,
     CUDA_ERROR_FILE_NOT_FOUND = 301,
     CUDA_ERROR_SHARED_OBJECT_SYMBOL_NOT_FOUND = 302,
@@ -416,6 +417,34 @@ typedef struct CUlaunchAttribute_st {
     CUlaunchAttributeValue value;
 } CUlaunchAttribute;
 
+// cuCtxCreate_v3/_v4 parameters (execution affinity and CUDA-in-graphics are not supported).
+typedef enum CUexecAffinityType_enum {
+    CU_EXEC_AFFINITY_TYPE_SM_COUNT = 0,
+    CU_EXEC_AFFINITY_TYPE_MAX
+} CUexecAffinityType;
+typedef struct CUexecAffinitySmCount_st {
+    unsigned int val;
+} CUexecAffinitySmCount;
+typedef struct CUexecAffinityParam_st {
+    CUexecAffinityType type;
+    union {
+        CUexecAffinitySmCount smCount;
+    } param;
+} CUexecAffinityParam;
+typedef enum CUcigDataType_enum {
+    CIG_DATA_TYPE_D3D12_COMMAND_QUEUE = 0x1,
+    CIG_DATA_TYPE_NV_BLOB = 0x2,
+} CUcigDataType;
+typedef struct CUctxCigParam_st {
+    CUcigDataType sharedDataType;
+    void* sharedData;
+} CUctxCigParam;
+typedef struct CUctxCreateParams_st {
+    CUexecAffinityParam* execAffinityParams;
+    int numExecAffinityParams;
+    CUctxCigParam* cigParams;
+} CUctxCreateParams;
+
 typedef struct CUlaunchConfig_st {
     unsigned int gridDimX;
     unsigned int gridDimY;
@@ -563,6 +592,11 @@ CUresult CUDAAPI cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int* flags, i
 CUresult CUDAAPI cuDevicePrimaryCtxReset(CUdevice dev);
 
 CUresult CUDAAPI cuCtxCreate(CUcontext* pctx, unsigned int flags, CUdevice dev);
+CUresult CUDAAPI cuCtxCreate_v3(CUcontext* pctx, CUexecAffinityParam* paramsArray, int numParams, unsigned int flags,
+                                CUdevice dev);
+CUresult CUDAAPI cuCtxCreate_v4(CUcontext* pctx, CUctxCreateParams* ctxCreateParams, unsigned int flags, CUdevice dev);
+CUresult CUDAAPI cuCtxGetDevice_v2(CUdevice* device, CUcontext ctx);  // CUDA 13: of ctx, or the current one if NULL
+CUresult CUDAAPI cuCtxSynchronize_v2(CUcontext ctx);
 CUresult CUDAAPI cuCtxDestroy(CUcontext ctx);
 CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx);
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext* pctx);

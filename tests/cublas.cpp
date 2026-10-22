@@ -271,9 +271,14 @@ void testSgemv(cublasHandle_t h) {
         Matrix A(CUDA_R_32F, size_t(lda) * n, 21), x(CUDA_R_32F, size_t(cols) * incx, 22),
             y(CUDA_R_32F, size_t(rows) * incy, 23);
         const float alpha = 1.5f, beta = -0.5f;
-        CHECK_BLAS(cublasSgemv(h, trans, m, n, &alpha, reinterpret_cast<const float*>(A.dev), lda,
-                               reinterpret_cast<const float*>(x.dev), incx, &beta, reinterpret_cast<float*>(y.dev),
-                               incy));
+        if (trans == CUBLAS_OP_N)
+            CHECK_BLAS(cublasSgemv(h, trans, m, n, &alpha, reinterpret_cast<const float*>(A.dev), lda,
+                                   reinterpret_cast<const float*>(x.dev), incx, &beta, reinterpret_cast<float*>(y.dev),
+                                   incy));
+        else  // the 64-bit form (cuBLAS 12+, what cu13x PyTorch builds call)
+            CHECK_BLAS(cublasSgemv_v2_64(h, trans, m, n, &alpha, reinterpret_cast<const float*>(A.dev), lda,
+                                         reinterpret_cast<const float*>(x.dev), incx, &beta,
+                                         reinterpret_cast<float*>(y.dev), incy));
         const std::vector<float> got = y.download();
         for (int i = 0; i < rows; ++i) {
             double acc = 0;
@@ -295,6 +300,13 @@ void testSgemv(cublasHandle_t h) {
                 break;
             }
         }
+    }
+    // sizes beyond 32 bits are refused rather than truncated
+    const float one = 1.0f;
+    if (cublasSgemv_v2_64(h, CUBLAS_OP_N, int64_t(1) << 32, 1, &one, nullptr, int64_t(1) << 32, nullptr, 1, &one,
+                          nullptr, 1) != CUBLAS_STATUS_NOT_SUPPORTED) {
+        std::fprintf(stderr, "  sgemv_64: a 2^32 row count was not refused\n");
+        ok = false;
     }
     std::printf("%-28s %s\n", "sgemv", ok ? "ok" : "FAILED");
     if (!ok) ++g_failures;

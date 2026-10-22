@@ -1,5 +1,0 @@
-/* Same symbol version as the official libcudart.so.12, which nvcc-built binaries require. */
-libcudart.so.12 {
-  global: cuda*; __cuda*;
-  local: *;
-};

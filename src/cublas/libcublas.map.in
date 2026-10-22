@@ -1,0 +1,5 @@
+/* Same symbol version as the official libcublas.so.@VULKANIZER_CUDA_MAJOR@. */
+libcublas.so.@VULKANIZER_CUDA_MAJOR@ {
+  global: cublas*;
+  local: *;
+};

@@ -18,7 +18,7 @@
 
 namespace {
 
-constexpr int kRuntimeVersion = 12090;
+constexpr int kRuntimeVersion = VULKANIZER_CUDART_MAJOR >= 13 ? 13040 : 12090;
 
 struct FatBinary;
 
@@ -473,7 +473,9 @@ cudaError_t CUDARTAPI cudaDeviceGetAttribute(int* value, cudaDeviceAttr attr, in
     return record(cuDeviceGetAttribute(value, static_cast<CUdevice_attribute>(attr), device));
 }
 
-cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int device) {
+// CUDA 12 exports this as cudaGetDeviceProperties_v2 too; CUDA 13 only under the plain name, with
+// the fields its cudaDeviceProp dropped (clock rates, compute mode, ...) removed.
+cudaError_t CUDARTAPI cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
     ENTER();
     if (!prop) return record(cudaErrorInvalidValue);
     if (device < 0 || device >= Runtime::get().deviceCount) return record(cudaErrorInvalidDevice);
@@ -492,18 +494,24 @@ cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int devic
         p.maxThreadsDim[i] = attr(2 + i, d);
         p.maxGridSize[i] = attr(5 + i, d);
     }
+#if VULKANIZER_CUDART_MAJOR < 13
     p.clockRate = attr(13, d);
+    p.deviceOverlap = attr(15, d);
+    p.kernelExecTimeoutEnabled = attr(17, d);
+    p.computeMode = attr(20, d);
+    p.memoryClockRate = attr(36, d);
+#else
+    p.deviceNumaId = -1;  // not a NUMA device
+    p.hostNumaId = -1;
+#endif
     p.totalConstMem = size_t(attr(9, d));
     p.major = attr(75, d);
     p.minor = attr(76, d);
     p.textureAlignment = size_t(attr(14, d));
     p.texturePitchAlignment = size_t(attr(51, d));
-    p.deviceOverlap = attr(15, d);
     p.multiProcessorCount = attr(16, d);
-    p.kernelExecTimeoutEnabled = attr(17, d);
     p.integrated = attr(18, d);
     p.canMapHostMemory = attr(19, d);
-    p.computeMode = attr(20, d);
     p.concurrentKernels = attr(31, d);
     p.ECCEnabled = attr(32, d);
     p.pciBusID = attr(33, d);
@@ -512,7 +520,6 @@ cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int devic
     p.tccDriver = attr(35, d);
     p.asyncEngineCount = attr(40, d);
     p.unifiedAddressing = attr(41, d);
-    p.memoryClockRate = attr(36, d);
     p.memoryBusWidth = attr(37, d);
     p.l2CacheSize = attr(38, d);
     p.maxThreadsPerMultiProcessor = attr(39, d);
@@ -529,9 +536,11 @@ cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int devic
     return cudaSuccess;
 }
 
-cudaError_t CUDARTAPI cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
-    return cudaGetDeviceProperties_v2(prop, device);
+#if VULKANIZER_CUDART_MAJOR < 13
+cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(cudaDeviceProp* prop, int device) {
+    return cudaGetDeviceProperties(prop, device);
 }
+#endif
 
 cudaError_t CUDARTAPI cudaDeviceSynchronize(void) {
     ENTER();
@@ -793,7 +802,11 @@ cudaError_t CUDARTAPI cudaHostGetDevicePointer(void** pDevice, void* pHost, unsi
     ENTER();
     return record(cudaErrorNotSupported);
 }
+#if VULKANIZER_CUDART_MAJOR >= 13
+cudaError_t CUDARTAPI cudaMemAdvise(const void* devPtr, size_t count, int advice, cudaMemLocation location) {
+#else
 cudaError_t CUDARTAPI cudaMemAdvise(const void* devPtr, size_t count, int advice, int device) {
+#endif
     ENTER();
     return cudaSuccess;  // a hint
 }
@@ -1049,7 +1062,12 @@ cudaError_t CUDARTAPI cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* node
 }
 
 // Dependencies are not recorded: nodes run in the order they were added.
+#if VULKANIZER_CUDART_MAJOR >= 13
+cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t* deps, void* edgeData,
+                                                   size_t* numDeps) {
+#else
 cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t* deps, size_t* numDeps) {
+#endif
     ENTER();
     if (!node || !numDeps) return record(cudaErrorInvalidValue);
     *numDeps = 0;
@@ -1061,30 +1079,37 @@ cudaError_t CUDARTAPI cudaGraphDebugDotPrint(cudaGraph_t graph, const char* path
     return record(cudaErrorNotSupported);
 }
 
-cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(cudaStream_t stream, enum cudaStreamCaptureStatus* status,
+// CUDA 13's cudaStreamGetCaptureInfo is CUDA 12's _v3; nothing is ever captured.
+#if VULKANIZER_CUDART_MAJOR >= 13
+cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(cudaStream_t stream, enum cudaStreamCaptureStatus* status,
+#else
+cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v3(cudaStream_t stream, enum cudaStreamCaptureStatus* status,
+#endif
                                                   unsigned long long* id, cudaGraph_t* graph,
-                                                  const cudaGraphNode_t** deps, size_t* numDeps) {
+                                                  const cudaGraphNode_t** deps, const void** edgeData,
+                                                  size_t* numDeps) {
     ENTER();
     if (!status) return record(cudaErrorInvalidValue);
     *status = cudaStreamCaptureStatusNone;
     if (id) *id = 0;
     if (graph) *graph = nullptr;
     if (deps) *deps = nullptr;
+    if (edgeData) *edgeData = nullptr;
     if (numDeps) *numDeps = 0;
     return cudaSuccess;
 }
 
+#if VULKANIZER_CUDART_MAJOR < 13
+cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(cudaStream_t stream, enum cudaStreamCaptureStatus* status,
+                                                  unsigned long long* id, cudaGraph_t* graph,
+                                                  const cudaGraphNode_t** deps, size_t* numDeps) {
+    return cudaStreamGetCaptureInfo_v3(stream, status, id, graph, deps, nullptr, numDeps);
+}
+#endif
+
 cudaError_t CUDARTAPI cudaThreadExchangeStreamCaptureMode(int* mode) {
     ENTER();
     return mode ? cudaSuccess : record(cudaErrorInvalidValue);  // no capture: the mode is moot
-}
-
-cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v3(cudaStream_t stream, enum cudaStreamCaptureStatus* status,
-                                                  unsigned long long* id, cudaGraph_t* graph,
-                                                  const cudaGraphNode_t** deps, const void** edgeData,
-                                                  size_t* numDeps) {
-    if (edgeData) *edgeData = nullptr;
-    return cudaStreamGetCaptureInfo_v2(stream, status, id, graph, deps, numDeps);
 }
 
 cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGraph_t graph,
@@ -1094,14 +1119,21 @@ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGra
     return record(cudaErrorStreamCaptureUnsupported);
 }
 
-cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies_v2(cudaStream_t stream, cudaGraphNode_t* deps,
+// CUDA 12's _v2 forms are CUDA 13's plain names.
+#if VULKANIZER_CUDART_MAJOR >= 13
+#define VULKANIZER_V2(name) name
+#else
+#define VULKANIZER_V2(name) name##_v2
+#endif
+
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaStreamUpdateCaptureDependencies)(cudaStream_t stream, cudaGraphNode_t* deps,
                                                              const void* edgeData, size_t numDeps,
                                                              unsigned int flags) {
     ENTER();
     return record(cudaErrorStreamCaptureUnsupported);
 }
 
-cudaError_t CUDARTAPI cudaGraphAddNode_v2(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphAddNode)(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
                                           const void* edgeData, size_t numDeps, void* params) {
     ENTER();
     return record(cudaErrorNotSupported);  // only kernel nodes (cudaGraphAddKernelNode) so far

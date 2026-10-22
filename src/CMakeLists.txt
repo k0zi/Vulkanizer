@@ -63,20 +63,23 @@ target_link_options(vulkanizer_cuda PRIVATE
   -Wl,--no-undefined
 )
 
-# The CUDA Runtime: libcudart.so -> libcudart.so.12, implemented on the driver above.
-add_library(vulkanizer_cudart SHARED runtime/runtime.cpp)
-target_link_libraries(vulkanizer_cudart PRIVATE vulkanizer_common vulkanizer_cuda)
-target_include_directories(vulkanizer_cudart PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-set_target_properties(vulkanizer_cudart PROPERTIES
-  OUTPUT_NAME cudart
-  VERSION 12.9.0
-  SOVERSION 12
-  LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/runtime/libcudart.map
-)
-target_link_options(vulkanizer_cudart PRIVATE
-  -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/runtime/libcudart.map
-  -Wl,--no-undefined
-)
+# The CUDA Runtime, implemented on the driver above: libcudart.so.12 and, from the same source with
+# the CUDA 13 ABI (VULKANIZER_CUDART_MAJOR), libcudart.so.13 in lib/cuda13 (for cu13x PyTorch builds;
+# a separate directory keeps the libcudart.so links apart).
+function(vulkanizer_cudart target major version)
+  set(VULKANIZER_CUDART_MAJOR ${major})  # for the version script template
+  set(map ${CMAKE_CURRENT_BINARY_DIR}/libcudart${major}.map)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/runtime/libcudart.map.in ${map} @ONLY)
+  add_library(${target} SHARED runtime/runtime.cpp)
+  target_link_libraries(${target} PRIVATE vulkanizer_common vulkanizer_cuda)
+  target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(${target} PRIVATE VULKANIZER_CUDART_MAJOR=${major})
+  set_target_properties(${target} PROPERTIES OUTPUT_NAME cudart VERSION ${version} SOVERSION ${major} LINK_DEPENDS ${map})
+  target_link_options(${target} PRIVATE -Wl,--version-script=${map} -Wl,--no-undefined)
+endfunction()
+vulkanizer_cudart(vulkanizer_cudart 12 12.9.0)
+vulkanizer_cudart(vulkanizer_cudart13 13 13.4.0)
+set_target_properties(vulkanizer_cudart13 PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/cuda13)
 
 # cuBLAS: libcublas.so -> libcublas.so.12, GEMM kernels written in GLSL.
 set(cublas_gen ${CMAKE_CURRENT_BINARY_DIR}/cublas)
@@ -106,33 +109,28 @@ foreach(entry gemm:gemm trsm:trsm gemv:gemv epilogue:epilogue gemm_f16_tn:gemm_f
   )
   list(APPEND cublas_shaders ${cublas_gen}/${shader}.comp.inc)
 endforeach()
-add_library(vulkanizer_cublas SHARED cublas/cublas.cpp cublas/cublas_stubs.cpp ${cublas_shaders})
-target_link_libraries(vulkanizer_cublas PRIVATE vulkanizer_common vulkanizer_cuda)
-target_include_directories(vulkanizer_cublas PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${cublas_gen}
-  PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
-set_target_properties(vulkanizer_cublas PROPERTIES
-  OUTPUT_NAME cublas
-  VERSION 12.9.0
-  SOVERSION 12
-  LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cublas/libcublas.map
-)
-target_link_options(vulkanizer_cublas PRIVATE
-  -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cublas/libcublas.map
-  -Wl,--no-undefined
-)
-
-# cuBLASLt: libcublasLt.so -> libcublasLt.so.12, the matmul on top of libcublas plus epilogues.
-add_library(vulkanizer_cublaslt SHARED cublas/cublasLt.cpp ${cublas_gen}/epilogue.comp.inc)
-target_link_libraries(vulkanizer_cublaslt PRIVATE vulkanizer_common vulkanizer_cuda vulkanizer_cublas)
-target_include_directories(vulkanizer_cublaslt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${cublas_gen}
-  PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
-set_target_properties(vulkanizer_cublaslt PROPERTIES
-  OUTPUT_NAME cublasLt
-  VERSION 12.9.0
-  SOVERSION 12
-  LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cublas/libcublasLt.map
-)
-target_link_options(vulkanizer_cublaslt PRIVATE
-  -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cublas/libcublasLt.map
-  -Wl,--no-undefined
-)
+# cuBLAS (GEMM kernels written in GLSL) and cuBLASLt (the matmul on top of it plus epilogues):
+# libcublas.so.12 / libcublasLt.so.12, and the same sources as .so.13 in lib/cuda13. The API did not
+# change between the two, only the symbol version.
+function(vulkanizer_cublas suffix major version outdir)
+  set(VULKANIZER_CUDA_MAJOR ${major})  # for the version script templates
+  foreach(lib cublas cublasLt)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cublas/lib${lib}.map.in ${CMAKE_CURRENT_BINARY_DIR}/lib${lib}${major}.map @ONLY)
+  endforeach()
+  add_library(vulkanizer_cublas${suffix} SHARED cublas/cublas.cpp cublas/cublas_stubs.cpp ${cublas_shaders})
+  add_library(vulkanizer_cublaslt${suffix} SHARED cublas/cublasLt.cpp ${cublas_gen}/epilogue.comp.inc)
+  target_link_libraries(vulkanizer_cublas${suffix} PRIVATE vulkanizer_common vulkanizer_cuda)
+  target_link_libraries(vulkanizer_cublaslt${suffix} PRIVATE vulkanizer_common vulkanizer_cuda vulkanizer_cublas${suffix})
+  foreach(pair "vulkanizer_cublas${suffix};cublas" "vulkanizer_cublaslt${suffix};cublasLt")
+    list(GET pair 0 target)
+    list(GET pair 1 lib)
+    set(map ${CMAKE_CURRENT_BINARY_DIR}/lib${lib}${major}.map)
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${cublas_gen}
+      PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
+    set_target_properties(${target} PROPERTIES OUTPUT_NAME ${lib} VERSION ${version} SOVERSION ${major}
+      LINK_DEPENDS ${map} LIBRARY_OUTPUT_DIRECTORY ${outdir})
+    target_link_options(${target} PRIVATE -Wl,--version-script=${map} -Wl,--no-undefined)
+  endforeach()
+endfunction()
+vulkanizer_cublas("" 12 12.9.0 ${CMAKE_BINARY_DIR}/lib)
+vulkanizer_cublas(13 13 13.8.0 ${CMAKE_BINARY_DIR}/lib/cuda13)
