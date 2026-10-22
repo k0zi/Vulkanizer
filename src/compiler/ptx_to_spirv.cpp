@@ -2,6 +2,7 @@
 
 #include "compiler/cfg.h"
 #include "compiler/spirv_builder.h"
+#include "common/device_address.h"
 #include "common/log.h"
 #include "ptx/instr.h"
 
@@ -713,16 +714,16 @@ private:
         return b_.op(spv::OpConvertUToPtr, b_.typePointer(spv::StorageClassPhysicalStorageBuffer, type), {addr});
     }
 
-    // Device addresses come without their sign extension (vk/device.h); the hardware wants bits
-    // 63..48 as copies of bit 47. Done on the high word alone (one 32-bit bit-field extract), and
-    // to the base before a constant offset is added, so the GPU compiler can still fold offsets
-    // into its load and store instructions.
+    // Device addresses come without their top bits (vk/device.h): bits 63..47 are set again, which
+    // also turns a host pointer into the address its imported pages have (pinned, registered and
+    // managed memory). Done on the high word alone (one 32-bit OR), and to the base before a
+    // constant offset is added, so the GPU compiler can still fold offsets into its loads and stores.
     uint32_t canonical(uint32_t addr) {
         const uint32_t v2 = b_.typeVector(tU32(), 2);
         const uint32_t words = b_.op(spv::OpBitcast, v2, {addr});
         const uint32_t lo = b_.op(spv::OpCompositeExtract, tU32(), {words, 0});
         const uint32_t hi = b_.op(spv::OpCompositeExtract, tU32(), {words, 1});
-        const uint32_t hiExt = b_.op(spv::OpBitFieldSExtract, tU32(), {hi, cU32(0), cU32(16)});
+        const uint32_t hiExt = b_.op(spv::OpBitwiseOr, tU32(), {hi, cU32(uint32_t(common::kHostAddressBits >> 32))});
         return b_.op(spv::OpBitcast, tU64(), {b_.op(spv::OpCompositeConstruct, v2, {lo, hiExt})});
     }
 

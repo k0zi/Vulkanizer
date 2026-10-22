@@ -292,6 +292,17 @@ CUresult refuseIfCapturing(CUstream hStream);
 // cuStreamWaitEvent on an event recorded during a capture: `hStream` joins that capture.
 CUresult joinCapture(CUstream hStream, CUevent hEvent);
 
+// Pinned, registered and managed host memory (api_host.cpp). Caller holds the driver lock.
+struct HostMemoryInfo {
+    uintptr_t base = 0;
+    size_t size = 0;
+    bool managed = false;
+    bool deviceAccessible = false;  // imported: the device uses it at the same address
+};
+bool findHostMemory(CUdeviceptr ptr, HostMemoryInfo& info);
+// cuMemFree of cuMemAllocManaged memory; CUDA_ERROR_NOT_FOUND for any other pointer.
+CUresult freeManaged(ApiScope& s, CUdeviceptr ptr);
+
 // Compute capability reported to applications (default 7.5; VULKANIZER_CC=86 overrides).
 void computeCapability(int& major, int& minor);
 

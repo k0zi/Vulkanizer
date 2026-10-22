@@ -210,6 +210,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフ、メモリノード、条件ノードは未対応です。
 - （まだ）未対応：テクスチャ、cuDNN、NCCL、マルチ GPU。
+- マネージド、ピン留め、登録済みのメモリはホストメモリであり、GPU は同じアドレスでその場で使います。マネージドメモリが
+  GPU に移動することはありません（統合 GPU ではいずれにせよ同じメモリです）。
 - llama.cpp の flash attention は正しく動作します（`tools/build_llama.sh --fa`）が、tensor core がない環境では
   プロンプト処理が遅くなるため、既定では無効です。
 - PyTorch：cuDNN、NCCL、融合 attention のカーネルはありません。デバイス側の `assert` が失敗してもそのスレッドが

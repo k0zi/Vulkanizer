@@ -15,18 +15,12 @@
 using namespace vulkanizer;
 using namespace vulkanizer::driver;
 
-static std::map<uintptr_t, size_t>& hostAllocations() {  // cuMemAllocHost: address -> size
-    static auto* map = new std::map<uintptr_t, size_t>();
-    return *map;
-}
-
-// The cuMemAllocHost allocation containing p (caller holds the driver lock).
-static bool findHostAllocation(uintptr_t p, uintptr_t& base, size_t& size) {
-    auto it = hostAllocations().upper_bound(p);
-    if (it == hostAllocations().begin() || p - std::prev(it)->first >= std::prev(it)->second) return false;
-    base = std::prev(it)->first;
-    size = std::prev(it)->second;
-    return true;
+// Copies and memsets into pinned or managed memory are synchronous in CUDA: the host may read
+// the result right away. Waits for the work when `dst` is such memory.
+static CUresult finishIfHostTarget(vk::Device& dev, const std::vector<AllocPiece>& dst) {
+    for (const AllocPiece& p : dst)
+        if (p.ref.buffer->importedHost) return toCuResult(dev.finish());
+    return CUDA_SUCCESS;
 }
 
 static CUresult memset32(CUdeviceptr dst, uint32_t pattern, size_t bytes, size_t elemSize) {
@@ -59,7 +53,7 @@ static CUresult memset32(CUdeviceptr dst, uint32_t pattern, size_t bytes, size_t
             if (VkResult vr = s.dev->write(*ref.buffer, at, patternBytes(at, tail).data(), tail)) return toCuResult(vr);
         }
     }
-    return CUDA_SUCCESS;
+    return finishIfHostTarget(*s.dev, pieces);
 }
 
 static CUresult writePieces(vk::Device& dev, const std::vector<AllocPiece>& dst, const void* src) {
@@ -88,7 +82,7 @@ static CUresult copyPieces(vk::Device& dev, const std::vector<AllocPiece>& src, 
         if (at == a.at + a.size) ++i;
         if (at == b.at + b.size) ++j;
     }
-    return CUDA_SUCCESS;
+    return finishIfHostTarget(dev, dst);
 }
 
 extern "C" {
@@ -130,6 +124,7 @@ CUresult CUDAAPI cuMemFree_v2(CUdeviceptr dptr) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     if (dptr == 0) return CUDA_SUCCESS;
+    if (CUresult r = freeManaged(s, dptr); r != CUDA_ERROR_NOT_FOUND) return r;  // cuMemAllocManaged memory
     auto it = s.slot->allocations.find(dptr);
     if (it == s.slot->allocations.end()) return CUDA_ERROR_INVALID_VALUE;
     s.slot->allocatedBytes -= it->second.size;
@@ -159,28 +154,6 @@ CUresult CUDAAPI cuMemGetAddressRange_v2(CUdeviceptr* pbase, size_t* psize, CUde
         return CUDA_SUCCESS;
     }
     return CUDA_ERROR_NOT_FOUND;
-}
-
-// TODO: real pinned memory that the device can access (VK_EXT_external_memory_host).
-CUresult CUDAAPI cuMemAllocHost_v2(void** pp, size_t bytesize) {
-    VULKANIZER_TRACE_API();
-    if (!pp || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    void* p = std::aligned_alloc(4096, (bytesize + 4095) / 4096 * 4096);
-    if (!p) return CUDA_ERROR_OUT_OF_MEMORY;
-    hostAllocations()[reinterpret_cast<uintptr_t>(p)] = bytesize;
-    *pp = p;
-    return CUDA_SUCCESS;
-}
-
-CUresult CUDAAPI cuMemFreeHost(void* p) {
-    VULKANIZER_TRACE_API();
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    if (!hostAllocations().erase(reinterpret_cast<uintptr_t>(p))) return CUDA_ERROR_INVALID_VALUE;
-    std::free(p);
-    return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {
@@ -315,7 +288,7 @@ CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t
 namespace {
 
 struct PointerInfo {
-    bool device = false, host = false;
+    bool device = false, host = false, managed = false;
     CUdeviceptr base = 0;  // of the allocation or mapping
     size_t size = 0;
     CUmemoryPool pool = nullptr;
@@ -323,6 +296,15 @@ struct PointerInfo {
 
 PointerInfo pointerInfo(DeviceSlot& slot, CUdeviceptr ptr) {
     PointerInfo info;
+    HostMemoryInfo host;
+    if (findHostMemory(ptr, host)) {  // pinned, registered or managed: one pointer for both sides
+        info.host = true;
+        info.device = host.deviceAccessible;
+        info.managed = host.managed;
+        info.base = host.base;
+        info.size = host.size;
+        return info;
+    }
     auto it = slot.allocations.upper_bound(ptr);
     if (it != slot.allocations.begin() && ptr - std::prev(it)->first < std::prev(it)->second.size) {
         info.device = true;
@@ -338,11 +320,6 @@ PointerInfo pointerInfo(DeviceSlot& slot, CUdeviceptr ptr) {
         info.size = std::prev(m)->second.size;
         return info;
     }
-    uintptr_t base;
-    if (findHostAllocation(uintptr_t(ptr), base, info.size)) {
-        info.host = true;
-        info.base = base;
-    }
     return info;
 }
 
@@ -352,7 +329,10 @@ bool pointerAttribute(const ApiScope& s, const PointerInfo& info, CUdeviceptr pt
     auto put = [&](auto v) { std::memcpy(data, &v, sizeof v); };
     switch (attribute) {
         case CU_POINTER_ATTRIBUTE_CONTEXT: put(s.ctx); return true;
-        case CU_POINTER_ATTRIBUTE_MEMORY_TYPE: put(unsigned(info.device ? CU_MEMORYTYPE_DEVICE : CU_MEMORYTYPE_HOST)); return true;
+        case CU_POINTER_ATTRIBUTE_MEMORY_TYPE:
+            // managed memory reports the device, as on CUDA (IS_MANAGED tells it apart)
+            put(unsigned(info.host && !info.managed ? CU_MEMORYTYPE_HOST : CU_MEMORYTYPE_DEVICE));
+            return true;
         case CU_POINTER_ATTRIBUTE_DEVICE_POINTER:
             if (!info.device) return false;
             put(ptr);
@@ -364,7 +344,7 @@ bool pointerAttribute(const ApiScope& s, const PointerInfo& info, CUdeviceptr pt
         case CU_POINTER_ATTRIBUTE_SYNC_MEMOPS: put(true); return true;
         case CU_POINTER_ATTRIBUTE_BUFFER_ID:
         case CU_POINTER_ATTRIBUTE_MEMORY_BLOCK_ID: put(static_cast<unsigned long long>(info.base)); return true;
-        case CU_POINTER_ATTRIBUTE_IS_MANAGED:
+        case CU_POINTER_ATTRIBUTE_IS_MANAGED: put(info.managed); return true;
         case CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE:
         case CU_POINTER_ATTRIBUTE_IS_GPU_DIRECT_RDMA_CAPABLE: put(false); return true;
         case CU_POINTER_ATTRIBUTE_MAPPED: put(true); return true;

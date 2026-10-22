@@ -142,7 +142,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   Hiányzik: valódi párhuzamos streamek, host callbackek (`cuLaunchHostFunc`), aszinkron memcpy.
 - [x] **3.8** Ha a grid nagyobb a `maxComputeWorkGroupCount`-nál: `vkCmdDispatchBase`-szel darabolva, a `%nctaid` push constantból jön.
 - [x] **3.9** Ha a paraméter-buffer nem fér el a push constantban: batch-enkénti feltöltési aréna, a push constantban csak a cím megy át. Dinamikus `ld.param` is működik.
-- [ ] **3.10** Kernel cache lemezen. Halasztva: a Mesa saját shader cache-e már gyorsítótárazza a pipeline-okat, a PTX → SPIR-V fordítás pedig gyors. Előbb mérni kell egy nagy alkalmazáson.
+- [x] **3.10** Kernel cache lemezen (`src/driver/kernel_cache.cpp`): a lefordított SPIR-V és metaadatai a
+  `~/.cache/vulkanizer/kernels` alatt, kulcs: a libcuda build-ID-je + a PTX modul hash-e + kernelnév + target-jellemzők
+  (`VULKANIZER_CACHE_DIR=<dir>|off`). A pipeline-okat a Mesa saját shader cache-e tárolja.
 - [x] **3.11 Teszt korpusz** (`tests/cuda/rt_kernels.cu`, CPU referenciával): reduction, tiled matmul, histogram, atomics, warp-műveletek, változók és generikus pointerek, math, bitműveletek, half, device függvényhívások, launch limitek. Plusz `rt_printf`.
 - [x] **3.12** Device oldali `printf` (launch-onkénti buffer, host oldali formázás).
 - [x] **3.13 Korán kilépő szálak és `__syncthreads`**
@@ -308,7 +310,18 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     cuDNN nélkül működnek, egy shim ugyanezt adná (im2col + GEMM), viszont bekapcsolt cuDNN mellett a PyTorch az RNN-t,
     a CTC-t, a `grid_sample`-t is oda küldené: ami a shimből hiányzik, az a mostani működő állapothoz képest elromlana.
     Ha mégis: `TORCH_CUDNN_V8_API_DISABLED=1` mellett a konvolúcióhoz elég a v7 API.
-- [ ] **5.2** Unified/managed memory, host-mapped memória (`VK_EXT_external_memory_host`), valódi pinned memória.
+- [x] **5.2** Unified/managed memory, host-mapped memória (`VK_EXT_external_memory_host`), valódi pinned memória.
+  - Kész (`src/driver/api_host.cpp`, `tests/host_memory.cpp`, `rt_kernels managed`): a pinned (`cuMemAllocHost`,
+    `cuMemHostAlloc`), a regisztrált (`cuMemHostRegister`) és a managed (`cuMemAllocManaged`) memória host-lap, amit a
+    device ugyanazon a pointeren ér el. A lapokat egy sparse bufferhez kötjük, amit capture/replay-jel a
+    `h | 0xFFFF800000000000` device-címre teszünk (`vk::Device::importHostMemory`); a kernelek a címek felső bitjeit
+    OR-ral állítják be (a sign extension helyett), így a h host-pointer is érvényes device-cím. A rögzítés csak sparse
+    bufferrel működik: az importált memória saját capture-címét a RADV figyelmen kívül hagyja.
+  - A managed memória nem migrál: host-memória marad, amit a device helyben ír-olvas (integrált GPU-n ez ugyanaz a
+    memória). `cuMemAdvise`, `cuMemPrefetchAsync`, `cuStreamAttachMemAsync` elfogadja és nem csinál semmit.
+    `CONCURRENT_MANAGED_ACCESS` = 0: a host a device munkájának végét várja meg.
+  - A szinkron memcpy/memset pinned vagy managed célra megvárja a GPU-t (CUDA-szemantika).
+  - Korlát: két regisztráció ugyanazon a lapon – a második host-only marad (a lap device-címe foglalt).
 - [x] **5.3** CUDA Graphs: stream capture és visszajátszás (`src/driver/api_graph.cpp`, `tests/graph.cpp`).
   - A gráfok a driverben vannak, így a runtime és a Driver API indításai (Triton) egyaránt rögzülnek. Capture alatt
     a kernelindítás, memcpy/memset, host függvény, event record/wait csomópont vagy függőségi él lesz; másik stream

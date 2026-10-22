@@ -211,6 +211,8 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph, memória- és feltételes csomópont nincs.
 - (Még) nem támogatott: textúrák, cuDNN, NCCL, több GPU.
+- A managed, a pinned és a regisztrált memória host-memória, amit a GPU helyben, ugyanazon a címen használ; a managed
+  memória sosem migrál a GPU-ra (integrált GPU-n ez amúgy is ugyanaz a memória).
 - A llama.cpp flash attention helyesen fut (`tools/build_llama.sh --fa`), de tensor core-ok nélkül vele lassabb a
   prompt feldolgozása, ezért alapból ki van kapcsolva.
 - PyTorch: nincsenek cuDNN-, NCCL- és fúzionált attention kernelek; egy eszközoldali `assert` hibája csak a szálat

@@ -212,6 +212,8 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 - CUDA Graphs: Stream Capture und Wiedergabe funktionieren (die Graphen von llama.cpp, PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); keine Child-Graphen, Speicher- oder bedingten Knoten.
 - (Noch) nicht unterstützt: Texturen, cuDNN, NCCL, Multi-GPU.
+- Managed-, Pinned- und registrierter Speicher sind Host-Speicher, den die GPU direkt unter derselben Adresse nutzt;
+  Managed-Speicher wird nie auf die GPU migriert (auf einer integrierten GPU ist es ohnehin derselbe Speicher).
 - Flash Attention in llama.cpp läuft korrekt (`tools/build_llama.sh --fa`), aber ohne Tensor Cores ist die
   Prompt-Verarbeitung damit langsamer, daher ist sie standardmäßig aus.
 - PyTorch: keine cuDNN-, NCCL- oder fusionierten Attention-Kernel; ein fehlgeschlagenes `assert` auf dem Gerät hält

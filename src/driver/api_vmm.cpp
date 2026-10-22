@@ -139,15 +139,6 @@ VkResult createChunks(vk::Device& dev, size_t size, size_t alignment, VmReservat
     return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
-struct HostRegistry {
-    std::mutex mutex;
-    std::map<uintptr_t, size_t> ranges;  // address -> size
-};
-HostRegistry& hostRegistry() {
-    static auto* r = new HostRegistry;
-    return *r;
-}
-
 }  // namespace
 
 extern "C" {
@@ -354,51 +345,6 @@ CUresult CUDAAPI cuMemRetainAllocationHandle(CUmemGenericAllocationHandle* handl
     ++a->refs;
     *handle = reinterpret_cast<uintptr_t>(a);
     return CUDA_SUCCESS;
-}
-
-// Registered host memory is bookkeeping only: copies from and to host memory work on any
-// pointer, and kernels cannot access host memory (no VK_EXT_external_memory_host import yet,
-// plan.md 5.2), so registration with CU_MEMHOSTREGISTER_DEVICEMAP is not supported.
-CUresult CUDAAPI cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int Flags) {
-    VULKANIZER_TRACE_API();
-    if (!p || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
-    if (Flags & ~unsigned(CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_IOMEMORY |
-                          CU_MEMHOSTREGISTER_READ_ONLY))
-        return CUDA_ERROR_INVALID_VALUE;
-    if (Flags & (CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_IOMEMORY)) return CUDA_ERROR_NOT_SUPPORTED;
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    HostRegistry& reg = hostRegistry();
-    std::lock_guard<std::mutex> lock(reg.mutex);
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(p);
-    auto next = reg.ranges.lower_bound(begin);
-    if (next != reg.ranges.end() && next->first < begin + bytesize) return CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED;
-    if (next != reg.ranges.begin() && std::prev(next)->first + std::prev(next)->second > begin)
-        return CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED;
-    reg.ranges[begin] = bytesize;
-    return CUDA_SUCCESS;
-}
-
-// The pre-CUDA 11 entry point (the header maps the name to _v2).
-#undef cuMemHostRegister
-CUresult CUDAAPI cuMemHostRegister(void* p, size_t bytesize, unsigned int Flags);
-CUresult CUDAAPI cuMemHostRegister(void* p, size_t bytesize, unsigned int Flags) {
-    return cuMemHostRegister_v2(p, bytesize, Flags);
-}
-
-CUresult CUDAAPI cuMemHostUnregister(void* p) {
-    VULKANIZER_TRACE_API();
-    ApiScope s;
-    if (CUresult r = enterContext(s)) return r;
-    HostRegistry& reg = hostRegistry();
-    std::lock_guard<std::mutex> lock(reg.mutex);
-    return reg.ranges.erase(reinterpret_cast<uintptr_t>(p)) ? CUDA_SUCCESS : CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED;
-}
-
-CUresult CUDAAPI cuMemHostGetDevicePointer_v2(CUdeviceptr* pdptr, void* p, unsigned int Flags) {
-    VULKANIZER_TRACE_API();
-    if (!pdptr || !p || Flags != 0) return CUDA_ERROR_INVALID_VALUE;
-    return CUDA_ERROR_NOT_SUPPORTED;  // host memory is not device-accessible (see above)
 }
 
 }  // extern "C"

@@ -37,6 +37,7 @@ vulkanizer_cuda_test(fatbin)
 vulkanizer_cuda_test(vmm)
 vulkanizer_cuda_test(warp_matrix)
 vulkanizer_cuda_test(graph)
+vulkanizer_cuda_test(host_memory)
 vulkanizer_cuda_test(cublas)
 target_link_libraries(cublas PRIVATE vulkanizer_cublas vulkanizer_cublaslt)
 

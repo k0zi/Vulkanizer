@@ -43,6 +43,7 @@ add_library(vulkanizer_cuda SHARED
   driver/api_init.cpp
   driver/api_context.cpp
   driver/api_graph.cpp
+  driver/api_host.cpp
   driver/api_memory.cpp
   driver/api_mempool.cpp
   driver/api_vmm.cpp

@@ -212,6 +212,8 @@ Lista completa: [plan.md, sección 4](plan.md).
 - CUDA Graphs: la captura de streams y la reproducción funcionan (los grafos de llama.cpp, `CUDAGraph` de PyTorch,
   `torch.compile(mode="reduce-overhead")`); no hay grafos hijos, nodos de memoria ni nodos condicionales.
 - (Aún) no compatible: texturas, cuDNN, NCCL, varias GPU.
+- La memoria managed, fijada (pinned) y registrada es memoria del anfitrión que la GPU usa en su sitio, en la misma
+  dirección; la memoria managed nunca migra a la GPU (en una GPU integrada es la misma memoria de todos modos).
 - La flash attention de llama.cpp funciona correctamente (`tools/build_llama.sh --fa`), pero sin tensor cores el
   procesamiento del prompt es más lento con ella, por eso está desactivada por defecto.
 - PyTorch: sin kernels de cuDNN, NCCL ni de atención fusionada; un `assert` fallido en el dispositivo solo detiene el

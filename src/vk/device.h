@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/device_address.h"
 #include "vk/instance.h"
 
 #include <functional>
@@ -10,20 +11,17 @@
 
 namespace vulkanizer::vk {
 
-// A device allocation addressable from shaders through its buffer device address.
-// The device addresses Vulkanizer hands out (CUdeviceptr, Buffer::address) are the buffer device
-// addresses without their sign extension: RADV places buffers in the upper half of the 48-bit
-// address space (0xffff8...), which as a signed 64-bit integer is negative and breaks programs
-// that keep pointers in an int64 (PyTorch's CUDA graph trees, ctypes). Kernels restore bits
-// 63..48 from bit 47 before every access (the PTX compiler, and canon() in the GLSL shaders).
-constexpr uint64_t kAddressMask = 0x0000FFFFFFFFFFFFull;
+using common::kAddressMask;  // device address conventions: common/device_address.h
+using common::kHostAddressBits;
 
+// A device allocation addressable from shaders through its buffer device address.
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
     void* mapped = nullptr;  // set when the memory is host-visible and coherent
+    bool importedHost = false;  // `mapped` is application host memory imported into the device
 };
 
 struct ComputePipeline {
@@ -52,6 +50,7 @@ struct Features {
     bool fusedFma64 = false;         // the same for f64 fma()
     bool sparseBuffers = false;      // sparse residency buffers on the compute queue (CUDA VMM)
     bool addressCaptureReplay = false;  // buffers can be placed at a requested device address
+    bool hostMemoryImport = false;  // host memory at device address h | kHostAddressBits (importHostMemory)
 };
 
 // One page range of a sparse buffer bound to `memory` (or unbound if VK_NULL_HANDLE).
@@ -90,6 +89,12 @@ public:
     // `opaqueOut` receives the value that places another buffer right here.
     VkDeviceSize sparsePageSize() const { return sparsePageSize_; }
     VkDeviceSize maxSparseBufferSize() const { return maxSparseBufferSize_; }
+    VkDeviceSize hostImportAlignment() const { return hostImportAlignment_; }
+    // Makes [host, host + size) device-accessible at device address host | kHostAddressBits (a
+    // sparse buffer placed there, with the host pages imported through VK_EXT_external_memory_host
+    // bound to it). `host` and `size` must be multiples of hostImportAlignment(). out.address and
+    // out.mapped are `host`. Fails if the device address range is taken.
+    VkResult importHostMemory(void* host, VkDeviceSize size, Buffer& out);
     VkResult createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, Buffer& out, uint64_t& opaqueOut);
     VkResult allocateMemory(VkDeviceSize size, VkDeviceMemory& out);  // for sparse binding
     void freeMemory(VkDeviceMemory memory);
@@ -217,6 +222,8 @@ private:
     VkDeviceSize sparsePageSize_ = 0;
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
+    VkDeviceSize hostImportAlignment_ = 0;
+    PFN_vkGetMemoryHostPointerPropertiesEXT getHostPointerProperties_ = nullptr;
     std::recursive_mutex mutex_;
 };
 

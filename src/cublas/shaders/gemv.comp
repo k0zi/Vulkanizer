@@ -18,11 +18,11 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ptr { uint64_t v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer U16x4 { uvec2 v; };
 
-// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
-// hardware wants them canonical.
-uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+// Device addresses arrive without their top bits (see vk/device.h); the hardware wants them
+// canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: bits 63..47 set (vk::kHostAddressBits)
     uvec2 w = unpackUint2x32(a);
-    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    w.y |= 0xFFFF8000u;
     return packUint2x32(w);
 }
 

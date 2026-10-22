@@ -75,9 +75,13 @@ int main() {
     CHECK_CU(cuCtxSynchronize_v2(primary));
     EXPECT_CU(CUDA_ERROR_INVALID_CONTEXT, cuCtxGetDevice_v2(&viaV2, nullptr));  // none is current
     CHECK_CU(cuDevicePrimaryCtxRelease(dev));
+    CHECK_CU(cuGetProcAddress("cuMemAdvise", &fn, 13000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+    EXPECT(fn == reinterpret_cast<void*>(&cuMemAdvise_v2));  // CUmemLocation since 12.2
+    CHECK_CU(cuGetProcAddress("cuMemAdvise", &fn, 12000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+    EXPECT(fn == reinterpret_cast<void*>(&cuMemAdvise));
     // a variant Vulkanizer lacks is not found rather than an older signature
     EXPECT_CU(CUDA_ERROR_NOT_FOUND,
-              cuGetProcAddress("cuMemAdvise", &fn, 13000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+              cuGetProcAddress("cuGraphAddNode", &fn, 13000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
 
     const char* str = nullptr;
     CHECK_CU(cuGetErrorString(CUDA_ERROR_OUT_OF_MEMORY, &str));

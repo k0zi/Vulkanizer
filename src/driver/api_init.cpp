@@ -334,7 +334,17 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
         }
         case CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED:
         case CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED: *pi = 1; break;
+        // Host memory imported at the host pointer's own device address (api_host.cpp).
+        case CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY:
         case CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM:
+        case CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY:
+        case CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST: {
+            std::lock_guard<std::recursive_mutex> lock(Driver::get().mutex());
+            *pi = Driver::get().ensureDevice(*s) == CUDA_SUCCESS && s->vk->features().hostMemoryImport;
+            break;
+        }
+        case CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS:     // only registered memory
+        case CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS:  // the host waits for the device
         case CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED:
         case CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED:
         case CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED:
@@ -346,7 +356,6 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
         case CU_DEVICE_ATTRIBUTE_GPU_OVERLAP:
         case CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT:
         case CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT:
-        case CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY:
         case CU_DEVICE_ATTRIBUTE_COMPUTE_MODE:
         case CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS:
         case CU_DEVICE_ATTRIBUTE_ECC_ENABLED:
@@ -355,7 +364,6 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
         case CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID:
         case CU_DEVICE_ATTRIBUTE_TCC_DRIVER:
         case CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED:
-        case CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY:
         case CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD:
         case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: *pi = 0; break;
         default:

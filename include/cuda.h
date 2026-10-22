@@ -150,6 +150,9 @@ typedef enum CUdevice_attribute_enum {
     CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR = 81,
     CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR = 82,
     CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY = 83,
+    CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS = 88,
+    CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS = 89,
+    CU_DEVICE_ATTRIBUTE_DIRECT_MANAGED_MEM_ACCESS_FROM_HOST = 101,
     CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD = 84,
     CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 91,
     CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH = 95,
@@ -359,6 +362,22 @@ typedef CUmemPoolProps_v1 CUmemPoolProps;
 #define CU_MEMHOSTREGISTER_DEVICEMAP 0x02
 #define CU_MEMHOSTREGISTER_IOMEMORY 0x04
 #define CU_MEMHOSTREGISTER_READ_ONLY 0x08
+#define CU_MEMHOSTALLOC_PORTABLE 0x01
+#define CU_MEMHOSTALLOC_DEVICEMAP 0x02
+#define CU_MEMHOSTALLOC_WRITECOMBINED 0x04
+typedef enum CUmemAttach_flags_enum {
+    CU_MEM_ATTACH_GLOBAL = 0x1,
+    CU_MEM_ATTACH_HOST = 0x2,
+    CU_MEM_ATTACH_SINGLE = 0x4
+} CUmemAttach_flags;
+typedef enum CUmem_advise_enum {
+    CU_MEM_ADVISE_SET_READ_MOSTLY = 1,
+    CU_MEM_ADVISE_UNSET_READ_MOSTLY = 2,
+    CU_MEM_ADVISE_SET_PREFERRED_LOCATION = 3,
+    CU_MEM_ADVISE_UNSET_PREFERRED_LOCATION = 4,
+    CU_MEM_ADVISE_SET_ACCESSED_BY = 5,
+    CU_MEM_ADVISE_UNSET_ACCESSED_BY = 6
+} CUmem_advise;
 
 /* Extended launches (cuLaunchKernelEx) */
 
@@ -719,6 +738,17 @@ CUresult CUDAAPI cuMemFree(CUdeviceptr dptr);
 CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr);
 CUresult CUDAAPI cuMemAllocHost(void** pp, size_t bytesize);
 CUresult CUDAAPI cuMemFreeHost(void* p);
+/* Pinned, registered and managed memory are host pages the device accesses at the same
+   address (VK_EXT_external_memory_host); advice and prefetches are accepted and ignored. */
+CUresult CUDAAPI cuMemHostAlloc(void** pp, size_t bytesize, unsigned int Flags);
+CUresult CUDAAPI cuMemHostGetFlags(unsigned int* pFlags, void* p);
+CUresult CUDAAPI cuMemAllocManaged(CUdeviceptr* dptr, size_t bytesize, unsigned int flags);
+CUresult CUDAAPI cuMemAdvise(CUdeviceptr devPtr, size_t count, CUmem_advise advice, CUdevice device);
+CUresult CUDAAPI cuMemAdvise_v2(CUdeviceptr devPtr, size_t count, CUmem_advise advice, CUmemLocation location);
+CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count, CUdevice dstDevice, CUstream hStream);
+CUresult CUDAAPI cuMemPrefetchAsync_v2(CUdeviceptr devPtr, size_t count, CUmemLocation location, unsigned int flags,
+                                       CUstream hStream);
+CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr, size_t length, unsigned int flags);
 
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount);
 CUresult CUDAAPI cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount);

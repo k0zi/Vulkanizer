@@ -627,9 +627,15 @@ cudaError_t CUDARTAPI cudaMallocHost(void** ptr, size_t size) {
     return record(cuMemAllocHost(ptr, size));
 }
 
+// The flags (cudaHostAllocPortable/Mapped/WriteCombined) have the driver's values.
 cudaError_t CUDARTAPI cudaHostAlloc(void** pHost, size_t size, unsigned int flags) {
     ENTER();
-    return record(cuMemAllocHost(pHost, size));
+    return record(cuMemHostAlloc(pHost, size, flags));
+}
+
+cudaError_t CUDARTAPI cudaHostGetFlags(unsigned int* pFlags, void* pHost) {
+    ENTER();
+    return record(cuMemHostGetFlags(pFlags, pHost));
 }
 
 cudaError_t CUDARTAPI cudaFreeHost(void* ptr) {
@@ -783,13 +789,16 @@ cudaError_t CUDARTAPI cudaMemcpyPeer(void* dst, int dstDevice, const void* src, 
     return cudaMemcpyPeerAsync(dst, dstDevice, src, srcDevice, count, nullptr);
 }
 
-// Host-mapped and managed memory need VK_EXT_external_memory_host-style support (plan.md 5.2);
-// callers such as ggml fall back to ordinary allocations when these fail.
+// Managed, pinned and registered memory: host pages the device uses at the same address
+// (driver api_host.cpp). Flags and advice values are the driver's.
 cudaError_t CUDARTAPI cudaMallocManaged(void** devPtr, size_t size, unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    if (!devPtr) return record(cudaErrorInvalidValue);
+    CUdeviceptr p = 0;
+    const CUresult r = cuMemAllocManaged(&p, size, flags);
+    *devPtr = reinterpret_cast<void*>(p);
+    return record(r);
 }
-// Registration is bookkeeping in the driver; mapped registrations (device access) fail.
 cudaError_t CUDARTAPI cudaHostRegister(void* ptr, size_t size, unsigned int flags) {
     ENTER();
     return record(cuMemHostRegister(ptr, size, flags));
@@ -800,7 +809,33 @@ cudaError_t CUDARTAPI cudaHostUnregister(void* ptr) {
 }
 cudaError_t CUDARTAPI cudaHostGetDevicePointer(void** pDevice, void* pHost, unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    if (!pDevice) return record(cudaErrorInvalidValue);
+    CUdeviceptr p = 0;
+    const CUresult r = cuMemHostGetDevicePointer(&p, pHost, flags);
+    *pDevice = reinterpret_cast<void*>(p);
+    return record(r);
+}
+
+// Managed memory never migrates: prefetches and attachments only check their arguments.
+#if VULKANIZER_CUDART_MAJOR >= 13
+cudaError_t CUDARTAPI cudaMemPrefetchAsync(const void* devPtr, size_t count, cudaMemLocation location,
+                                           unsigned int flags, cudaStream_t stream) {
+#else
+cudaError_t CUDARTAPI cudaMemPrefetchAsync(const void* devPtr, size_t count, int dstDevice, cudaStream_t stream) {
+#endif
+    ENTER();
+    return record(cuMemPrefetchAsync(reinterpret_cast<CUdeviceptr>(devPtr), count, 0, stream));
+}
+#if VULKANIZER_CUDART_MAJOR < 13
+cudaError_t CUDARTAPI cudaMemPrefetchAsync_v2(const void* devPtr, size_t count, cudaMemLocation location,
+                                              unsigned int flags, cudaStream_t stream) {
+    ENTER();
+    return record(cuMemPrefetchAsync(reinterpret_cast<CUdeviceptr>(devPtr), count, 0, stream));
+}
+#endif
+cudaError_t CUDARTAPI cudaStreamAttachMemAsync(cudaStream_t stream, void* devPtr, size_t length, unsigned int flags) {
+    ENTER();
+    return record(cuStreamAttachMemAsync(stream, reinterpret_cast<CUdeviceptr>(devPtr), length, flags));
 }
 #if VULKANIZER_CUDART_MAJOR >= 13
 cudaError_t CUDARTAPI cudaMemAdvise(const void* devPtr, size_t count, int advice, cudaMemLocation location) {
@@ -1287,14 +1322,21 @@ cudaError_t CUDARTAPI cudaPointerGetAttributes(struct cudaPointerAttributes* att
     ENTER();
     if (!attributes) return record(cudaErrorInvalidValue);
     *attributes = {};
-    CUdeviceptr base;
-    size_t size;
-    if (ptr && cuMemGetAddressRange(&base, &size, reinterpret_cast<CUdeviceptr>(ptr)) == CUDA_SUCCESS) {
-        attributes->type = cudaMemoryTypeDevice;
+    const CUdeviceptr p = reinterpret_cast<CUdeviceptr>(ptr);
+    unsigned memoryType = 0;
+    int managed = 0;
+    if (ptr && cuPointerGetAttribute(&memoryType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, p) == CUDA_SUCCESS &&
+        cuPointerGetAttribute(&managed, CU_POINTER_ATTRIBUTE_IS_MANAGED, p) == CUDA_SUCCESS) {
+        attributes->type = managed ? cudaMemoryTypeManaged
+                           : memoryType == CU_MEMORYTYPE_HOST ? cudaMemoryTypeHost
+                                                              : cudaMemoryTypeDevice;
         CUdevice dev = 0;
         cuCtxGetDevice(&dev);
         attributes->device = dev;
-        attributes->devicePointer = const_cast<void*>(ptr);
+        CUdeviceptr d = 0;  // pinned memory the device cannot use has no device pointer
+        if (cuPointerGetAttribute(&d, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, p) == CUDA_SUCCESS)
+            attributes->devicePointer = reinterpret_cast<void*>(d);
+        if (attributes->type != cudaMemoryTypeDevice) attributes->hostPointer = const_cast<void*>(ptr);
     } else {
         attributes->type = cudaMemoryTypeUnregistered;  // plain host memory
         attributes->device = -2;

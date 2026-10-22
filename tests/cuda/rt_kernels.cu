@@ -816,6 +816,53 @@ static bool testGraphs() {
     return ok;
 }
 
+// ---- managed and mapped host memory -----------------------------------------------------------
+
+__global__ void squarePlusOne(float* data, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] = data[i] * data[i] + 1.0f;
+}
+
+static bool testManaged() {
+    const int n = 50000;
+    float* m = nullptr;
+    CHECK(cudaMallocManaged(reinterpret_cast<void**>(&m), n * sizeof(float), cudaMemAttachGlobal));
+    for (int i = 0; i < n; ++i) m[i] = float(i % 100);  // the CPU writes through the same pointer
+    squarePlusOne<<<(n + 255) / 256, 256>>>(m, n);
+    CHECK(cudaDeviceSynchronize());
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) ok = m[i] == float((i % 100) * (i % 100) + 1);
+    if (!ok) std::fprintf(stderr, "  managed: wrong result\n");
+    cudaPointerAttributes a;
+    CHECK(cudaPointerGetAttributes(&a, m));
+    if (a.type != cudaMemoryTypeManaged || a.devicePointer != m || a.hostPointer != m) {
+        std::fprintf(stderr, "  managed: pointer attributes type %d\n", int(a.type));
+        ok = false;
+    }
+    CHECK(cudaFree(m));
+
+    float* pinned = nullptr;  // zero-copy: the kernel uses the host allocation directly
+    CHECK(cudaHostAlloc(reinterpret_cast<void**>(&pinned), n * sizeof(float), cudaHostAllocMapped));
+    for (int i = 0; i < n; ++i) pinned[i] = 2.0f;
+    float* device = nullptr;
+    CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device), pinned, 0));
+    squarePlusOne<<<(n + 255) / 256, 256>>>(device, n);
+    CHECK(cudaDeviceSynchronize());
+    for (int i = 0; i < n && ok; ++i) ok = pinned[i] == 5.0f;
+    if (!ok) std::fprintf(stderr, "  mapped pinned memory: wrong result\n");
+    CHECK(cudaPointerGetAttributes(&a, pinned));
+    if (a.type != cudaMemoryTypeHost || a.devicePointer != pinned) {
+        std::fprintf(stderr, "  pinned: pointer attributes type %d\n", int(a.type));
+        ok = false;
+    }
+    CHECK(cudaFreeHost(pinned));
+    int dummy = 0;
+    CHECK(cudaPointerGetAttributes(&a, &dummy));
+    if (a.type != cudaMemoryTypeUnregistered) ok = false;
+    if (!ok) ++g_mismatches;
+    return ok;
+}
+
 // ---- fma accuracy (emulated where the driver's Fma is not fused) ---------------------------------
 
 __global__ void fmaKernel(const float* a, const float* b, const float* c, float* out, float* err, int n) {
@@ -959,7 +1006,7 @@ int main(int argc, char** argv) {
                           {"math", testMath},       {"bits", testBits},     {"calls", testCalls},
                           {"limits", testLimits}, {"half", testHalf},
                           {"fma", testFma}, {"packing", testPacking},
-                          {"graphs", testGraphs},
+                          {"graphs", testGraphs}, {"managed", testManaged},
                           {"halfatomics", testHalfAtomics}};
     int failed = 0;
     for (const Test& t : tests) {
