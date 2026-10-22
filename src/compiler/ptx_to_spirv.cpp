@@ -2295,7 +2295,7 @@ private:
     bool usesWarpOps() const {
         for (const ptx::Instruction& ins : fn_.instructions)
             if (ins.opcode == "shfl" || ins.opcode == "vote" || ins.opcode == "activemask" || ins.opcode == "match" ||
-                ins.opcode == "mma" || ins.opcode == "ldmatrix")
+                ins.opcode == "redux" || ins.opcode == "mma" || ins.opcode == "ldmatrix")
                 return true;
         return false;
     }
@@ -2559,6 +2559,38 @@ private:
         }
     }
 
+    // redux.sync.{add,min,max}.{u32,s32} d, a, mask   redux.sync.{and,or,xor}.b32 d, a, mask
+    // Lane by lane like match: only the lanes in mask are read, so a partial mask with the other
+    // lanes inactive works too.
+    void emitRedux(const ptx::Instruction& ins) {
+        if (ins.operands.size() != 3) fail(ins, "redux needs 3 operands");
+        const PtxType t = typeOf(ins);
+        if (t.width != 32 || t.isFloat()) fail(ins, "only 32-bit integer redux is supported");
+        const bool s = t.isSigned();
+        std::function<uint32_t(uint32_t, uint32_t)> combine;
+        auto bitwise = [&](spv::Op op) { combine = [this, op](uint32_t x, uint32_t y) { return b_.op(op, tU32(), {x, y}); }; };
+        auto ext = [&](GLSLstd450 inst) { combine = [this, inst](uint32_t x, uint32_t y) { return glsl(tU32(), inst, {x, y}); }; };
+        if (ins.has(".add")) bitwise(spv::OpIAdd);
+        else if (ins.has(".min")) ext(s ? GLSLstd450SMin : GLSLstd450UMin);
+        else if (ins.has(".max")) ext(s ? GLSLstd450SMax : GLSLstd450UMax);
+        else if (ins.has(".and")) bitwise(spv::OpBitwiseAnd);
+        else if (ins.has(".or")) bitwise(spv::OpBitwiseOr);
+        else if (ins.has(".xor")) bitwise(spv::OpBitwiseXor);
+        else fail(ins, "missing redux operation");
+        const uint32_t a = value(ins, ins.operands[1], {Base::Bit, 32});
+        const uint32_t mask = value(ins, ins.operands[2], {Base::Bit, 32});
+        uint32_t acc = 0;  // starts at the first lane in mask: no identity per operation needed
+        uint32_t seen = b_.constBool(false);
+        for (uint32_t i = 0; i < 32; ++i) {
+            const uint32_t v = warpShuffle(a, cU32(i));
+            const uint32_t in = b_.op(spv::OpINotEqual, tBool(), {b_.op(spv::OpBitwiseAnd, tU32(), {mask, cU32(1u << i)}), cU32(0)});
+            const uint32_t combined = i ? b_.op(spv::OpSelect, tU32(), {seen, combine(acc, v), v}) : v;
+            acc = i ? b_.op(spv::OpSelect, tU32(), {in, combined, acc}) : v;
+            seen = b_.op(spv::OpLogicalOr, tBool(), {seen, in});
+        }
+        storeReg(ins, dstReg(ins).name, {Base::Bit, 32}, acc);
+    }
+
     void emitInstruction(const ptx::Instruction& ins) {
         const std::string_view op = ins.opcode;
         if (op != "cvt" && op != "ld" && op != "st" && op != "mov" && op != "atom" && op != "red" && op != "mma" &&
@@ -2612,6 +2644,7 @@ private:
         else if (op == "vote") emitVote(ins);
         else if (op == "activemask") emitActivemask(ins);
         else if (op == "match") emitMatch(ins);
+        else if (op == "redux") emitRedux(ins);
         else if (op == "vprintf") emitPrintf(ins);
         else if (op == "bar" || op == "barrier" || op == "membar" || op == "fence") emitBarrier(ins);
         else fail(ins, "unsupported instruction '" + std::string(op) + "'");

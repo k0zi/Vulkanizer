@@ -125,10 +125,11 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   Hiányzik: 64 bites atomics shared memórián.
 - [x] **3.3** Local memory (per-szál word tömb), `.func` hívások PTX-szintű inline-olása, `.global`/`.const` modulváltozók inicializálóval, `cuModuleGetGlobal`, generikus címek (shared/local ablak tag-gel).
   Hiányzik: rekurzió, indirekt hívás.
-- [x] **3.4 Warp műveletek**: `shfl.sync`, `vote.sync`, `activemask`, `match`, `%lanemask_*`.
+- [x] **3.4 Warp műveletek**: `shfl.sync`, `vote.sync`, `activemask`, `match`, `redux.sync` (egész), `%lanemask_*`.
   - subgroup 32 és 64 (RADV): a warp a subgroup 32-es szelete;
   - subgroup < 32 (llvmpipe): shared memórián át, workgroup barrierrel. Csak akkor helyes, ha az egész blokk egységesen hajtja végre.
-  Hiányzik: `redux` (sm_80).
+  A `redux.sync` lane-enként, a maszk szerint gyűjt (mint a `match`), így részleges maszkkal is helyes (`tests/warp_matrix.cpp`).
+  Hiányzik: `redux.sync` f32 min/max (sm_100a).
 - [x] **3.5 Math**
   - `sqrt/rsqrt/rcp/ex2/lg2/sin/cos/tanh`, `copysign`, `testp`, `popc/clz/brev/bfind/bfe/bfi/prmt/lop3/shf`, carry-láncok, `sad/cnot/slct/set`;
   - f16/bf16 konverzió és aritmetika (f32-ben, pontos RNE).
@@ -158,7 +159,8 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - [x] **4.1** `libcublas.so.12` shim: saját `cublas_v2.h`, handle/stream/math mode, `Sgemm`, `GemmEx`, batched és strided batched változatok, `StrsmBatched`.
   A kernelek GLSL-ben vannak (`src/cublas/shaders`), és a `vulkanizerCreateSpirvFunction` driver-bővítésen át futnak.
   Hiányzik: gyors GEMM (cooperative matrix, jobb tiling), `cublasLt`.
-- [ ] **4.2** `libcublasLt` (kész: matmul, batch, bias/ReLU/GELU epilógus), `libcurand`, `libcufft`. Majd ha a PyTorch kéri.
+- [ ] **4.2** `libcublasLt` (kész: matmul, batch, bias/ReLU/GELU epilógus), `libcurand`, `libcufft`, `libcusparse`, `libcusolver`.
+  Majd ha a PyTorch vagy egy célalkalmazás kéri. A cuBLAS is csak a GEMM/TRSM családot tudja (4.1).
 - [x] **4.3** Célalkalmazás: a llama.cpp CUDA backendje (`tools/build_llama.sh`).
 - [x] **4.4 Mérföldkő:** a SmolLM2-135M (Q8_0 és Q4_0) szöveget generál a Renoir iGPU-n.
   - `llama-bench`: pp64 ≈ 227 t/s, tg32 ≈ 25 t/s.
@@ -186,10 +188,32 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     (ggml f16 k=128 batched: 24 → 6,7 ms; a natív 2,5 ms, mert a broadcastolt A-t egyszer olvassa).
   - Hátra: mmvq (Q4_0 ~1,4×, Q6_K lassabb a natívnál), dequantize + GEMM összevonása,
     flash attention gyorsítása (a tile kernel pp-ben lassú).
-- [ ] **4.7** ComfyUI (Z-Image Turbo) teljes képgenerálás.
+- [x] **4.7** ComfyUI (Z-Image Turbo) teljes képgenerálás.
   - Már kész: a conda-forge környezetben fut (`venv-vulkanizer`, a torchvision feloldás nélkül, URL-ről).
-    Indítás: `run_torch.sh` + `--disable-cuda-malloc --disable-dynamic-vram`. A `torch._native` Triton/CuTe DSL
+    Indítás: `run_torch.sh` + `--disable-cuda-malloc` (a 4.9 óta DynamicVRAM-mal is). A `torch._native` Triton/CuTe DSL
     kernelei `TORCH_DISABLE_NATIVE_JIT=1`-gyel ki vannak kapcsolva (`tools/torch/sitecustomize.py`).
+  - GPU-n kész (2026-10-21): a sablon 1024×1024-en, seed 42-vel végigfut a Renoiron, 117,8 s/lépés (8 lépés, összesen ~21 perc).
+    Közben előjött hibák:
+    - A 64 parancsos batchek 1024×1024-en 2 s-nál tovább futottak, és az amdgpu reseteli a GPU-t (`lockup_timeout`,
+      alapból 2000 ms a compute ringen is). Megoldás: minden dispatch timestampet kap, és pipeline-onként a mért legnagyobb
+      ns/workgroup alapján egy submit legfeljebb `VULKANIZER_BATCH_MS` (alap: 50 ms) becsült munkát kap. A nagyobb gridek
+      darabokra bomlanak (`vkCmdDispatchBase`, a `%nctaid` push constantból jön). Egy új pipeline első indítása egy 256
+      workgroupos, külön mért próbadarab.
+    - A pufferben átadott kernelparaméterek (`paramsInBuffer`, >256 bájt, pl. a TensorIterator offset calculatorai)
+      a batch arénájában voltak. A több batchre bontott dispatch későbbi darabjai újrahasznosított slot arénájára
+      mutattak, amit a következő indítás felülírhatott. Most a `Device::dispatch` minden batchbe saját másolatot tölt fel.
+      Regressziós teszt: `VULKANIZER_BATCH_MS=0.01 ./run_torch.sh tests/torch/split.py`. Ez a hibát a régi kóddal sem
+      váltotta ki (ritka slot/offset-egybeesés kell hozzá), de a javítás után a ComfyUI-s futás timeout nélkül ment végig.
+    - Diagnosztika: device lostnál a legrégebbi befejezetlen batch dispatch-ei listázódnak méretükkel és becsült
+      idejükkel, egyszer. A `CUDA_LAUNCH_BLOCKING=1` minden indítás után megvárja a GPU-t.
+  - CPU-s összevetés (2026-10-22, ugyanaz a seed, a CPU fp32-ben, a GPU fp16-ban számol; a CPU-s futás ~10 óra volt):
+    kép SSIM 0,929 (8×8 blokk, luma), PSNR 26,6 dB, MAE 6,2/255, a pixelek 4,6%-a tér el 32-nél többel;
+    latent koszinusz 0,982, relatív L2 0,19. A kompozíció azonos, az eltérés az éleken és a finom részleteken van.
+  - Egyetlen modell-forward 256×256-on (azonos conditioning és zaj, egy euler lépés σ=1-ről), relatív L2 / koszinusz:
+    GPU fp16 (Vulkanizer) vs CPU fp32: 4,78e-2 / 0,99886; CPU fp16 vs CPU fp32: 4,66e-2 / 0,99892;
+    GPU fp16 vs CPU fp16: 3,85e-3 / 0,999993. A Vulkanizer eltérése az fp32-től akkora, mint maga az fp16-é,
+    vagyis a képek közti különbség az fp16 kerekítésből jön, a 8 lépés felerősíti; a maradék a GEMM-ek összegzési sorrendje.
+    Megismételhető: `python3 tests/torch/zimage_forward.py` (ComfyUI checkout és Z-Image modellek kellenek hozzá).
   - **Kész, ha:** a Z-Image Turbo sablon 1024×1024-es képet generál, és az eredmény megegyezik a CPU-s futáséval.
   - Az alábbi hiányzó funkciók a ComfyUI nélkülük is futó, de lassabb vagy szűkebb útjait nyitnák meg:
 - [x] **4.8** Stream-rendezett allokáció a Driver API-ban: `cuMemAllocAsync`, `cuMemFreeAsync` (`_ptsz` is),
@@ -197,7 +221,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   A felszabadítás a stream addigi munkája után történik várakozás nélkül (`Device::freeBufferAfter`, serial alapján).
   A poolok nem cache-elnek, csak az attribútumokat és a statisztikát tartják. A runtime `cudaMallocAsync`/`cudaMemPool*`
   ezekre épül; `cuGetProcAddress` a per-thread flaggel a `_ptsz`/`_ptds` változatot adja.
-- [ ] **4.9** Virtuális memóriakezelés (VMM) sparse bufferekkel, a ComfyUI DynamicVRAM-jához (comfy-aimdo).
+- [x] **4.9** Virtuális memóriakezelés (VMM) sparse bufferekkel, a ComfyUI DynamicVRAM-jához (comfy-aimdo).
   - Kész (`src/driver/api_vmm.cpp`, `tests/vmm.cpp`): reserve/free, create/release, map/unmap, set/get access,
     granularitás (2 MB), `cuMemRetainAllocationHandle`, `cuMemHostRegister/Unregister` (csak nyilvántartás,
     `DEVICEMAP` nem megy). RADV-n egy 12 GB-os foglalás 4 db ~4 GB-os sparse bufferből áll.
@@ -205,7 +229,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     címet nem szabad kérni, mert a libdrm címkezelője ettől elromlik, és utána minden kérés elbukik.
   - Unmapkor a felvett munkát meg kell várni (`finish`), mapkor nem. A host-oldali másolás sparse memóriába
     staging bufferen át megy (lassú modellbetöltés; UMA-n a VkDeviceMemory közvetlen mappelése gyorsítana).
-  - Hátra: a ComfyUI + aimdo kipróbálása.
+  - ComfyUI + aimdo kész (2026-10-22): a DynamicVRAM magától bekapcsol („comfy-aimdo inited for GPU: ... RADV RENOIR”,
+    integrált GPU-ként 2 GB RAM-tartalékkal). A Z-Image Turbo sablon 1024×1024-en, 8 lépéssel 111 s/lépés, összesen 19:50
+    (a 256×256-os, 2 lépéses próba 43 s). A modell két VBAR-ban (4,7 + 11,7 GB) rezidens.
   - API: `cuMemAddressReserve/Free`, `cuMemCreate/Release`, `cuMemMap/Unmap`, `cuMemSetAccess`,
     `cuMemGetAllocationGranularity`; mellette `cuMemHostRegister/Unregister`.
   - Megvalósítás: reserve = `SPARSE_BINDING | SPARSE_RESIDENCY` VkBuffer BDA-val; create = VkDeviceMemory;
@@ -238,7 +264,8 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 ### Fázis 5 – Széles kompatibilitás és teljesítmény
 - [ ] **5.1** cuDNN shim: konvolúció, batchnorm/layernorm, softmax, attention.
 - [ ] **5.2** Unified/managed memory, host-mapped memória (`VK_EXT_external_memory_host`), valódi pinned memória.
-- [ ] **5.3** CUDA Graphs (rögzített command bufferek), cooperative groups, multi-GPU, IPC.
+- [ ] **5.3** CUDA Graphs: most csak a kézzel épített gráf megy (`cudaGraphCreate`, `AddKernelNode`); hátra a stream capture
+  és a rögzített command bufferek. Továbbá cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
 - [ ] **5.4 Teljesítmény**
   - sub-allokátor (nagy VkDeviceMemory blokkok);
   - HOST_CACHED staging a DtoH-hoz;
@@ -250,6 +277,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 
 - **Statikusan linkelt libcudart** (az nvcc alapértelmezése) nem fut: az NVIDIA runtime a driver nem dokumentált belső tábláit igényli. Megoldás: `-cudart shared` újrafordítás, vagy később a táblák pótlása.
 - **Csak-SASS binárisok** (PTX nélkül) nem futtathatók – nincs reális SASS → SPIR-V út.
+- **GPU-timeout**: a kernel driver reseteli a GPU-t, ha egy submit túl sokáig fut (amdgpu: 2 s). A batchek mért
+  kernelidők alapján legfeljebb `VULKANIZER_BATCH_MS`-nyi munkát kapnak. Ha egyetlen workgroup is tovább fut a
+  limitnél, vagy a becslés nagyon alulmér (ugyanaz a pipeline sokkal nagyobb K-val), a reset továbbra is előfordulhat.
 - **Vulkan shader modell**: nincs rekurzió, nincs függvénypointer, structured CF kötelező, kernelből `malloc`/`printf` nincs (printf később emulálható bufferrel).
 - **Warp size ≠ 32** eszközökön a warp-szintű kód lassú vagy részlegesen támogatott.
 - **UVA**: több Vulkan device címtere ütközhet; jelenleg a pointer-keresés a current context device-án belül történik.

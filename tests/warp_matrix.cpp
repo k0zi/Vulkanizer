@@ -1,5 +1,5 @@
 // Warp-level matrix instructions (mma.sync, ldmatrix) as Triton emits them for tl.dot, against
-// the fragment layouts of the PTX ISA computed on the host.
+// the fragment layouts of the PTX ISA computed on the host; warp reductions (redux.sync).
 
 #include "test_util.h"
 
@@ -91,6 +91,39 @@ const char* kPtx = R"(
     add.u64 %rd3, %rd1, %rd2;
     st.global.v4.b32 [%rd3], {%d0, %d1, %d2, %d3};
     st.global.v2.b32 [%rd3+16], {%d4, %d5};
+    ret;
+}
+
+// out[lane * 8 + i]: the six reductions over all lanes, then add.s32 and min.u32 over the
+// lanes in 0x00F0F00F, which are the only ones executing them (the rest keep 0).
+.visible .entry redux(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %t, %v, %m, %d<8>;
+    .reg .b64 %rd<4>;
+    .reg .pred %p;
+    mov.u32 %t, %tid.x;
+    ld.param.u64 %rd0, [pin];
+    ld.param.u64 %rd1, [pout];
+    mul.wide.u32 %rd2, %t, 4;
+    add.u64 %rd2, %rd0, %rd2;
+    ld.global.b32 %v, [%rd2];
+    redux.sync.add.s32 %d0, %v, -1;
+    redux.sync.min.s32 %d1, %v, -1;
+    redux.sync.max.u32 %d2, %v, -1;
+    redux.sync.and.b32 %d3, %v, -1;
+    redux.sync.or.b32 %d4, %v, -1;
+    redux.sync.xor.b32 %d5, %v, -1;
+    mov.u32 %d6, 0;
+    mov.u32 %d7, 0;
+    shr.u32 %m, 0x00F0F00F, %t;
+    and.b32 %m, %m, 1;
+    setp.ne.u32 %p, %m, 0;
+    @%p redux.sync.add.s32 %d6, %v, 0x00F0F00F;
+    @%p redux.sync.min.u32 %d7, %v, 0x00F0F00F;
+    mul.wide.u32 %rd2, %t, 32;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.v4.b32 [%rd3], {%d0, %d1, %d2, %d3};
+    st.global.v4.b32 [%rd3+16], {%d4, %d5, %d6, %d7};
     ret;
 }
 )";
@@ -215,6 +248,46 @@ void testLdmatrix(CUmodule mod) {
     CHECK_CU(cuMemFree(dout));
 }
 
+void testRedux(CUmodule mod) {
+    std::vector<uint32_t> in(32);
+    uint32_t seed = 7;
+    for (uint32_t& v : in) {
+        seed = seed * 1664525u + 1013904223u;
+        v = seed ^ (seed >> 7);
+    }
+    in[5] = 0x80000001u;  // a negative minimum for min.s32
+    CUdeviceptr din = upload(in.data(), in.size() * 4), dout;
+    CHECK_CU(cuMemAlloc(&dout, 32 * 32));
+    CUfunction f;
+    CHECK_CU(cuModuleGetFunction(&f, mod, "redux"));
+    void* args[] = {&din, &dout};
+    CHECK_CU(cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr));
+    std::vector<uint32_t> out(32 * 8);
+    CHECK_CU(cuMemcpyDtoH(out.data(), dout, out.size() * 4));
+    const uint32_t part = 0x00F0F00Fu;
+    uint32_t want[8] = {0, 0x7FFFFFFFu, 0, ~0u, 0, 0, 0, ~0u};
+    for (int l = 0; l < 32; ++l) {
+        const uint32_t v = in[l];
+        want[0] += v;
+        if (int32_t(v) < int32_t(want[1])) want[1] = v;
+        want[2] = v > want[2] ? v : want[2];
+        want[3] &= v;
+        want[4] |= v;
+        want[5] ^= v;
+        if (part >> l & 1) {
+            want[6] += v;
+            want[7] = v < want[7] ? v : want[7];
+        }
+    }
+    for (int lane = 0; lane < 32; ++lane)
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t w = i < 6 || (part >> lane & 1) ? want[i] : 0;
+            CHECK_EQ("redux lane %d result %d", out[lane * 8 + i], w, lane, i);
+        }
+    CHECK_CU(cuMemFree(din));
+    CHECK_CU(cuMemFree(dout));
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +301,7 @@ int main() {
     testMma(mod, 16);
     testMma(mod, 8);
     testLdmatrix(mod);
+    testRedux(mod);
     CHECK_CU(cuModuleUnload(mod));
     CHECK_CU(cuCtxDestroy(ctx));
     if (g_failures) {

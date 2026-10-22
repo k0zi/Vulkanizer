@@ -148,20 +148,23 @@ $VK/.work/micromamba/bin/micromamba install -y -p $PWD/venv-vulkanizer --file <(
 venv-vulkanizer/bin/pip install -r <(grep -vE '^(torch|torchvision)$' requirements.txt) -r manager_requirements.txt
 
 # start it
-$VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-malloc --disable-dynamic-vram
+$VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-malloc
 ```
 
 Then open <http://127.0.0.1:8188>. Models go into `models/` as usual. Notes:
 
 - `--disable-cuda-malloc`: ComfyUI's `cudaMallocAsync` allocator backend is not used.
-- `--disable-dynamic-vram`: DynamicVRAM (comfy-aimdo) needs virtual memory management (VMM), which is still
-  being tested ([plan.md 4.9](plan.md)).
+- DynamicVRAM (comfy-aimdo) runs on Vulkanizer's virtual memory management (VMM, sparse buffers). If it causes
+  trouble, `--disable-dynamic-vram` switches back to estimate based model loading.
 - `tools/torch/sitecustomize.py` applies the PyTorch settings only when ComfyUI imports torch, and keeps
   the fused attention backends off even though ComfyUI re-enables them: attention runs on the math path.
 - The ComfyUI-Manager "PyTorch is not installed" message comes from the missing `torchaudio` (conda-forge has
   no build for torch 2.14); image generation does not need it.
 - The first generation is slow while the kernels are compiled to SPIR-V; later runs load them from the cache.
 - `$VK/run_torch.sh --log info --env venv-vulkanizer main.py ...` shows which Vulkan GPU is used.
+- `python3 tests/torch/zimage_forward.py` checks the GPU against the CPU: one Z-Image Turbo forward at 256×256 in
+  fp16 on the GPU and in fp32 and fp16 on the CPU. The GPU must be as far from fp32 as fp16 itself is (ComfyUI runs
+  the model in fp16 on the GPU, so full images differ from a CPU fp32 run in fine detail).
 
 ### Useful environment variables
 
@@ -190,7 +193,7 @@ Full list: [plan.md, section 4](plan.md).
   processing is slower with it, so it is off by default.
 - PyTorch: no cuDNN, NCCL or fused attention kernels; a device-side `assert` failure only stops the
   thread (no `cudaErrorAssert`).
-- ComfyUI: no DynamicVRAM yet (`--disable-dynamic-vram`), no CUDA 13 (cu130) optimized paths.
+- ComfyUI: no CUDA 13 (cu130) optimized paths.
 
 ## Scripts
 
