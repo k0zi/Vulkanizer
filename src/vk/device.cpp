@@ -285,6 +285,8 @@ VkResult Device::init() {
     // As with NVIDIA's driver: every launch waits for completion, so errors (and GPU hangs) show
     // at the launch that caused them.
     if (const char* env = std::getenv("CUDA_LAUNCH_BLOCKING"); env && std::strcmp(env, "1") == 0) launchBlocking_ = true;
+    if (const char* env = std::getenv("VULKANIZER_NO_SUBALLOC"); env && *env && std::strcmp(env, "0") != 0)
+        subAlloc_ = false;
 
     features_.fusedFma = probeFusedFma();
     features_.fusedFma64 = features_.shaderFloat64 && probeFusedFma64();
@@ -316,6 +318,7 @@ Device::~Device() {
     vkDeviceWaitIdle(device_);
     for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
     destroyBuffer(readStaging_);
+    for (auto& b : blocks_) destroyBuffer(b->buf);
     for (Batch& b : batches_) {
         if (b.fence) vkDestroyFence(device_, b.fence, nullptr);
         if (b.arena.buffer) {
@@ -414,6 +417,11 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
 }
 
 VkResult Device::allocateBuffer(VkDeviceSize size, Buffer& out) {
+    if (subAlloc_ && size <= kSubAllocLimit && subAllocate(size, out) == VK_SUCCESS) return VK_SUCCESS;
+    return allocateDedicated(size, out);
+}
+
+VkResult Device::allocateDedicated(VkDeviceSize size, Buffer& out) {
     // Prefer memory that is both device-local and host-mappable (UMA / ReBAR): copies become memcpy.
     auto attempt = [&] {
         return createBuffer(size, kDeviceBufferUsage,
@@ -451,6 +459,10 @@ void Device::destroyBuffer(Buffer& buf) {
 }
 
 void Device::freeBuffer(Buffer& buf) {
+    if (buf.subAllocated) {
+        releaseSubAllocation(buf);
+        return;
+    }
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (hasRecordedWork()) finish();  // recorded kernels may still use it
@@ -459,10 +471,79 @@ void Device::freeBuffer(Buffer& buf) {
 }
 
 void Device::freeBufferAfter(Buffer& buf, uint64_t serial) {
+    if (buf.subAllocated) {  // queue order protects it, see freeBuffer
+        releaseSubAllocation(buf);
+        return;
+    }
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     deferredFrees_.emplace_back(serial, buf);
     buf = Buffer{};
     reapDeferredFrees();
+}
+
+VkResult Device::subAllocate(VkDeviceSize size, Buffer& out) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const VkDeviceSize need = (std::max<VkDeviceSize>(size, 1) + kSubAllocAlign - 1) / kSubAllocAlign * kSubAllocAlign;
+    Block* block = nullptr;
+    VkDeviceSize at = 0;
+    for (auto& b : blocks_) {  // first fit
+        for (auto& [offset, n] : b->free)
+            if (n >= need) {
+                block = b.get();
+                at = offset;
+                break;
+            }
+        if (block) break;
+    }
+    if (!block) {
+        auto b = std::make_unique<Block>();
+        if (VkResult r = allocateDedicated(kBlockSize, b->buf)) return r;
+        b->free[0] = kBlockSize;
+        block = b.get();
+        blocks_.push_back(std::move(b));
+    }
+    auto it = block->free.find(at);
+    const VkDeviceSize rest = it->second - need;
+    block->free.erase(it);
+    if (rest) block->free[at + need] = rest;
+    block->used += need;
+    out = block->buf;
+    out.size = size;
+    out.offset = at;
+    out.address += at;
+    if (out.mapped) out.mapped = static_cast<char*>(out.mapped) + at;
+    out.subAllocated = true;
+    return VK_SUCCESS;
+}
+
+void Device::releaseSubAllocation(Buffer& buf) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto b = std::find_if(blocks_.begin(), blocks_.end(), [&](auto& blk) { return blk->buf.buffer == buf.buffer; });
+    if (b == blocks_.end()) return;
+    Block& block = **b;
+    VkDeviceSize at = buf.offset;
+    VkDeviceSize n = (std::max<VkDeviceSize>(buf.size, 1) + kSubAllocAlign - 1) / kSubAllocAlign * kSubAllocAlign;
+    block.used -= n;
+    auto next = block.free.lower_bound(at);
+    if (next != block.free.end() && next->first == at + n) {  // merge with the following range
+        n += next->second;
+        next = block.free.erase(next);
+    }
+    if (next != block.free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == at) {  // and the preceding one
+            at = prev->first;
+            n += prev->second;
+            block.free.erase(prev);
+        }
+    }
+    block.free[at] = n;
+    buf = Buffer{};
+    // Keep one empty block for the next allocations; release the others once unused.
+    if (block.used == 0 && std::count_if(blocks_.begin(), blocks_.end(), [](auto& blk) { return blk->used == 0; }) > 1) {
+        freeBufferAfter(block.buf, currentSerial());
+        blocks_.erase(b);
+    }
 }
 
 void Device::reapDeferredFrees() {
@@ -1075,7 +1156,7 @@ VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, 
         const Batch& b = batches_[open_];
         const VkDeviceSize from = staged - b.arena.address;
         return record([&](VkCommandBuffer cb) {
-            VkBufferCopy region{from, offset, size};
+            VkBufferCopy region{from, dst.offset + offset, size};
             vkCmdCopyBuffer(cb, b.arena.buffer, dst.buffer, 1, &region);
         });
     }
@@ -1090,7 +1171,7 @@ VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, 
     if (r != VK_SUCCESS) return r;
     std::memcpy(staging.mapped, src, size);
     r = submit([&](VkCommandBuffer cb) {
-        VkBufferCopy region{0, offset, size};
+        VkBufferCopy region{0, dst.offset + offset, size};
         vkCmdCopyBuffer(cb, staging.buffer, dst.buffer, 1, &region);
     });
     freeBuffer(staging);
@@ -1124,7 +1205,7 @@ VkResult Device::read(const Buffer& src, VkDeviceSize offset, void* dst, VkDevic
         if (n) {
             const VkDeviceSize half = (i % 2) * kReadChunk;
             if (VkResult r = record([&](VkCommandBuffer cb) {
-                    VkBufferCopy region{offset + at, half, n};
+                    VkBufferCopy region{src.offset + offset + at, half, n};
                     vkCmdCopyBuffer(cb, src.buffer, readStaging_.buffer, 1, &region);
                 }))
                 return r;
@@ -1146,14 +1227,14 @@ VkResult Device::copy(const Buffer& src, VkDeviceSize srcOffset, const Buffer& d
                       VkDeviceSize size) {
     if (size == 0) return VK_SUCCESS;
     return record([&](VkCommandBuffer cb) {  // device to device: no host synchronization
-        VkBufferCopy region{srcOffset, dstOffset, size};
+        VkBufferCopy region{src.offset + srcOffset, dst.offset + dstOffset, size};
         vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
     });
 }
 
 VkResult Device::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, uint32_t pattern) {
     if (size == 0) return VK_SUCCESS;
-    return record([&](VkCommandBuffer cb) { vkCmdFillBuffer(cb, dst.buffer, offset, size, pattern); });
+    return record([&](VkCommandBuffer cb) { vkCmdFillBuffer(cb, dst.buffer, dst.offset + offset, size, pattern); });
 }
 
 VkResult Device::createComputePipeline(const uint32_t* code, size_t wordCount, const char* entryPoint,

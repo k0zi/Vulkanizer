@@ -4,6 +4,7 @@
 #include "vk/instance.h"
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -19,8 +20,10 @@ struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkDeviceSize offset = 0;  // where this allocation starts in `buffer` (sub-allocations)
     VkDeviceAddress address = 0;
-    void* mapped = nullptr;  // set when the memory is host-visible and coherent
+    void* mapped = nullptr;  // set when the memory is host-visible and coherent (at `offset`)
+    bool subAllocated = false;  // part of a shared block (allocateBuffer): never destroyed on its own
     bool hostCached = false;  // host reads of `mapped` are cached (otherwise write-combined: very slow)
     bool hostAddressed = false;  // host memory at its own address (address == mapped)
     bool placedMapping = false;  // our memory, mapped at a chosen address (allocateHostMemory)
@@ -82,8 +85,13 @@ public:
     const Features& features() const { return features_; }
     VkDevice handle() const { return device_; }
 
+    // Small allocations (up to kSubAllocLimit) are carved out of shared blocks: creating and
+    // freeing Vulkan memory costs tens of microseconds, and the kernel zeroes every new page.
+    // Offsets passed to write/read/copy/fill are relative to the allocation.
     VkResult allocateBuffer(VkDeviceSize size, Buffer& out);
-    void freeBuffer(Buffer& buf);  // waits for recorded work first
+    // Waits for recorded work first. A sub-allocation is free again at once: all later device
+    // work is queued after the work recorded so far, and host access waits for that work.
+    void freeBuffer(Buffer& buf);
     // Frees the buffer once the work up to `serial` has executed, without waiting for it.
     void freeBufferAfter(Buffer& buf, uint64_t serial);
 
@@ -231,6 +239,20 @@ private:
     // GPU time per workgroup of each pipeline: the highest seen, so estimates err on the long side.
     std::unordered_map<VkPipeline, double> nsPerGroup_;
     std::vector<std::pair<uint64_t, Buffer>> deferredFrees_;  // (serial, buffer)
+    // Sub-allocation (VULKANIZER_NO_SUBALLOC=1 turns it off).
+    static constexpr VkDeviceSize kSubAllocLimit = 4 << 20;
+    static constexpr VkDeviceSize kBlockSize = 64 << 20;
+    static constexpr VkDeviceSize kSubAllocAlign = 256;  // as cudaMalloc guarantees
+    struct Block {
+        Buffer buf;
+        std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size, coalesced
+        VkDeviceSize used = 0;
+    };
+    std::vector<std::unique_ptr<Block>> blocks_;
+    bool subAlloc_ = true;
+    VkResult allocateDedicated(VkDeviceSize size, Buffer& out);
+    VkResult subAllocate(VkDeviceSize size, Buffer& out);
+    void releaseSubAllocation(Buffer& buf);
     Buffer readStaging_;  // host-cached, two kReadChunk halves (read)
     VkDeviceSize sparsePageSize_ = 0;
     VkDeviceSize maxSparseBufferSize_ = 0;

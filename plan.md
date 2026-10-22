@@ -347,8 +347,11 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     A pinned/managed memória és a device közti másolás GPU-n fut, az `*Async` változatok nem várnak.
     Mérés (`vulkanizer-bandwidth`, 256 MiB): DtoH pageable 0,17 → ~3,8 GB/s, DtoH pinned 0,25 → ~12 GB/s.
   - [x] profilozó mód (`VULKANIZER_PROFILE`).
-  - [ ] sub-allokátor (nagy VkDeviceMemory blokkok): `cuMemAlloc`+`cuMemFree` ~30–80 µs, 16 MiB ~0,8 ms (a kernel
-    nullázza a lapokat).
+  - [x] sub-allokátor (`Device::allocateBuffer`): a ≤ 4 MiB foglalások közös, 64 MiB-os blokkokból jönnek (first fit,
+    256 B igazítás, összevonás felszabadításkor; egy üres blokk megmarad, a többi a rajta futó munka után felszabadul).
+    A felszabadítás nem vár a GPU-ra: minden későbbi device-munka a már rögzített után fut, a host-hozzáférés pedig
+    megvárja azt. `cuMemAlloc`+`cuMemFree`: 4 KiB 42 → 0,9 µs, 1 MiB 31 → 3,4 µs. Kikapcsolás: `VULKANIZER_NO_SUBALLOC=1`.
+    A nagyobb foglalások külön Vulkan-memóriát kapnak (16 MiB ~0,8 ms, a kernel nullázza a lapokat).
   - [ ] async copy queue (külön transfer queue; integrált GPU-n kevés haszon).
 - [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
 
@@ -391,6 +394,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 | `VULKANIZER_FAST_FMA` | `1` = az f32 `fma` a driver natív (esetleg nem fused) `Fma`-ja, ott is, ahol a próba szerint nem fused (gyorsabb, kevésbé pontos) |
 | `VULKANIZER_FMA_F64` | `1` = a nem fused eszközön az f32 `fma` f64-ben számolódik (alapból f32 TwoProduct/TwoSum emuláció) |
 | `VULKANIZER_NO_VMM` | `1` = nincs sparse binding, így nincs CUDA VMM (`cuMemAddressReserve` stb. `NOT_SUPPORTED`) |
+| `VULKANIZER_NO_SUBALLOC` | `1` = minden `cuMemAlloc` külön Vulkan-memóriát kap (nincs sub-allokátor) |
 | `VULKANIZER_NO_PACK` | `1` = nincs block packing (minden CUDA block külön workgroup) |
 | `VULKANIZER_GEMM_F32` | `1` = a cuBLAS `COMPUTE_16F` GEMM-ek is f32 szorzással futnak (alapból packed f16, ha az eszköz tud f16 aritmetikát) |
 
