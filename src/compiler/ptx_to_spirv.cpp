@@ -753,7 +753,9 @@ private:
 
     std::vector<const ptx::Operand*> dataOperands(const ptx::Instruction& ins, const ptx::Operand& o, uint32_t count) {
         std::vector<const ptx::Operand*> out;
-        if (count == 1) {
+        if (count == 1 && o.kind == ptx::OperandKind::Vector && o.elems.size() == 1) {
+            out.push_back(&o.elems[0]);  // Triton writes scalar ld/st data as {%r1}
+        } else if (count == 1) {
             out.push_back(&o);
         } else {
             if (o.kind != ptx::OperandKind::Vector || o.elems.size() != count) fail(ins, "vector operand expected");

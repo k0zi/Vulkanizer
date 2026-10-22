@@ -3,8 +3,9 @@
 #  - The fused attention kernels (flash, memory-efficient, cuDNN) are built per GPU generation
 #    around tensor cores and refuse to run here: scaled_dot_product_attention uses its math path,
 #    even where the program turns the other backends back on.
-#  - torch._native routes some ops (e.g. bmm outer products) to Triton/CuTe DSL kernels, which are
-#    compiled to SASS: TORCH_DISABLE_NATIVE_JIT=1 keeps them on PyTorch's own (PTX) kernels.
+#  - torch._native routes some ops to Triton (bmm outer products) and CuTe DSL kernels. The Triton
+#    ones work, the CuTe DSL ones compile to SASS, and one switch covers both:
+#    TORCH_DISABLE_NATIVE_JIT=1 keeps them on PyTorch's own (PTX) kernels.
 #  - Triton (torch.compile) runs with tools/triton/ptxas, which hands the PTX through instead of
 #    assembling it, and builds its launcher against Vulkanizer's include/cuda.h.
 # The settings are applied when the program imports torch, not here: some programs (ComfyUI) set

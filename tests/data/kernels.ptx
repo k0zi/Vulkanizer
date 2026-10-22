@@ -425,7 +425,10 @@ $L__BB6_2:
 	mov.b64 	{%r8, %r9}, %rd10;
 	cvta.to.global.u64 	%rd14, %rd3;
 	add.s64 	%rd15, %rd14, %rd12;
-	st.global.v2.u32 	[%rd15], {%r9, %r8};
+	// scalar data as a one-element vector, as Triton writes it
+	ld.global.b32 	{%r9}, [%rd7+4];
+	st.global.b32 	[%rd15], {%r9};
+	st.global.b32 	[%rd15+4], {%r8};
 
 $L__BB7_2:
 	ret;

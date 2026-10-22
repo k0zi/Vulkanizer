@@ -241,13 +241,21 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     (`bufferDeviceAddressCaptureReplay`, `VkBufferOpaqueCaptureAddressCreateInfo`). A `findAllocation` és a
     copy/fill/write/read darabhatárokon vágjon.
   - **Kész, ha:** a ComfyUI `--disable-dynamic-vram` nélkül indul, és az aimdo-val generál.
-- [ ] **4.10** Triton backend: a `torch._native` műveletei, a `torch.compile`, a comfy-kitchen triton backendje.
+- [x] **4.10** Triton backend: a `torch._native` műveletei, a `torch.compile`, a comfy-kitchen triton backendje.
   - A Triton NVIDIA backendje a `cuda.h`-val lefordít egy C launchert (ehhez a saját `include/cuda.h` kell).
     A PTX-et `ptxas`-szal cubinná alakítaná, helyette a PTX-et kell betölteni (ptxas-wrapper vagy
     `TRITON_PTXAS_PATH`, ami PTX-et ad vissza; a `cuModuleLoadData` PTX-et is elfogad).
   - Kellhet még: `cuLaunchKernelEx`, `cuFuncSetAttribute`, `cuOccupancyMaxActiveClusters` stb.
   - **Kész, ha:** `TORCH_DISABLE_NATIVE_JIT` nélkül is helyes a `tests/torch/ops.py`, és lefut egy `torch.compile`-olt MLP.
-  - Kész (tesztelés hátra):
+  - Tesztelve (2026-10-22): `tests/torch/triton_add.py` (kézi `@triton.jit`), `tests/torch/compile.py`
+    (`torch.compile`-olt MLP előre és vissza, 5 Inductor Triton kernel, rel. hiba 2e-7), és
+    `TORCH_DISABLE_NATIVE_JIT=0`-val a `tests/torch/ops.py` (benne a `torch._native` Triton-os bmm outer productja).
+    Egy hiba jött elő: a Triton a skalár `ld`/`st` adatát egyelemű vektorként írja (`ld.global.b32 {%r1}, [..]`);
+    most elfogadjuk (`tests/data/kernels.ptx`, `vec4`).
+  - A `TORCH_DISABLE_NATIVE_JIT=1` alapértelmezés marad: ugyanez a kapcsoló tiltja a CuTe DSL kerneleket, amik SASS-ra
+    fordulnak (az `nvidia-cutlass-dsl` most nincs telepítve, így azok amúgy sem futnának).
+  - Hátra: a comfy-kitchen triton backendje (a ComfyUI-ban „available, disabled”), ezt a ComfyUI maga kapcsolja.
+  - Kész:
     - `tools/triton/ptxas`: a PTX-et adja tovább „cubin”-ként, a verziója (12.8) határozza meg a PTX ISA verziót.
     - A `sitecustomize` beállítja a `TRITON_PTXAS_PATH`-ot, és a Triton `driver.c`-je a saját `include/cuda.h`-val fordul;
       ehhez a header kapott launch config, tensor map, limit és pointer-attribútum típusokat.

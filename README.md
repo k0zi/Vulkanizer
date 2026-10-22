@@ -113,6 +113,8 @@ tools/setup_torch.sh                       # conda-forge PyTorch CUDA environmen
 ./run_torch.sh -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ./run_torch.sh tests/torch/mlp.py          # trains an MLP on GPU and CPU and compares them
 ./run_torch.sh tests/torch/ops.py          # conv, softmax, LayerNorm, attention, Transformer layer, ...
+./run_torch.sh tests/torch/triton_add.py   # a hand-written Triton kernel
+./run_torch.sh tests/torch/compile.py      # torch.compile (Inductor -> Triton) MLP forward and backward
 ```
 
 The official PyTorch wheels contain only native NVIDIA machine code (SASS), no PTX, so Vulkanizer cannot
@@ -120,8 +122,11 @@ run their kernels. The conda-forge CUDA builds also ship PTX (`compute_120`):
 `tools/setup_torch.sh` installs these with micromamba, without a system-wide install. `run_torch.sh` loads
 Vulkanizer's `libcuda`, `libcudart`, `libcublas` and `libcublasLt` instead of NVIDIA's,
 and disables everything that requires NVIDIA hardware or libraries: cuDNN, the fused attention kernels
-(so `scaled_dot_product_attention` runs on the math path) and the Triton/CuTe DSL kernels of `torch._native`
-(`TORCH_DISABLE_NATIVE_JIT=1`), which compile to SASS. `VULKANIZER_TORCH_DEFAULTS=0` skips this.
+(so `scaled_dot_product_attention` runs on the math path) and the DSL kernels of `torch._native`
+(`TORCH_DISABLE_NATIVE_JIT=1`): its Triton kernels work, but its CuTe DSL kernels compile to SASS and the one
+switch turns off both. `VULKANIZER_TORCH_DEFAULTS=0` skips this.
+Triton itself (`torch.compile`, `@triton.jit`) works: `tools/triton/ptxas` hands Triton's PTX through instead of
+assembling it, and Triton's launcher is built against Vulkanizer's `include/cuda.h` (needs a C compiler).
 
 ### 6. ComfyUI
 
