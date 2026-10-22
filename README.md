@@ -1,5 +1,7 @@
 ![Vulkanizer – Brings peace to the galaxy. A female Vulcan in front of a computer running an LLM, in 1960s style.](assets/vulkanizer-hero.png)
 
+**English** | [Deutsch](README.de.md) | [Français](README.fr.md) | [Español](README.es.md) | [Português](README.pt.md) | [Magyar](README.hu.md) | [中文](README.zh.md) | [日本語](README.ja.md)
+
 # Stardate 2026.10.21 # 
 The Artificial Intelligence Galaxy is on the brink of total architectural collapse.
 For cycles, the cosmos has been locked in a brutal optimization war. Emerging from the open-source sectors, the fierce Red Rocmulans clash relentlessly against the dominant, proprietary fleets of the Green Klincudas, each desperate to claim absolute runtime supremacy over the neural networks.
@@ -11,7 +13,7 @@ In this era of unprecedented chaos, the fate of the cosmos hangs in the balance.
 Drop-in `libcuda.so`, `libcudart.so` and `libcublas.so`: implements the CUDA Driver and Runtime API (and the cuBLAS
 GEMM family) on top of Vulkan compute, so CUDA programs run without an NVIDIA card, on any
 Vulkan 1.2 GPU (AMD, Intel, llvmpipe).
-Plan, architecture and phases: [plan.md](plan.md).
+Plan, architecture and phases: [plan.md](plan.md) (in Hungarian).
 
 ## Requirements
 
@@ -207,7 +209,7 @@ Full list: [plan.md, section 4](plan.md).
 - No SASS execution: only binaries containing PTX run.
 - CUDA Graphs: stream capture and replay work (llama.cpp's graphs, PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); no child graphs, memory nodes or conditional nodes.
-- Not (yet) supported: VMM, textures, cuDNN, NCCL, multi-GPU.
+- Not (yet) supported: textures, cuDNN, NCCL, multi-GPU.
 - llama.cpp flash attention runs correctly (`tools/build_llama.sh --fa`), but without tensor cores prompt
   processing is slower with it, so it is off by default.
 - PyTorch: no cuDNN, NCCL or fused attention kernels; a device-side `assert` failure only stops the
