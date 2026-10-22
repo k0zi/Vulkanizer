@@ -50,6 +50,19 @@ build/bin/vulkanizer-info                       # Vulkanizer から見える Vul
 `libcublasLt.so.12`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム向けのランタイムと cuBLAS の
 CUDA 13 版（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`）があり、同じ `libcuda.so.1` を使います。
 
+#### インストール（パッケージ）
+
+```sh
+tools/package.sh                               # build-pkg/vulkanizer_<バージョン>_<アーキ>.deb と .tar.gz
+sudo apt install ./build-pkg/vulkanizer_*.deb
+vulkanizer-run ./my_cuda_app args...           # CUDA 12 / 13 の任意のプログラム
+vulkanizer-run --torch python script.py        # pip や conda の PyTorch（CUDA 12 / 13 は自動判別）
+```
+
+ライブラリは `/usr/lib/<アーキ>/vulkanizer/` に入り、リンカの検索パスには含まれません。同じマシンの NVIDIA ドライバは
+それ以外のすべてで引き続き使われ、`vulkanizer-run` は起動するプログラムに対してだけ Vulkanizer を優先させます。
+`cmake --install build --prefix DIR` を使えば、パッケージなしで同じ構成を任意の場所にインストールできます。
+
 ### 2. CUDA プログラムの実行
 
 Vulkanizer は本物の NVIDIA ライブラリの代わりになります。動的リンカがそれを先に見つけさえすれば動きます：
@@ -229,6 +242,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `./run.sh <プログラム>` | Vulkanizer の `libcuda.so` でプログラムを実行。`--log trace`、`--device`、`--gdb`、`--validation` |
 | `./clean.sh` | `build/` ディレクトリを削除 |
 | `./ci.sh` | 完全チェック：Debug+ASAN と Release を全デバイスで実行（`build-ci/` にビルド） |
+| `tools/package.sh` | リリースパッケージ：`build-pkg/` に `.deb` と `.tar.gz` を作成（`--check` で `.deb` の動作も確認） |
 | `build/bin/vulkanizer-info` | Vulkanizer から見える Vulkan デバイスを一覧表示 |
 | `build/bin/vulkanizer-ptxc` | オフラインの PTX → SPIR-V：`vulkanizer-ptxc k.ptx --list`、`-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | コピー帯域幅（HtoD/DtoH/DtoD、ページング可能とピン留め）と割り当てコスト：`vulkanizer-bandwidth [MiB]` |

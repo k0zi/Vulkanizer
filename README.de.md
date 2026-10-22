@@ -50,6 +50,19 @@ Die gebauten Bibliotheken liegen in `build/lib/`: `libcuda.so.1`, `libcudart.so.
 `libcublasLt.so.12`. `build/lib/cuda13/` enthält die CUDA-13-Versionen von Runtime und cuBLAS (`libcudart.so.13`,
 `libcublas.so.13`, `libcublasLt.so.13`) für Programme, die mit CUDA 13 gebaut wurden; sie nutzen dieselbe `libcuda.so.1`.
 
+#### Installation (Paket)
+
+```sh
+tools/package.sh                               # build-pkg/vulkanizer_<Version>_<Arch>.deb und ein .tar.gz
+sudo apt install ./build-pkg/vulkanizer_*.deb
+vulkanizer-run ./my_cuda_app args...           # jedes CUDA-12- oder -13-Programm
+vulkanizer-run --torch python script.py        # PyTorch aus pip oder conda (CUDA 12 oder 13, wird erkannt)
+```
+
+Die Bibliotheken landen in `/usr/lib/<Arch>/vulkanizer/`, außerhalb des Suchpfads des Linkers: ein NVIDIA-Treiber auf
+demselben Rechner funktioniert für alles andere weiter, und `vulkanizer-run` stellt Vulkanizer nur für das gestartete
+Programm voran. `cmake --install build --prefix DIR` installiert dieselbe Struktur an beliebiger Stelle, ohne Paket.
+
 ### 2. Ein CUDA-Programm ausführen
 
 Vulkanizer tritt an die Stelle der echten NVIDIA-Bibliotheken; der dynamische Linker muss sie nur zuerst finden:
@@ -231,6 +244,7 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 | `./run.sh <programm>` | Führt ein Programm mit der `libcuda.so` von Vulkanizer aus. `--log trace`, `--device`, `--gdb`, `--validation` |
 | `./clean.sh` | Löscht das Verzeichnis `build/` |
 | `./ci.sh` | Vollständige Prüfung: Debug+ASAN und Release, auf jedem Gerät (baut nach `build-ci/`) |
+| `tools/package.sh` | Release-Pakete: ein `.deb` und ein `.tar.gz` in `build-pkg/` (`--check` probiert das `.deb` auch aus) |
 | `build/bin/vulkanizer-info` | Listet die Vulkan-Geräte, die Vulkanizer sieht |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | Kopierbandbreite (HtoD/DtoH/DtoD, auslagerbar und pinned) und Allokationskosten: `vulkanizer-bandwidth [MiB]` |

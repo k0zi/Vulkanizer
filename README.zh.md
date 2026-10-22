@@ -49,6 +49,19 @@ build/bin/vulkanizer-info                       # Vulkanizer 能看到哪些 Vul
 `build/lib/cuda13/` 中是运行时和 cuBLAS 的 CUDA 13 版本（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`），
 供用 CUDA 13 构建的程序使用；它们使用同一个 `libcuda.so.1`。
 
+#### 安装（软件包）
+
+```sh
+tools/package.sh                               # build-pkg/vulkanizer_<版本>_<架构>.deb 和一个 .tar.gz
+sudo apt install ./build-pkg/vulkanizer_*.deb
+vulkanizer-run ./my_cuda_app args...           # 任意 CUDA 12 或 13 程序
+vulkanizer-run --torch python script.py        # 来自 pip 或 conda 的 PyTorch（自动识别 CUDA 12 或 13）
+```
+
+这些库安装到 `/usr/lib/<架构>/vulkanizer/`，不在链接器的搜索路径中：同一台机器上的 NVIDIA 驱动对其他一切照常工作，
+`vulkanizer-run` 只为它启动的程序把 Vulkanizer 放在前面。`cmake --install build --prefix DIR` 可在任意位置安装相同的
+目录结构，无需软件包。
+
 ### 2. 运行 CUDA 程序
 
 Vulkanizer 取代真正的 NVIDIA 库；只需让动态链接器先找到它们：
@@ -221,6 +234,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `./run.sh <程序>` | 用 Vulkanizer 的 `libcuda.so` 运行程序。`--log trace`、`--device`、`--gdb`、`--validation` |
 | `./clean.sh` | 删除 `build/` 目录 |
 | `./ci.sh` | 完整检查：Debug+ASAN 和 Release，在每个设备上运行（构建到 `build-ci/`） |
+| `tools/package.sh` | 发布包：在 `build-pkg/` 中生成一个 `.deb` 和一个 `.tar.gz`（`--check` 还会试用 `.deb`） |
 | `build/bin/vulkanizer-info` | 列出 Vulkanizer 能看到的 Vulkan 设备 |
 | `build/bin/vulkanizer-ptxc` | 离线 PTX → SPIR-V：`vulkanizer-ptxc k.ptx --list`、`-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | 复制带宽（HtoD/DtoH/DtoD，可分页与锁页）和分配开销：`vulkanizer-bandwidth [MiB]` |

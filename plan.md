@@ -28,12 +28,12 @@ Az exportált szimbólumokat version script szabályozza (`src/driver/libcuda.ma
 | Nyelv | C++20, CMake, nincs külső függőség a Vulkan SDK-n kívül |
 | Header | Saját, clean-room `include/cuda.h` (csak a nyilvános dokumentáció alapján; az enum értékek ABI-kompatibilisek) |
 | Device pointer | `CUdeviceptr` = Vulkan buffer device address (`VK_KHR_buffer_device_address`), így a pointer-aritmetika a kernelben természetes |
-| Allokáció | Egyelőre 1 cuMemAlloc = 1 VkBuffer + dedikált VkDeviceMemory; címtartomány-térkép a pointer → buffer kereséshez |
+| Allokáció | A ≤ 4 MiB foglalások 64 MiB-os blokkokból (sub-allokátor), a nagyobbak saját VkBuffer + VkDeviceMemory; címtartomány-térkép a pointer → buffer kereséshez. Pinned/managed memória: host-memória, a device ugyanazon a címen éri el (5.2) |
 | Kernel ABI | A CUDA paraméter-buffer bájtra pontosan a push constant blokkba kerül (≤128/256 B); fölötte később UBO / BDA-s param buffer |
 | Block méret | Specialization constant (ID 0,1,2 = blockDim.x/y/z) → pipeline cache blockDim-enként |
 | Dinamikus shared mem | Specialization constant-tal méretezett workgroup tömb (ID 3, 32 bites szavakban) |
 | Block packing | Barrier és shared memory nélküli kernelnél (natív warpokkal) több kis CUDA block osztozik egy workgroupon: spec constant 4 = K, a workgroup `(K·blockDim.x, y, z)`, a grid `ceil(gridDim.x / K)`; a rács utáni blockok azonnal kilépnek |
-| Végrehajtás | Most minden szinkron (submit + fence wait). Később stream = saját command buffer sor + timeline semaphore |
+| Végrehajtás | Egy compute queue; a munka batch-ekben (command buffer ring) megy ki, a streamek ezen osztoznak (3.7), a host-hozzáférés kiüríti a sort |
 | Warp | A CUDA warp mindig 32. Subgroup 32 → direkt map; 64 → subgroup = 2 warp, maszkolt ballot/shuffle; <32 → emuláció shared memorián keresztül (részleges) |
 | Compute capability | Alapból 7.5-öt jelentünk (`VULKANIZER_CC=86` stb. felülírja) – minél alacsonyabb, annál kevesebb PTX feature kell |
 
@@ -46,6 +46,21 @@ Az exportált szimbólumokat version script szabályozza (`src/driver/libcuda.ma
 ## 2. Fázisok és lépések
 
 Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben a javasolt munkasorrend.
+
+### Állapot (2026-10-22)
+
+Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs)
+az 5.4 (teljesítmény) és az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
+Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
+
+Hátra, javasolt sorrendben:
+1. **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
+2. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
+3. **4.2** További könyvtárak (`libcurand`, `libcufft`, `libcusparse`, `libcusolver`) – ha egy célalkalmazás kéri.
+4. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
+5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
+6. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
+   queue (5.4); a kernel cache-nek nincs méretkorlátja (a régi build-ID-k bejegyzései megmaradnak, 3.10).
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -340,8 +355,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     int64-ként kezeli a pointert.
   - Hátra: rögzített Vulkan command bufferek (csak host-időt spórolna), child graph, memória-csomópontok
     (`cuMemAllocAsync` capture alatt), `cudaGraphAddNode` általános paraméterekkel, feltételes csomópontok.
-- [ ] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
-- [ ] **5.4 Teljesítmény**
+- [x] **5.4 Teljesítmény**
   - [x] DtoH: a write-combined device-memóriából a CPU ~0,2 GB/s-mal olvas. A `Device::read` a GPU-val másol egy
     host-cached staging bufferbe (2 × 8 MiB, a GPU és a CPU másolása átfedve), 4 KiB alatt közvetlenül olvas.
     A pinned/managed memória és a device közti másolás GPU-n fut, az `*Async` változatok nem várnak.
@@ -352,8 +366,23 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     A felszabadítás nem vár a GPU-ra: minden későbbi device-munka a már rögzített után fut, a host-hozzáférés pedig
     megvárja azt. `cuMemAlloc`+`cuMemFree`: 4 KiB 42 → 0,9 µs, 1 MiB 31 → 3,4 µs. Kikapcsolás: `VULKANIZER_NO_SUBALLOC=1`.
     A nagyobb foglalások külön Vulkan-memóriát kapnak (16 MiB ~0,8 ms, a kernel nullázza a lapokat).
-  - [ ] async copy queue (külön transfer queue; integrált GPU-n kevés haszon).
+  - Hátra (halasztva): külön transfer queue a másolásoknak. A másolások már most sem blokkolnak (a compute queue-n,
+    sorban futnak); a külön queue a kernelekkel való átfedést hozná, integrált GPU-n (közös memória-sávszélesség)
+    kevés haszonnal.
 - [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
+  - [x] Install és csomagok (`cmake/install.cmake`, `tools/package.sh [--check]`): CPack `.deb` (függőségek
+    `dpkg-shlibdeps`-ből: libvulkan1, libstdc++; ajánlott: mesa-vulkan-drivers) és `.tar.gz`. A könyvtárak a
+    `<prefix>/lib/<arch>/vulkanizer/` (+ `cuda13/`) alá kerülnek, a linker keresési útvonalán kívül (nincs ldconfig),
+    hogy egy ugyanott lévő NVIDIA drivert ne takarjanak el; `$ORIGIN` RUNPATH-szal megtalálják egymást. A fejlécek saját
+    gyökérben (`<prefix>/include/vulkanizer/`, a CUDA toolkit `cuda.h`-jával ne ütközzenek), a PyTorch/Triton
+    segédfájlok a `<prefix>/share/vulkanizer/` alatt.
+  - [x] `vulkanizer-run` indító (a `run.sh`/`run_torch.sh` telepített párja): `LD_LIBRARY_PATH` a CUDA 12 és 13
+    könyvtárakra; `--torch` a Python környezet NVIDIA-könyvtárai elé tölti a Vulkanizert (a CUDA 12/13-at a környezet
+    `libcudart.so.13`-ja alapján ismeri fel) és beállítja a PyTorch/Triton változókat. Kipróbálva a kicsomagolt
+    `.deb`-ből: nvcc-programok (CUDA 12 és 13), llama.cpp, PyTorch CUDA 12 és 13, Triton.
+  - [x] Dokumentáció: README „Telepítés (csomag)” szakasz mind a 8 nyelven.
+  - [ ] Jogi átnézés publikálás előtt (nem fejlesztési feladat).
+- [ ] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
 
 ## 3. Ismert korlátok / kockázatok
 

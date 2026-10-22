@@ -50,6 +50,19 @@ As bibliotecas compiladas ficam em `build/lib/`: `libcuda.so.1`, `libcudart.so.1
 `libcublasLt.so.12`. `build/lib/cuda13/` contém as versões CUDA 13 do runtime e do cuBLAS (`libcudart.so.13`,
 `libcublas.so.13`, `libcublasLt.so.13`), para programas compilados com CUDA 13; elas usam a mesma `libcuda.so.1`.
 
+#### Instalação (pacote)
+
+```sh
+tools/package.sh                               # build-pkg/vulkanizer_<versão>_<arq>.deb e um .tar.gz
+sudo apt install ./build-pkg/vulkanizer_*.deb
+vulkanizer-run ./my_cuda_app args...           # qualquer programa CUDA 12 ou 13
+vulkanizer-run --torch python script.py        # PyTorch do pip ou conda (CUDA 12 ou 13, detectado)
+```
+
+As bibliotecas vão para `/usr/lib/<arq>/vulkanizer/`, fora do caminho de busca do linker: um driver NVIDIA na mesma
+máquina continua funcionando para todo o resto, e o `vulkanizer-run` coloca o Vulkanizer à frente só para o programa
+que inicia. `cmake --install build --prefix DIR` instala a mesma estrutura em qualquer lugar, sem pacote.
+
 ### 2. Executar um programa CUDA
 
 O Vulkanizer ocupa o lugar das bibliotecas reais da NVIDIA; basta que o linker dinâmico as encontre primeiro:
@@ -229,6 +242,7 @@ Lista completa: [plan.md, seção 4](plan.md).
 | `./run.sh <programa>` | Executa um programa com a `libcuda.so` do Vulkanizer. `--log trace`, `--device`, `--gdb`, `--validation` |
 | `./clean.sh` | Apaga o diretório `build/` |
 | `./ci.sh` | Verificação completa: Debug+ASAN e Release, em todos os dispositivos (compila em `build-ci/`) |
+| `tools/package.sh` | Pacotes de versão: um `.deb` e um `.tar.gz` em `build-pkg/` (`--check` também testa o `.deb`) |
 | `build/bin/vulkanizer-info` | Lista os dispositivos Vulkan que o Vulkanizer enxerga |
 | `build/bin/vulkanizer-ptxc` | PTX → SPIR-V offline: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | Largura de banda de cópia (HtoD/DtoH/DtoD, paginável e fixada) e custo de alocação: `vulkanizer-bandwidth [MiB]` |

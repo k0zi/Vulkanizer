@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Runs a CUDA program on the Vulkan GPU through Vulkanizer's libcuda, libcudart and libcublas
+# (the installed counterpart of the source tree's run.sh and run_torch.sh).
+#
+#   vulkanizer-run ./my_cuda_app args...      a CUDA program (CUDA 12 or 13 runtime)
+#   vulkanizer-run --torch python script.py   PyTorch (a pip or conda build bringing NVIDIA's libraries)
+#
+# Options (before the program):
+#   --torch          preload Vulkanizer's libraries over the NVIDIA ones a Python environment brings,
+#                    and set PyTorch/Triton up for Vulkanizer (cuDNN and fused attention off, Triton's
+#                    PTX goes through unassembled); VULKANIZER_TORCH_DEFAULTS=0 keeps PyTorch's defaults
+#   --cuda12|--cuda13  the CUDA major version to preload with --torch (default: detected)
+#   --device NAME    Vulkan device by name substring (VULKANIZER_DEVICE)
+#   --log LEVEL      off|error|warn|info|debug|trace (VULKANIZER_LOG)
+#   --profile        per-kernel GPU and per-call host times at exit (VULKANIZER_PROFILE=1)
+#
+# The libraries live in their own directory, outside the linker's search path, so an NVIDIA driver
+# on the same system stays in use for everything else.
+set -euo pipefail
+
+PREFIX="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+LIB="$PREFIX/@VULKANIZER_INSTALL_LIBDIR@"
+SHARE="$PREFIX/@VULKANIZER_INSTALL_DATADIR@"
+INCLUDE="$PREFIX/@VULKANIZER_INSTALL_INCLUDEDIR@"
+
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+
+TORCH=0
+MAJOR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --torch) TORCH=1 ;;
+    --cuda12) MAJOR=12 ;;
+    --cuda13) MAJOR=13 ;;
+    --device) export VULKANIZER_DEVICE="$2"; shift ;;
+    --log) export VULKANIZER_LOG="$2"; shift ;;
+    --profile) export VULKANIZER_PROFILE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "unknown option: $1" >&2; usage; exit 1 ;;
+    *) break ;;
+  esac
+  shift
+done
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+# libcudart.so.12 and .so.13 (and libcublas) have different sonames: both directories can be searched.
+export LD_LIBRARY_PATH="$LIB:$LIB/cuda13${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+if [[ $TORCH -eq 1 ]]; then
+  if [[ -z "$MAJOR" ]]; then
+    # A CUDA 13 build brings libcudart.so.13: in the environment's lib (conda) or in nvidia/ (pip).
+    MAJOR=12
+    py_prefix="$("$1" -c 'import sys; print(sys.prefix)' 2>/dev/null || true)"
+    if [[ -n "$py_prefix" ]]; then
+      if compgen -G "$py_prefix/lib/libcudart.so.13" >/dev/null ||
+         compgen -G "$py_prefix/lib/python3*/site-packages/nvidia/*/lib/libcudart.so.13" >/dev/null; then
+        MAJOR=13
+      fi
+    fi
+  fi
+  CUDA_LIB="$LIB"
+  if [[ $MAJOR == 13 ]]; then CUDA_LIB="$LIB/cuda13"; fi
+  export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$MAJOR:$CUDA_LIB/libcublas.so.$MAJOR:$CUDA_LIB/libcublasLt.so.$MAJOR${LD_PRELOAD:+:$LD_PRELOAD}"
+  export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda
+  if [[ "${VULKANIZER_TORCH_DEFAULTS:-1}" != 0 ]]; then
+    export PYTHONPATH="$SHARE/torch${PYTHONPATH:+:$PYTHONPATH}"  # sitecustomize.py: cuDNN, fused attention
+    # torch._native's CuTe DSL kernels compile to SASS; the same switch also turns off its (working) Triton ones
+    export TORCH_DISABLE_NATIVE_JIT="${TORCH_DISABLE_NATIVE_JIT:-1}"
+    # Triton: PTX is handed through instead of assembled, the launcher is built against our cuda.h
+    export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$SHARE/triton/ptxas}"
+    export TRITON_PTXAS_BLACKWELL_PATH="${TRITON_PTXAS_BLACKWELL_PATH:-$SHARE/triton/ptxas}"
+    export C_INCLUDE_PATH="$INCLUDE${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+  fi
+fi
+exec "$@"

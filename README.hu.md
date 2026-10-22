@@ -51,6 +51,19 @@ A lefordított könyvtárak a `build/lib/`-ben vannak: `libcuda.so.1`, `libcudar
 (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) a CUDA 13-mal fordított programokhoz; ezek ugyanazt a
 `libcuda.so.1`-et használják.
 
+#### Telepítés (csomag)
+
+```sh
+tools/package.sh                               # build-pkg/vulkanizer_<verzió>_<arch>.deb és egy .tar.gz
+sudo apt install ./build-pkg/vulkanizer_*.deb
+vulkanizer-run ./my_cuda_app args...           # bármely CUDA 12-es vagy 13-as program
+vulkanizer-run --torch python script.py        # PyTorch pipből vagy condából (CUDA 12 vagy 13, felismeri)
+```
+
+A könyvtárak a `/usr/lib/<arch>/vulkanizer/` alá kerülnek, a linker keresési útvonalán kívül: egy ugyanazon a gépen
+lévő NVIDIA driver minden másnak megmarad, a `vulkanizer-run` csak az általa indított programnak teszi előre a
+Vulkanizert. A `cmake --install build --prefix DIR` ugyanezt a szerkezetet bárhová, csomag nélkül telepíti.
+
 ### 2. CUDA-program futtatása
 
 A Vulkanizer a valódi NVIDIA-könyvtárak helyére lép; a dinamikus linkernek csak előbb kell megtalálnia őket:
@@ -230,6 +243,7 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 | `./run.sh <program>` | Programot futtat a Vulkanizer `libcuda.so`-jával. `--log trace`, `--device`, `--gdb`, `--validation` |
 | `./clean.sh` | Törli a `build/` könyvtárat |
 | `./ci.sh` | Teljes ellenőrzés: Debug+ASAN és Release, minden eszközön (a `build-ci/`-be fordít) |
+| `tools/package.sh` | Kiadási csomagok: egy `.deb` és egy `.tar.gz` a `build-pkg/`-ben (`--check`: a `.deb`-et ki is próbálja) |
 | `build/bin/vulkanizer-info` | Kilistázza a Vulkanizer által látott Vulkan eszközöket |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | Másolási sávszélesség (HtoD/DtoH/DtoD, lapozható és pinned) és foglalási költség: `vulkanizer-bandwidth [MiB]` |

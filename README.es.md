@@ -51,6 +51,19 @@ Las bibliotecas compiladas están en `build/lib/`: `libcuda.so.1`, `libcudart.so
 `libcublasLt.so.12`. `build/lib/cuda13/` contiene las versiones CUDA 13 del runtime y de cuBLAS (`libcudart.so.13`,
 `libcublas.so.13`, `libcublasLt.so.13`), para programas compilados con CUDA 13; usan la misma `libcuda.so.1`.
 
+#### Instalación (paquete)
+
+```sh
+tools/package.sh                               # build-pkg/vulkanizer_<versión>_<arq>.deb y un .tar.gz
+sudo apt install ./build-pkg/vulkanizer_*.deb
+vulkanizer-run ./my_cuda_app args...           # cualquier programa CUDA 12 o 13
+vulkanizer-run --torch python script.py        # PyTorch de pip o conda (CUDA 12 o 13, se detecta)
+```
+
+Las bibliotecas van a `/usr/lib/<arq>/vulkanizer/`, fuera de la ruta de búsqueda del enlazador: un controlador NVIDIA
+en la misma máquina sigue funcionando para todo lo demás, y `vulkanizer-run` antepone Vulkanizer solo para el programa
+que inicia. `cmake --install build --prefix DIR` instala la misma estructura en cualquier sitio, sin paquete.
+
 ### 2. Ejecutar un programa CUDA
 
 Vulkanizer ocupa el lugar de las bibliotecas reales de NVIDIA; basta con que el enlazador dinámico las encuentre primero:
@@ -231,6 +244,7 @@ Lista completa: [plan.md, sección 4](plan.md).
 | `./run.sh <programa>` | Ejecuta un programa con la `libcuda.so` de Vulkanizer. `--log trace`, `--device`, `--gdb`, `--validation` |
 | `./clean.sh` | Borra el directorio `build/` |
 | `./ci.sh` | Comprobación completa: Debug+ASAN y Release, en cada dispositivo (compila en `build-ci/`) |
+| `tools/package.sh` | Paquetes de versión: un `.deb` y un `.tar.gz` en `build-pkg/` (`--check` también prueba el `.deb`) |
 | `build/bin/vulkanizer-info` | Lista los dispositivos Vulkan que ve Vulkanizer |
 | `build/bin/vulkanizer-ptxc` | PTX → SPIR-V sin conexión: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | Ancho de banda de copia (HtoD/DtoH/DtoD, paginable y fijada) y coste de asignación: `vulkanizer-bandwidth [MiB]` |
