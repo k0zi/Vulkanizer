@@ -525,7 +525,7 @@ private:
     uint32_t paramAt(const ptx::Instruction& ins, uint32_t off, const PtxType& t) {
         const uint32_t width = t.base == Base::Pred ? 8 : t.width;
         if (paramsInBuffer_) {
-            const uint32_t base = pushU64(0);
+            const uint32_t base = canonical(pushU64(0));
             Access a;
             a.type = t;
             if (width < 32 && !(width == 8 ? t_.storage8 : t_.storage16)) {
@@ -603,6 +603,7 @@ private:
         if (a.baseIsRegister) v = loadReg(ins, a.name, {Base::Unsigned, word ? 32u : 64u});
         else if (a.name.empty()) v = word ? cU32(0) : cU64(0);
         else v = symbolAddress(ins, a.name, sp);
+        if (sp == Space::Global) v = canonical(v);  // generic ones once the space is known (withSpace)
         if (a.offset) v = b_.op(spv::OpIAdd, word ? tU32() : tU64(), {v, word ? cU32(uint64_t(a.offset)) : cU64(uint64_t(a.offset))});
         return v;
     }
@@ -625,12 +626,13 @@ private:
     // run time on their tag (only between the spaces this kernel actually has).
     void withSpace(Space sp, uint32_t addr, const std::function<void(Space, uint32_t)>& body) {
         if (sp != Space::Generic) return body(sp, addr);
-        if (!hasShared_ && !localBytes_) return body(Space::Global, addr);
+        auto global = [&] { body(Space::Global, canonical(addr)); };
+        if (!hasShared_ && !localBytes_) return global();
         const uint32_t tagValue = truncTo32(b_.op(spv::OpShiftRightLogical, tU64(), {addr, cU32(56)}));
         auto local = [&] {
-            if (!localBytes_) return body(Space::Global, addr);
+            if (!localBytes_) return global();
             selection(b_.op(spv::OpIEqual, tBool(), {tagValue, cU32(kLocalTag)}),
-                      [&] { body(Space::Local, truncTo32(addr)); }, [&] { body(Space::Global, addr); });
+                      [&] { body(Space::Local, truncTo32(addr)); }, global);
         };
         if (!hasShared_) return local();
         selection(b_.op(spv::OpIEqual, tBool(), {tagValue, cU32(kSharedTag)}),
@@ -706,8 +708,22 @@ private:
         return count > 1 ? b_.typeVector(elem, count) : elem;
     }
 
+    // `addr` must be canonical (see canonical()).
     uint32_t globalPointer(uint32_t addr, uint32_t type) {
         return b_.op(spv::OpConvertUToPtr, b_.typePointer(spv::StorageClassPhysicalStorageBuffer, type), {addr});
+    }
+
+    // Device addresses come without their sign extension (vk/device.h); the hardware wants bits
+    // 63..48 as copies of bit 47. Done on the high word alone (one 32-bit bit-field extract), and
+    // to the base before a constant offset is added, so the GPU compiler can still fold offsets
+    // into its load and store instructions.
+    uint32_t canonical(uint32_t addr) {
+        const uint32_t v2 = b_.typeVector(tU32(), 2);
+        const uint32_t words = b_.op(spv::OpBitcast, v2, {addr});
+        const uint32_t lo = b_.op(spv::OpCompositeExtract, tU32(), {words, 0});
+        const uint32_t hi = b_.op(spv::OpCompositeExtract, tU32(), {words, 1});
+        const uint32_t hiExt = b_.op(spv::OpBitFieldSExtract, tU32(), {hi, cU32(0), cU32(16)});
+        return b_.op(spv::OpBitcast, tU64(), {b_.op(spv::OpCompositeConstruct, v2, {lo, hiExt})});
     }
 
     // Memory bits (int of t.width) -> computation value.
@@ -2201,7 +2217,7 @@ private:
         auto loadParamVar = [&](const ptx::Operand& o) { return loadWords(Space::Local, address(ins, o, Space::Local), u64t); };
         const uint32_t format = loadParamVar(ins.operands[0]);
         const uint32_t args = loadParamVar(ins.operands[1]);
-        const uint32_t buf = pushU64(printfOffset_);
+        const uint32_t buf = canonical(pushU64(printfOffset_));
         const uint32_t recordBytes = 8 + KernelBinary::kPrintfArgBytes;
         const uint32_t used = b_.op(spv::OpAtomicIAdd, tU32(), {globalPointer(buf, tU32()), cU32(spv::ScopeDevice), cU32(0), cU32(recordBytes)});
         const uint32_t capacity = b_.op(spv::OpLoad, tU32(), {globalPointer(b_.op(spv::OpIAdd, tU64(), {buf, cU64(4)}), tU32()),

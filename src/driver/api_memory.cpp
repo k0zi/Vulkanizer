@@ -232,24 +232,40 @@ CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
     return CUDA_SUCCESS;
 }
 
+// A captured copy becomes a memcpy node, which repeats cuMemcpy on replay.
+static CUresult captureCopy(CUstream hStream, CUdeviceptr dst, CUdeviceptr src, size_t bytes) {
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_MEMCPY;
+    node->dst = dst;
+    node->src = src;
+    node->bytes = bytes;
+    return captureNode(hStream, std::move(node));
+}
+
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream)) return captureCopy(cs, dst, src, ByteCount);
     return cuMemcpy(dst, src, ByteCount);
 }
 
 CUresult CUDAAPI cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream))
+        return captureCopy(cs, dstDevice, reinterpret_cast<CUdeviceptr>(srcHost), ByteCount);
     return cuMemcpyHtoD_v2(dstDevice, srcHost, ByteCount);
 }
 
 CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream))
+        return captureCopy(cs, reinterpret_cast<CUdeviceptr>(dstHost), srcDevice, ByteCount);
     return cuMemcpyDtoH_v2(dstHost, srcDevice, ByteCount);
 }
 
 CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount,
                                       CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream)) return captureCopy(cs, dstDevice, srcDevice, ByteCount);
     return cuMemcpyDtoD_v2(dstDevice, srcDevice, ByteCount);
 }
 
@@ -268,18 +284,29 @@ CUresult CUDAAPI cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui, size_t N
     return memset32(dstDevice, ui, N * 4, 4);
 }
 
+// A captured memset becomes a memset node (one row of N elements).
+static CUresult captureMemset(CUstream hStream, CUdeviceptr dst, unsigned value, unsigned elementSize, size_t n) {
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_MEMSET;
+    node->memset = {dst, n * elementSize, value, elementSize, n, 1};
+    return captureNode(hStream, std::move(node));
+}
+
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream)) return captureMemset(cs, dstDevice, uc, 1, N);
     return cuMemsetD8_v2(dstDevice, uc, N);
 }
 
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us, size_t N, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream)) return captureMemset(cs, dstDevice, us, 2, N);
     return cuMemsetD16_v2(dstDevice, us, N);
 }
 
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream)) return captureMemset(cs, dstDevice, ui, 4, N);
     return cuMemsetD32_v2(dstDevice, ui, N);
 }
 

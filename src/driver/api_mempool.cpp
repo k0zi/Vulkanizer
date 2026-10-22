@@ -13,11 +13,14 @@
 using namespace vulkanizer;
 using namespace vulkanizer::driver;
 
+// Graph memory nodes are not supported: allocating or freeing on a capturing stream invalidates
+// the capture.
 static CUresult allocFromPool(CUdeviceptr* dptr, size_t bytesize, CUmemPoolHandle_st* pool, CUstream hStream) {
     if (!dptr || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
+    if (CUresult r = refuseIfCapturing(hStream)) return r;
     if (!pool) pool = s.slot->currentPool;
     if (pool->device != s.slot->ordinal) return CUDA_ERROR_INVALID_VALUE;
     if (pool->props.maxSize && pool->usedBytes + bytesize > pool->props.maxSize) return CUDA_ERROR_OUT_OF_MEMORY;
@@ -39,6 +42,7 @@ static CUresult freeAsync(CUdeviceptr dptr, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
+    if (CUresult r = refuseIfCapturing(hStream)) return r;
     if (dptr == 0) return CUDA_SUCCESS;
     auto it = s.slot->allocations.find(dptr);
     if (it == s.slot->allocations.end()) return CUDA_ERROR_INVALID_VALUE;

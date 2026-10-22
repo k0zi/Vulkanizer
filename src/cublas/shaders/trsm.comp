@@ -13,6 +13,14 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ptr { uint64_t v; };
 
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
+
 layout(push_constant, std430) uniform Params {
     uint64_t a, b;   // device arrays of matrix pointers
     int m, n;        // B is m x n
@@ -30,7 +38,7 @@ void main() {
     const int rhs = int(gl_GlobalInvocationID.x);
     if (rhs >= (left ? p.n : p.m)) return;
     const int batch = int(gl_WorkGroupID.z) + p.batchOffset;
-    const uint64_t A = Ptr(p.a + uint64_t(batch) * 8ul).v, B = Ptr(p.b + uint64_t(batch) * 8ul).v;
+    const uint64_t A = Ptr(canon(p.a + uint64_t(batch) * 8ul)).v, B = Ptr(canon(p.b + uint64_t(batch) * 8ul)).v;
 
     // op(A) is lower triangular when exactly one of "stored lower" and "transposed" holds; for
     // side right the system matrix is op(A) transposed.
@@ -40,16 +48,16 @@ void main() {
     for (int step = 0; step < size; ++step) {
         const int i = lowerSystem ? step : size - 1 - step;
         const int64_t bi = left ? int64_t(i) + int64_t(rhs) * p.ldb : int64_t(rhs) + int64_t(i) * p.ldb;
-        float x = p.alpha * F32(B + uint64_t(bi) * 4ul).v;
+        float x = p.alpha * F32(canon(B + uint64_t(bi) * 4ul)).v;
         for (int s = 0; s < step; ++s) {
             const int k = lowerSystem ? s : size - 1 - s;
             // system matrix S[i][k]: op(A)[i][k] for side left, op(A)[k][i] for side right
             const int r = left ? i : k, c = left ? k : i;  // element of op(A)
             const int64_t ai = trans ? int64_t(c) + int64_t(r) * p.lda : int64_t(r) + int64_t(c) * p.lda;
             const int64_t bk = left ? int64_t(k) + int64_t(rhs) * p.ldb : int64_t(rhs) + int64_t(k) * p.ldb;
-            x -= F32(A + uint64_t(ai) * 4ul).v * F32(B + uint64_t(bk) * 4ul).v;
+            x -= F32(canon(A + uint64_t(ai) * 4ul)).v * F32(canon(B + uint64_t(bk) * 4ul)).v;
         }
-        if (!unit) x /= F32(A + uint64_t(int64_t(i) + int64_t(i) * p.lda) * 4ul).v;
-        F32(B + uint64_t(bi) * 4ul).v = x;
+        if (!unit) x /= F32(canon(A + uint64_t(int64_t(i) + int64_t(i) * p.lda) * 4ul)).v;
+        F32(canon(B + uint64_t(bi) * 4ul)).v = x;
     }
 }

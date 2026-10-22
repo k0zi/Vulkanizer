@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -58,6 +59,13 @@ struct CUstream_st {
     uint32_t magic = kMagic;
     CUcontext ctx = nullptr;
     unsigned int flags = 0;
+    // Stream capture (api_graph.cpp): work goes into `capture` instead of running. A stream joins
+    // another one's capture by waiting on an event recorded there.
+    CUgraph capture = nullptr;
+    CUstreamCaptureStatus captureStatus = CU_STREAM_CAPTURE_STATUS_NONE;
+    CUstreamCaptureMode captureMode = CU_STREAM_CAPTURE_MODE_GLOBAL;
+    bool captureOrigin = false;               // the stream that began the capture
+    std::vector<CUgraphNode> captureDeps;     // what the next captured node depends on
 };
 
 struct CUevent_st {
@@ -68,6 +76,48 @@ struct CUevent_st {
     bool recorded = false;
     uint64_t serial = 0;      // device work the event completes with
     int32_t timestamp = -1;   // GPU timestamp slot, -1 without timing
+    CUgraph captureGraph = nullptr;           // recorded on a capturing stream (fork/join point)
+    std::vector<CUgraphNode> captureDeps;
+};
+
+// A node of a CUDA graph. Kernel nodes keep their parameters packed as cuLaunchKernel would.
+struct CUgraphNode_st {
+    static constexpr uint32_t kMagic = 0x444e4753;  // 'SGND'
+    uint32_t magic = kMagic;
+    CUgraph graph = nullptr;
+    CUgraphNodeType type = CU_GRAPH_NODE_TYPE_EMPTY;
+    std::vector<CUgraphNode> deps;
+    // kernel
+    CUfunction func = nullptr;
+    unsigned int grid[3] = {1, 1, 1}, block[3] = {1, 1, 1}, sharedMem = 0;
+    std::vector<uint8_t> params;
+    std::vector<void*> paramPointers;  // for cuGraphKernelNodeGetParams: into `params`
+    // memcpy (device or host addresses, as cuMemcpy takes them)
+    CUdeviceptr dst = 0, src = 0;
+    size_t bytes = 0;
+    // memset
+    CUDA_MEMSET_NODE_PARAMS memset{};
+    // host
+    CUhostFn fn = nullptr;
+    void* userData = nullptr;
+};
+
+struct CUgraph_st {
+    static constexpr uint32_t kMagic = 0x50524753;  // 'SGRP'
+    uint32_t magic = kMagic;
+    CUcontext ctx = nullptr;
+    std::vector<std::unique_ptr<CUgraphNode_st>> nodes;  // in an order that respects the dependencies
+    std::vector<CUstream> capturing;                       // streams capturing into this graph
+    uint64_t captureId = 0;                                // cuStreamGetCaptureInfo's id
+};
+
+// An instantiated graph: its own copy of the nodes, run in order on the launch stream.
+struct CUgraphExec_st {
+    static constexpr uint32_t kMagic = 0x58454753;  // 'SGEX'
+    uint32_t magic = kMagic;
+    CUcontext ctx = nullptr;
+    std::vector<CUgraphNode_st> nodes;
+    std::unordered_map<CUgraphNode, size_t> index;  // graph node -> position in `nodes`
 };
 
 // A memory pool (stream-ordered allocation). Allocations come straight from the device; the pool
@@ -226,6 +276,21 @@ bool findPieces(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, std::vector<All
 VmReservation* findReservation(DeviceSlot& slot, CUdeviceptr ptr);
 
 CUresult toCuResult(VkResult r);
+
+// Kernel launches (api_module.cpp): the parameter buffer as cuLaunchKernel builds it, and the
+// launch of packed parameters (cuLaunchKernel, graph replay). Caller holds the driver lock.
+CUresult packParams(const ptx::Entry& e, void** kernelParams, void** extra, std::vector<uint8_t>& out);
+CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const unsigned block[3],
+                      unsigned sharedMemBytes, const std::vector<uint8_t>& params);
+
+// Stream capture (api_graph.cpp): `hStream` if it is capturing, else nullptr; captureNode appends
+// a node after the stream's current dependencies (invalidated captures report the error).
+CUstream capturingStream(CUstream hStream);
+CUresult captureNode(CUstream hStream, std::unique_ptr<CUgraphNode_st> node);
+// Synchronizing a capturing stream is illegal: it ends the capture as invalidated.
+CUresult refuseIfCapturing(CUstream hStream);
+// cuStreamWaitEvent on an event recorded during a capture: `hStream` joins that capture.
+CUresult joinCapture(CUstream hStream, CUevent hEvent);
 
 // Compute capability reported to applications (default 7.5; VULKANIZER_CC=86 overrides).
 void computeCapability(int& major, int& minor);

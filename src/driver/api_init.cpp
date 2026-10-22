@@ -127,6 +127,15 @@ constexpr VersionedEntry kVersionedEntries[] = {
     {"cuGraphNodeGetDependentNodes", 12030, "cuGraphNodeGetDependentNodes_v2"},
     {"cuGraphAddDependencies", 12030, "cuGraphAddDependencies_v2"},
     {"cuGraphRemoveDependencies", 12030, "cuGraphRemoveDependencies_v2"},
+    {"cuGraphInstantiate", 12000, "cuGraphInstantiateWithFlags"},
+    {"cuGraphAddKernelNode", 12000, "cuGraphAddKernelNode_v2"},
+    {"cuGraphKernelNodeGetParams", 12000, "cuGraphKernelNodeGetParams_v2"},
+    {"cuGraphKernelNodeSetParams", 12000, "cuGraphKernelNodeSetParams_v2"},
+    {"cuGraphExecKernelNodeSetParams", 12000, "cuGraphExecKernelNodeSetParams_v2"},
+    {"cuGraphExecUpdate", 12000, "cuGraphExecUpdate_v2"},
+    {"cuStreamBeginCapture", 10010, "cuStreamBeginCapture_v2"},
+    {"cuStreamUpdateCaptureDependencies", 12030, "cuStreamUpdateCaptureDependencies_v2"},
+    {"cuLaunchHostFunc", 13010, "cuLaunchHostFunc_v2"},
 };
 
 // Resolves a driver entry point by name. Symbols in kVersionedEntries get the variant of the
@@ -140,20 +149,23 @@ static void* lookupEntryPoint(const char* symbol, int cudaVersion, cuuint64_t fl
         return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
     }();
     if (!self || std::strncmp(symbol, "cu", 2) != 0) return nullptr;
-    if (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) {
-        for (const char* suffix : {"_ptsz", "_ptds"})
-            if (void* p = dlsym(self, (std::string(symbol) + suffix).c_str())) return p;
-    }
+    std::string name = symbol;
     bool versioned = false;
     for (const VersionedEntry& e : kVersionedEntries) {
         if (std::strcmp(e.symbol, symbol) != 0) continue;
         versioned = true;
-        if (cudaVersion >= e.since) return dlsym(self, e.variant);
+        if (cudaVersion >= e.since) {
+            name = e.variant;
+            break;
+        }
     }
-    if (!versioned && cudaVersion >= 3020) {
-        if (void* p = dlsym(self, (std::string(symbol) + "_v2").c_str())) return p;
+    if (!versioned && cudaVersion >= 3020 && dlsym(self, (name + "_v2").c_str())) name += "_v2";
+    // the per-thread variant of the chosen ABI (cuStreamBeginCapture_v2_ptsz), where one exists
+    if (flags & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) {
+        for (const char* suffix : {"_ptsz", "_ptds"})
+            if (void* p = dlsym(self, (name + suffix).c_str())) return p;
     }
-    return dlsym(self, symbol);
+    return dlsym(self, name.c_str());
 }
 
 extern "C" {

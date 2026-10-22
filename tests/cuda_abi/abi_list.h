@@ -7,6 +7,10 @@
 #define VULKANIZER_CU_VALUES(X)                                                                   \
     X(CUDA_ERROR_ALREADY_MAPPED) X(CUDA_ERROR_NOT_MAPPED) X(CUDA_ERROR_UNSUPPORTED_LIMIT)         \
     X(CUDA_ERROR_UNSUPPORTED_EXEC_AFFINITY) X(CU_EXEC_AFFINITY_TYPE_SM_COUNT) X(CIG_DATA_TYPE_NV_BLOB) \
+    X(CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED) X(CUDA_ERROR_STREAM_CAPTURE_IMPLICIT) X(CUDA_ERROR_CAPTURED_EVENT) \
+    X(CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE) X(CU_GRAPH_NODE_TYPE_MEM_FREE) X(CU_GRAPH_NODE_TYPE_EVENT_RECORD) \
+    X(CU_STREAM_CAPTURE_MODE_RELAXED) X(CU_STREAM_CAPTURE_STATUS_INVALIDATED)                   \
+    X(CU_GRAPH_EXEC_UPDATE_ERROR_ATTRIBUTES_CHANGED)                                            \
     X(CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED) X(CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED)         \
     X(CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM)                                \
     X(CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)                                                \
@@ -45,6 +49,11 @@
     X(sizeof(CUlaunchConfig)) X(offsetof(CUlaunchConfig, hStream)) X(offsetof(CUlaunchConfig, attrs)) \
     X(offsetof(CUlaunchConfig, numAttrs)) X(sizeof(CUtensorMap)) X(alignof(CUtensorMap))             \
     X(sizeof(CUexecAffinityParam)) X(sizeof(CUctxCigParam)) X(sizeof(CUctxCreateParams))         \
-    X(offsetof(CUctxCreateParams, numExecAffinityParams)) X(offsetof(CUctxCreateParams, cigParams))
+    X(offsetof(CUctxCreateParams, numExecAffinityParams)) X(offsetof(CUctxCreateParams, cigParams)) \
+    X(sizeof(CUDA_KERNEL_NODE_PARAMS_v1)) X(sizeof(CUDA_KERNEL_NODE_PARAMS_v2))                 \
+    X(offsetof(CUDA_KERNEL_NODE_PARAMS_v2, kernelParams)) X(offsetof(CUDA_KERNEL_NODE_PARAMS_v2, ctx)) \
+    X(sizeof(CUDA_MEMSET_NODE_PARAMS)) X(offsetof(CUDA_MEMSET_NODE_PARAMS, value))             \
+    X(offsetof(CUDA_MEMSET_NODE_PARAMS, height)) X(sizeof(CUDA_HOST_NODE_PARAMS))              \
+    X(sizeof(CUgraphExecUpdateResultInfo)) X(sizeof(CUgraphEdgeData))
 
 

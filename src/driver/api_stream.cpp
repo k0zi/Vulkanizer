@@ -38,6 +38,7 @@ CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUresult r = refuseIfCapturing(hStream)) return r;
     return toCuResult(s.dev->finish());
 }
 
@@ -46,6 +47,7 @@ CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUresult r = refuseIfCapturing(hStream)) return r;
     const uint64_t serial = s.dev->currentSerial();
     if (VkResult vr = s.dev->flush()) return toCuResult(vr);
     return s.dev->isComplete(serial) ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY;
@@ -54,6 +56,8 @@ CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags) {
     VULKANIZER_TRACE_API();
     if (!validStream(hStream) || !validHandle(hEvent)) return CUDA_ERROR_INVALID_HANDLE;
+    // An event recorded during a capture forks or joins it: the waiting stream captures too.
+    if (hEvent->captureGraph) return joinCapture(hStream, hEvent);
     return CUDA_SUCCESS;  // one queue: everything recorded later already runs after the event
 }
 
@@ -76,6 +80,12 @@ static vk::Device* deviceOf(CUevent e) { return Driver::get().slot(e->ctx->devic
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
     VULKANIZER_TRACE_API();
     if (!validHandle(hEvent) || !validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (CUstream cs = capturingStream(hStream)) {  // marks a point of the capture, runs nothing
+        hEvent->captureGraph = cs->capture;
+        hEvent->captureDeps = cs->captureDeps;
+        return CUDA_SUCCESS;
+    }
+    hEvent->captureGraph = nullptr;
     vk::Device* dev = deviceOf(hEvent);
     if (hEvent->timestamp >= 0) {
         if (VkResult vr = dev->recordTimestamp(hEvent->timestamp, hEvent->serial)) return toCuResult(vr);

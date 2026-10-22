@@ -352,7 +352,7 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     if (wantAddress) {
         VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         bai.buffer = buffer;
-        out.address = vkGetBufferDeviceAddress(device_, &bai);
+        out.address = vkGetBufferDeviceAddress(device_, &bai) & kAddressMask;
     }
     return VK_SUCCESS;
 }
@@ -450,7 +450,7 @@ VkResult Device::createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, B
     out.size = size;
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = out.buffer;
-    out.address = vkGetBufferDeviceAddress(device_, &bai);
+    out.address = vkGetBufferDeviceAddress(device_, &bai) & kAddressMask;
     opaqueOut = features_.addressCaptureReplay ? vkGetBufferOpaqueCaptureAddress(device_, &bai) : 0;
     return VK_SUCCESS;
 }

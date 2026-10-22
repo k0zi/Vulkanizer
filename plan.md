@@ -304,9 +304,25 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 
 ### Fázis 5 – Széles kompatibilitás és teljesítmény
 - [ ] **5.1** cuDNN shim: konvolúció, batchnorm/layernorm, softmax, attention.
+  - Halasztva (2026-10-22): az NVIDIA cuDNN 9 nem fut (statikus cudart, `cuGetExportTable`). A PyTorch saját CUDA-kernelei
+    cuDNN nélkül működnek, egy shim ugyanezt adná (im2col + GEMM), viszont bekapcsolt cuDNN mellett a PyTorch az RNN-t,
+    a CTC-t, a `grid_sample`-t is oda küldené: ami a shimből hiányzik, az a mostani működő állapothoz képest elromlana.
+    Ha mégis: `TORCH_CUDNN_V8_API_DISABLED=1` mellett a konvolúcióhoz elég a v7 API.
 - [ ] **5.2** Unified/managed memory, host-mapped memória (`VK_EXT_external_memory_host`), valódi pinned memória.
-- [ ] **5.3** CUDA Graphs: most csak a kézzel épített gráf megy (`cudaGraphCreate`, `AddKernelNode`); hátra a stream capture
-  és a rögzített command bufferek. Továbbá cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
+- [x] **5.3** CUDA Graphs: stream capture és visszajátszás (`src/driver/api_graph.cpp`, `tests/graph.cpp`).
+  - A gráfok a driverben vannak, így a runtime és a Driver API indításai (Triton) egyaránt rögzülnek. Capture alatt
+    a kernelindítás, memcpy/memset, host függvény, event record/wait csomópont vagy függőségi él lesz; másik stream
+    eseményre várva csatlakozik (fork/join). Szinkronizálás capture alatt érvényteleníti azt. Egy indított gráf a
+    csomópontjait sorban futtatja a stream-en (egy queue: a felvételi sorrend topologikus sorrend), a kernelek előre
+    becsomagolt paraméterekkel. `cuGraphExecUpdate` azonos alakú gráfra; explicit kernel/memset/host/üres csomópont.
+  - llama.cpp `GGML_CUDA_GRAPHS=ON`-nal épül (`tools/build_llama.sh`), a kimenet azonos; teljesítményben nem számít,
+    mert a tg a GPU-n múlik (egy gráf ~470 kernele ~1 ms host-idő, egyenként ~4 ms). PyTorch: `torch_graph`
+    (`at::cuda::CUDAGraph`, CUDA 12 és 13), `torch.compile(mode="reduce-overhead")` (`tests/torch/compile.py`).
+  - Ehhez kellett: a device-címek 48 bitesek lettek (lásd az ismert korlátoknál), mert a PyTorch CUDA graph tree-je
+    int64-ként kezeli a pointert.
+  - Hátra: rögzített Vulkan command bufferek (csak host-időt spórolna), child graph, memória-csomópontok
+    (`cuMemAllocAsync` capture alatt), `cudaGraphAddNode` általános paraméterekkel, feltételes csomópontok.
+- [ ] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
 - [ ] **5.4 Teljesítmény**
   - sub-allokátor (nagy VkDeviceMemory blokkok);
   - HOST_CACHED staging a DtoH-hoz;
@@ -323,6 +339,10 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   limitnél, vagy a becslés nagyon alulmér (ugyanaz a pipeline sokkal nagyobb K-val), a reset továbbra is előfordulhat.
 - **Vulkan shader modell**: nincs rekurzió, nincs függvénypointer, structured CF kötelező, kernelből `malloc`/`printf` nincs (printf később emulálható bufferrel).
 - **Warp size ≠ 32** eszközökön a warp-szintű kód lassú vagy részlegesen támogatott.
+- **Device-címek**: a RADV a buffereket a 48 bites címtér felső felébe teszi (0xffff8...), ami int64-ként negatív
+  (a PyTorch CUDA graph tree-je, `ctypes` ettől elbukik). A Vulkanizer ezért a bitek 63..48 nélkül adja ki a címeket
+  (`vk::kAddressMask`, 0x8000... alakúak, pozitívak), a kernelek pedig minden elérés előtt visszaállítják őket bit 47-ből
+  (a PTX-fordító a báziscímen, egyetlen 32 bites bit-field extracttal; a GLSL shaderek `canon()`-nal). Mérhető ára nincs.
 - **UVA**: több Vulkan device címtere ütközhet; jelenleg a pointer-keresés a current context device-án belül történik.
 - **DtoH olvasás** write-combined (nem HOST_CACHED) memóriából lassú → később cached staging.
 - **libcudart privát export table-jei** (`cuGetExportTable`) nem dokumentáltak, CUDA verziónként változhatnak → verzió-specifikus kezelés, sok trace-elés.

@@ -239,6 +239,11 @@ compiler::Target targetFor(const DeviceSlot& slot) {
     return t;
 }
 
+
+}  // namespace
+
+namespace vulkanizer::driver {
+
 CUresult packParams(const ptx::Entry& e, void** kernelParams, void** extra, std::vector<uint8_t>& out) {
     out.assign((e.paramBytes + 3u) & ~3u, 0);
     if (kernelParams) {
@@ -266,7 +271,81 @@ CUresult packParams(const ptx::Entry& e, void** kernelParams, void** extra, std:
     return e.params.empty() ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
-}  // namespace
+// The launch proper, with the parameters packed (packParams): cuLaunchKernel and graph replay.
+CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const unsigned block[3],
+                      unsigned sharedMemBytes, const std::vector<uint8_t>& params) {
+    const ptx::Entry& e = *f->entry;
+    const VkPhysicalDeviceLimits& lim = s.slot->info->props.limits;
+    const unsigned gridDimX = grid[0], gridDimY = grid[1], gridDimZ = grid[2];
+    const unsigned blockDimX = block[0], blockDimY = block[1], blockDimZ = block[2];
+
+    if (!f->compileAttempted) compileFunction(*f, *s.slot);
+    if (!f->compiled) {
+        VULKANIZER_ERROR("cannot launch '%s': %s", e.name.c_str(), f->compileError.c_str());
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
+    if (uint64_t(f->binary.staticSharedBytes) + sharedMemBytes > lim.maxComputeSharedMemorySize) {
+        VULKANIZER_ERROR("'%s': %u static + %u dynamic bytes of shared memory exceed the device limit (%u)", e.name.c_str(),
+                    f->binary.staticSharedBytes, sharedMemBytes, lim.maxComputeSharedMemorySize);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    std::vector<uint8_t> push(f->binary.pushConstantSize, 0);
+    if (f->binary.paramsInBuffer) {
+        // The parameter buffer's address goes into push[0..8): vk::Device::dispatch uploads it.
+    } else {
+        std::memcpy(push.data(), params.data(), std::min(params.size(), push.size()));
+    }
+    if (f->binary.globalsOffset != compiler::KernelBinary::kNone)
+        std::memcpy(push.data() + f->binary.globalsOffset, &f->module->globals, sizeof(CUdeviceptr));
+    if (f->binary.gridOffset != compiler::KernelBinary::kNone) {
+        const uint32_t grid[3] = {gridDimX, gridDimY, gridDimZ};
+        std::memcpy(push.data() + f->binary.gridOffset, grid, sizeof grid);
+    }
+    const bool printf = f->binary.printfOffset != compiler::KernelBinary::kNone;
+    if (printf) {
+        if (!s.slot->printfBuffer.buffer) {
+            if (VkResult vr = s.dev->allocateBuffer(kPrintfBufferBytes + 16, s.slot->printfBuffer)) return toCuResult(vr);
+        }
+        // The buffer is shared by all launches, so a printf kernel runs on its own.
+        const uint32_t header[4] = {0, kPrintfBufferBytes, 0, 0};
+        if (VkResult vr = s.dev->write(s.slot->printfBuffer, 0, header, sizeof header)) return toCuResult(vr);
+        std::memcpy(push.data() + f->binary.printfOffset, &s.slot->printfBuffer.address, sizeof(VkDeviceAddress));
+    }
+
+    // Small blocks of a packable kernel share a workgroup (up to kPackThreads threads): fuller
+    // waves, and more of them resident than the per-CU workgroup limit would allow. Only whole
+    // warps are packed, so CUDA warps stay aligned to the hardware's.
+    constexpr uint32_t kPackThreads = 256;
+    const uint32_t threads = blockDimX * blockDimY * blockDimZ;
+    uint32_t pack = 1;
+    if (f->binary.packable && blockDimX % 32 == 0 && threads < kPackThreads && gridDimX > 1 && !envFlag("VULKANIZER_NO_PACK")) {
+        pack = std::min<uint32_t>(kPackThreads / threads, gridDimX);
+        pack = std::min(pack, lim.maxComputeWorkGroupSize[0] / blockDimX);
+        pack = std::min(pack, lim.maxComputeWorkGroupInvocations / threads);
+        pack = std::max(pack, 1u);
+    }
+    const std::array<uint32_t, 5> spec{blockDimX, blockDimY, blockDimZ, (sharedMemBytes + 3) / 4, pack};
+    auto it = f->pipelines.find(spec);
+    if (it == f->pipelines.end()) {
+        vk::ComputePipeline pipeline;
+        VkResult vr = s.dev->createComputePipeline(f->binary.spirv.data(), f->binary.spirv.size(),
+                                                   f->binary.entryPoint.c_str(), f->binary.pushConstantSize,
+                                                   spec.data(), pipeline);
+        if (vr != VK_SUCCESS) {
+            VULKANIZER_ERROR("'%s': pipeline creation failed: %d", e.name.c_str(), vr);
+            return toCuResult(vr);
+        }
+        if (pack > 1) VULKANIZER_DEBUG("'%s': %u blocks of %u threads per workgroup", e.name.c_str(), pack, threads);
+        it = f->pipelines.emplace(spec, pipeline).first;
+    }
+    const bool buffered = f->binary.paramsInBuffer;
+    const VkResult vr = s.dev->dispatch(it->second, (gridDimX + pack - 1) / pack, gridDimY, gridDimZ, push.data(),
+                                        static_cast<uint32_t>(push.size()), f->entry->name.c_str(),
+                                        buffered ? params.data() : nullptr, buffered ? params.size() : 0);
+    if (vr == VK_SUCCESS && printf) flushDevicePrintf(*s.slot, *f->module);  // read() waits for the kernel
+    return toCuResult(vr);
+}
+}  // namespace vulkanizer::driver
 
 extern "C" {
 
@@ -474,75 +553,22 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
         gridDimZ > lim.maxComputeWorkGroupCount[2])
         return CUDA_ERROR_INVALID_VALUE;
 
-    const ptx::Entry& e = *f->entry;
     std::vector<uint8_t> params;
-    if (CUresult r = packParams(e, kernelParams, extra, params)) return r;
-
-    if (!f->compileAttempted) compileFunction(*f, *s.slot);
-    if (!f->compiled) {
-        VULKANIZER_ERROR("cannot launch '%s': %s", e.name.c_str(), f->compileError.c_str());
-        return CUDA_ERROR_NOT_SUPPORTED;
+    if (CUresult r = packParams(*f->entry, kernelParams, extra, params)) return r;
+    const unsigned grid[3] = {gridDimX, gridDimY, gridDimZ}, block[3] = {blockDimX, blockDimY, blockDimZ};
+    if (CUstream cs = capturingStream(hStream)) {
+        if (!f->compileAttempted) compileFunction(*f, *s.slot);  // report errors at capture already
+        if (!f->compiled) return CUDA_ERROR_NOT_SUPPORTED;
+        auto node = std::make_unique<CUgraphNode_st>();
+        node->type = CU_GRAPH_NODE_TYPE_KERNEL;
+        node->func = f;
+        std::copy(grid, grid + 3, node->grid);
+        std::copy(block, block + 3, node->block);
+        node->sharedMem = sharedMemBytes;
+        node->params = std::move(params);
+        return captureNode(cs, std::move(node));
     }
-    if (uint64_t(f->binary.staticSharedBytes) + sharedMemBytes > lim.maxComputeSharedMemorySize) {
-        VULKANIZER_ERROR("'%s': %u static + %u dynamic bytes of shared memory exceed the device limit (%u)", e.name.c_str(),
-                    f->binary.staticSharedBytes, sharedMemBytes, lim.maxComputeSharedMemorySize);
-        return CUDA_ERROR_INVALID_VALUE;
-    }
-    std::vector<uint8_t> push(f->binary.pushConstantSize, 0);
-    if (f->binary.paramsInBuffer) {
-        // The parameter buffer's address goes into push[0..8): vk::Device::dispatch uploads it.
-    } else {
-        std::memcpy(push.data(), params.data(), std::min(params.size(), push.size()));
-    }
-    if (f->binary.globalsOffset != compiler::KernelBinary::kNone)
-        std::memcpy(push.data() + f->binary.globalsOffset, &f->module->globals, sizeof(CUdeviceptr));
-    if (f->binary.gridOffset != compiler::KernelBinary::kNone) {
-        const uint32_t grid[3] = {gridDimX, gridDimY, gridDimZ};
-        std::memcpy(push.data() + f->binary.gridOffset, grid, sizeof grid);
-    }
-    const bool printf = f->binary.printfOffset != compiler::KernelBinary::kNone;
-    if (printf) {
-        if (!s.slot->printfBuffer.buffer) {
-            if (VkResult vr = s.dev->allocateBuffer(kPrintfBufferBytes + 16, s.slot->printfBuffer)) return toCuResult(vr);
-        }
-        // The buffer is shared by all launches, so a printf kernel runs on its own.
-        const uint32_t header[4] = {0, kPrintfBufferBytes, 0, 0};
-        if (VkResult vr = s.dev->write(s.slot->printfBuffer, 0, header, sizeof header)) return toCuResult(vr);
-        std::memcpy(push.data() + f->binary.printfOffset, &s.slot->printfBuffer.address, sizeof(VkDeviceAddress));
-    }
-
-    // Small blocks of a packable kernel share a workgroup (up to kPackThreads threads): fuller
-    // waves, and more of them resident than the per-CU workgroup limit would allow. Only whole
-    // warps are packed, so CUDA warps stay aligned to the hardware's.
-    constexpr uint32_t kPackThreads = 256;
-    const uint32_t threads = blockDimX * blockDimY * blockDimZ;
-    uint32_t pack = 1;
-    if (f->binary.packable && blockDimX % 32 == 0 && threads < kPackThreads && gridDimX > 1 && !envFlag("VULKANIZER_NO_PACK")) {
-        pack = std::min<uint32_t>(kPackThreads / threads, gridDimX);
-        pack = std::min(pack, lim.maxComputeWorkGroupSize[0] / blockDimX);
-        pack = std::min(pack, lim.maxComputeWorkGroupInvocations / threads);
-        pack = std::max(pack, 1u);
-    }
-    const std::array<uint32_t, 5> block{blockDimX, blockDimY, blockDimZ, (sharedMemBytes + 3) / 4, pack};
-    auto it = f->pipelines.find(block);
-    if (it == f->pipelines.end()) {
-        vk::ComputePipeline pipeline;
-        VkResult vr = s.dev->createComputePipeline(f->binary.spirv.data(), f->binary.spirv.size(),
-                                                   f->binary.entryPoint.c_str(), f->binary.pushConstantSize,
-                                                   block.data(), pipeline);
-        if (vr != VK_SUCCESS) {
-            VULKANIZER_ERROR("'%s': pipeline creation failed: %d", e.name.c_str(), vr);
-            return toCuResult(vr);
-        }
-        if (pack > 1) VULKANIZER_DEBUG("'%s': %u blocks of %u threads per workgroup", e.name.c_str(), pack, threads);
-        it = f->pipelines.emplace(block, pipeline).first;
-    }
-    const bool buffered = f->binary.paramsInBuffer;
-    const VkResult vr = s.dev->dispatch(it->second, (gridDimX + pack - 1) / pack, gridDimY, gridDimZ, push.data(),
-                                        static_cast<uint32_t>(push.size()), f->entry->name.c_str(),
-                                        buffered ? params.data() : nullptr, buffered ? params.size() : 0);
-    if (vr == VK_SUCCESS && printf) flushDevicePrintf(*s.slot, *f->module);  // read() waits for the kernel
-    return toCuResult(vr);
+    return launchKernel(s, f, grid, block, sharedMemBytes, params);
 }
 
 CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {

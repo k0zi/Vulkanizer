@@ -891,66 +891,25 @@ cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void* func, dim3 gridDim
 
 cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) {
     ENTER();
-    if (!fn) return record(cudaErrorInvalidValue);
-    // Runs once the stream's preceding work has completed.
-    if (CUresult r = cuStreamSynchronize(stream)) return record(r);
-    fn(userData);
-    return cudaSuccess;
+    return record(cuLaunchHostFunc(stream, fn, userData));  // captured, or run after the stream's work
 }
 
-// ---- graphs ------------------------------------------------------------------------------------
-// Explicitly built graphs of kernel nodes, replayed in the order the nodes were added (every
-// node's dependencies are added before it, so that order is a valid topological one). Stream
-// capture is not supported: callers run eagerly instead.
+// ---- graphs and stream capture ------------------------------------------------------------------
+// The driver keeps the graphs (api_graph.cpp): capture works for every launch path, the runtime's
+// and the Driver API's alike. Kernel nodes name host functions here and CUfunctions there.
 
 }  // extern "C"
 
-struct CUgraphNode_st {
-    Kernel* kernel = nullptr;
-    dim3 grid, block;
-    unsigned sharedMem = 0;
-    std::vector<uint8_t> params;       // the kernel's parameters, back to back
-    std::vector<size_t> paramOffsets;  // where each one starts in `params`
-};
-
-struct CUgraph_st {
-    std::vector<std::unique_ptr<CUgraphNode_st>> nodes;
-};
-
-struct CUgraphExec_st {
-    std::vector<CUgraphNode_st> nodes;
-    std::map<const CUgraphNode_st*, size_t> index;  // graph node -> position in `nodes`
-};
-
 namespace {
 
-// Copies a launch's parameters (kernelParams: one pointer per parameter) into `node`.
-cudaError_t setKernelNode(CUgraphNode_st& node, const cudaKernelNodeParams* p) {
+cudaError_t toDriverKernelParams(const cudaKernelNodeParams* p, CUDA_KERNEL_NODE_PARAMS_v2& out) {
     if (!p || !p->func) return cudaErrorInvalidValue;
-    if (p->extra) {
-        VULKANIZER_WARN_ONCE("graph kernel nodes with 'extra' parameters are not supported");
-        return cudaErrorNotSupported;
-    }
     Kernel* k = findKernel(p->func);
     if (!k) return cudaErrorInvalidDeviceFunction;
     CUfunction f;
     if (cudaError_t e = resolve(k, f)) return e;
-    std::vector<uint8_t> params;
-    std::vector<size_t> offsets;
-    for (size_t i = 0;; ++i) {
-        size_t offset = 0, size = 0;
-        if (cuFuncGetParamInfo(f, i, &offset, &size) != CUDA_SUCCESS) break;
-        if (!p->kernelParams) return cudaErrorInvalidValue;
-        offsets.push_back(params.size());
-        const auto* src = static_cast<const uint8_t*>(p->kernelParams[i]);
-        params.insert(params.end(), src, src + size);
-    }
-    node.kernel = k;
-    node.grid = p->gridDim;
-    node.block = p->blockDim;
-    node.sharedMem = p->sharedMemBytes;
-    node.params = std::move(params);
-    node.paramOffsets = std::move(offsets);
+    out = {f, p->gridDim.x, p->gridDim.y, p->gridDim.z, p->blockDim.x, p->blockDim.y, p->blockDim.z,
+           p->sharedMemBytes, p->kernelParams, p->extra, nullptr, nullptr};
     return cudaSuccess;
 }
 
@@ -960,38 +919,46 @@ extern "C" {
 
 cudaError_t CUDARTAPI cudaGraphCreate(cudaGraph_t* graph, unsigned int flags) {
     ENTER();
-    if (!graph || flags) return record(cudaErrorInvalidValue);
-    *graph = new CUgraph_st;
-    return cudaSuccess;
+    return record(cuGraphCreate(graph, flags));
 }
 
 cudaError_t CUDARTAPI cudaGraphAddKernelNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
                                              size_t numDeps, const cudaKernelNodeParams* params) {
     ENTER();
-    if (!node || !graph || (numDeps && !deps)) return record(cudaErrorInvalidValue);
-    auto n = std::make_unique<CUgraphNode_st>();
-    if (cudaError_t e = setKernelNode(*n, params)) return record(e);
-    *node = n.get();
-    graph->nodes.push_back(std::move(n));
-    return cudaSuccess;
+    CUDA_KERNEL_NODE_PARAMS_v2 p;
+    if (cudaError_t e = toDriverKernelParams(params, p)) return record(e);
+    return record(cuGraphAddKernelNode_v2(node, graph, deps, numDeps, &p));
 }
 
 cudaError_t CUDARTAPI cudaGraphKernelNodeSetParams(cudaGraphNode_t node, const cudaKernelNodeParams* params) {
     ENTER();
-    if (!node) return record(cudaErrorInvalidValue);
-    return record(setKernelNode(*node, params));
+    CUDA_KERNEL_NODE_PARAMS_v2 p;
+    if (cudaError_t e = toDriverKernelParams(params, p)) return record(e);
+    return record(cuGraphKernelNodeSetParams_v2(node, &p));
+}
+
+cudaError_t CUDARTAPI cudaGraphKernelNodeGetParams(cudaGraphNode_t node, cudaKernelNodeParams* params) {
+    ENTER();
+    if (!params) return record(cudaErrorInvalidValue);
+    CUDA_KERNEL_NODE_PARAMS_v2 p;
+    if (CUresult r = cuGraphKernelNodeGetParams_v2(node, &p)) return record(r);
+    params->func = nullptr;  // the host function the CUfunction was registered for
+    Runtime& rt = Runtime::get();
+    std::lock_guard<std::recursive_mutex> lock(rt.mutex);
+    for (const auto& [hostFun, k] : rt.kernelsByHostFun)
+        for (const auto& [device, f] : k->functions)
+            if (f == p.func) params->func = const_cast<void*>(hostFun);
+    params->gridDim = dim3(p.gridDimX, p.gridDimY, p.gridDimZ);
+    params->blockDim = dim3(p.blockDimX, p.blockDimY, p.blockDimZ);
+    params->sharedMemBytes = p.sharedMemBytes;
+    params->kernelParams = p.kernelParams;
+    params->extra = nullptr;
+    return cudaSuccess;
 }
 
 cudaError_t CUDARTAPI cudaGraphInstantiate(cudaGraphExec_t* exec, cudaGraph_t graph, unsigned long long flags) {
     ENTER();
-    if (!exec || !graph) return record(cudaErrorInvalidValue);
-    auto e = std::make_unique<CUgraphExec_st>();
-    for (const auto& n : graph->nodes) {
-        e->index[n.get()] = e->nodes.size();
-        e->nodes.push_back(*n);
-    }
-    *exec = e.release();
-    return cudaSuccess;
+    return record(cuGraphInstantiateWithFlags(exec, graph, flags));
 }
 
 cudaError_t CUDARTAPI cudaGraphInstantiateWithFlags(cudaGraphExec_t* exec, cudaGraph_t graph,
@@ -1002,84 +969,76 @@ cudaError_t CUDARTAPI cudaGraphInstantiateWithFlags(cudaGraphExec_t* exec, cudaG
 cudaError_t CUDARTAPI cudaGraphExecKernelNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node,
                                                        const cudaKernelNodeParams* params) {
     ENTER();
-    if (!exec || !node) return record(cudaErrorInvalidValue);
-    auto it = exec->index.find(node);
-    if (it == exec->index.end()) return record(cudaErrorInvalidValue);
-    return record(setKernelNode(exec->nodes[it->second], params));
+    CUDA_KERNEL_NODE_PARAMS_v2 p;
+    if (cudaError_t e = toDriverKernelParams(params, p)) return record(e);
+    return record(cuGraphExecKernelNodeSetParams_v2(exec, node, &p));
 }
 
-cudaError_t CUDARTAPI cudaGraphExecUpdate(void* exec, void* graph, void* resultInfo) {
+// CUDA 12 form: cudaGraphExecUpdateResultInfo has the driver struct's layout.
+cudaError_t CUDARTAPI cudaGraphExecUpdate(cudaGraphExec_t exec, cudaGraph_t graph, void* resultInfo) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    return record(cuGraphExecUpdate_v2(exec, graph, static_cast<CUgraphExecUpdateResultInfo*>(resultInfo)));
+}
+
+cudaError_t CUDARTAPI cudaGraphUpload(cudaGraphExec_t exec, cudaStream_t stream) {
+    ENTER();
+    return record(cuGraphUpload(exec, stream));
 }
 
 cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
     ENTER();
-    if (!exec) return record(cudaErrorInvalidValue);
-    std::vector<void*> args;
-    for (CUgraphNode_st& n : exec->nodes) {
-        args.clear();
-        for (size_t offset : n.paramOffsets) args.push_back(n.params.data() + offset);
-        if (cudaError_t e = launch(n.kernel, n.grid, n.block, args.data(), n.sharedMem, stream)) return e;
-    }
-    return cudaSuccess;
+    return record(cuGraphLaunch(exec, stream));
 }
 
 cudaError_t CUDARTAPI cudaGraphExecDestroy(cudaGraphExec_t exec) {
-    delete exec;
-    return cudaSuccess;
+    ENTER();
+    return record(cuGraphExecDestroy(exec));
 }
 
 cudaError_t CUDARTAPI cudaGraphDestroy(cudaGraph_t graph) {
-    delete graph;
-    return cudaSuccess;
-}
-
-cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus* status) {
     ENTER();
-    if (!status) return record(cudaErrorInvalidValue);
-    *status = cudaStreamCaptureStatusNone;
-    return cudaSuccess;
-}
-
-cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream, int mode) {
-    ENTER();
-    return record(cudaErrorStreamCaptureUnsupported);
-}
-
-cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, void** graph) {
-    ENTER();
-    return record(cudaErrorStreamCaptureUnsupported);
+    return record(cuGraphDestroy(graph));
 }
 
 cudaError_t CUDARTAPI cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, size_t* numNodes) {
     ENTER();
-    if (!graph || !numNodes) return record(cudaErrorInvalidValue);
-    if (nodes)
-        for (size_t i = 0; i < *numNodes && i < graph->nodes.size(); ++i) nodes[i] = graph->nodes[i].get();
-    *numNodes = graph->nodes.size();
-    return cudaSuccess;
+    return record(cuGraphGetNodes(graph, nodes, numNodes));
 }
 
-// Dependencies are not recorded: nodes run in the order they were added.
 #if VULKANIZER_CUDART_MAJOR >= 13
 cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t* deps, void* edgeData,
                                                    size_t* numDeps) {
+    ENTER();
+    return record(cuGraphNodeGetDependencies_v2(node, deps, static_cast<CUgraphEdgeData*>(edgeData), numDeps));
+}
 #else
 cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node, cudaGraphNode_t* deps, size_t* numDeps) {
-#endif
     ENTER();
-    if (!node || !numDeps) return record(cudaErrorInvalidValue);
-    *numDeps = 0;
-    return cudaSuccess;
+    return record(cuGraphNodeGetDependencies_v2(node, deps, nullptr, numDeps));
 }
+#endif
 
 cudaError_t CUDARTAPI cudaGraphDebugDotPrint(cudaGraph_t graph, const char* path, unsigned int flags) {
     ENTER();
     return record(cudaErrorNotSupported);
 }
 
-// CUDA 13's cudaStreamGetCaptureInfo is CUDA 12's _v3; nothing is ever captured.
+cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus* status) {
+    ENTER();
+    return record(cuStreamIsCapturing(stream, reinterpret_cast<CUstreamCaptureStatus*>(status)));
+}
+
+cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream, int mode) {
+    ENTER();
+    return record(cuStreamBeginCapture_v2(stream, static_cast<CUstreamCaptureMode>(mode)));
+}
+
+cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* graph) {
+    ENTER();
+    return record(cuStreamEndCapture(stream, graph));
+}
+
+// CUDA 13's cudaStreamGetCaptureInfo is CUDA 12's _v3.
 #if VULKANIZER_CUDART_MAJOR >= 13
 cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(cudaStream_t stream, enum cudaStreamCaptureStatus* status,
 #else
@@ -1089,14 +1048,9 @@ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v3(cudaStream_t stream, enum cuda
                                                   const cudaGraphNode_t** deps, const void** edgeData,
                                                   size_t* numDeps) {
     ENTER();
-    if (!status) return record(cudaErrorInvalidValue);
-    *status = cudaStreamCaptureStatusNone;
-    if (id) *id = 0;
-    if (graph) *graph = nullptr;
-    if (deps) *deps = nullptr;
-    if (edgeData) *edgeData = nullptr;
-    if (numDeps) *numDeps = 0;
-    return cudaSuccess;
+    return record(cuStreamGetCaptureInfo_v3(stream, reinterpret_cast<CUstreamCaptureStatus*>(status),
+                                            reinterpret_cast<cuuint64_t*>(id), graph, deps,
+                                            reinterpret_cast<const CUgraphEdgeData**>(edgeData), numDeps));
 }
 
 #if VULKANIZER_CUDART_MAJOR < 13
@@ -1109,7 +1063,7 @@ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(cudaStream_t stream, enum cuda
 
 cudaError_t CUDARTAPI cudaThreadExchangeStreamCaptureMode(int* mode) {
     ENTER();
-    return mode ? cudaSuccess : record(cudaErrorInvalidValue);  // no capture: the mode is moot
+    return record(cuThreadExchangeStreamCaptureMode(reinterpret_cast<CUstreamCaptureMode*>(mode)));
 }
 
 cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGraph_t graph,
@@ -1127,16 +1081,17 @@ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGra
 #endif
 
 cudaError_t CUDARTAPI VULKANIZER_V2(cudaStreamUpdateCaptureDependencies)(cudaStream_t stream, cudaGraphNode_t* deps,
-                                                             const void* edgeData, size_t numDeps,
-                                                             unsigned int flags) {
+                                                                        const void* edgeData, size_t numDeps,
+                                                                        unsigned int flags) {
     ENTER();
-    return record(cudaErrorStreamCaptureUnsupported);
+    return record(cuStreamUpdateCaptureDependencies_v2(stream, deps, static_cast<const CUgraphEdgeData*>(edgeData),
+                                                       numDeps, flags));
 }
 
 cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphAddNode)(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
                                           const void* edgeData, size_t numDeps, void* params) {
     ENTER();
-    return record(cudaErrorNotSupported);  // only kernel nodes (cudaGraphAddKernelNode) so far
+    return record(cudaErrorNotSupported);  // generic node parameters: not yet
 }
 
 cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(void* handle, cudaGraph_t graph, unsigned int defaultValue,

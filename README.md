@@ -117,14 +117,15 @@ tools/setup_torch.sh                       # conda-forge PyTorch CUDA environmen
 ./run_torch.sh -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ./run_torch.sh torch_mlp                   # trains an MLP on GPU and CPU and compares them (libtorch, C++)
 ./run_torch.sh torch_ops                   # conv, softmax, LayerNorm, attention, Transformer layer, ...
+./run_torch.sh torch_graph                 # a forward pass captured into a CUDA graph and replayed
 ./run_torch.sh tests/torch/triton_ops.py   # a hand-written Triton kernel and torch._native's Triton bmm
-./run_torch.sh tests/torch/compile.py      # torch.compile (Inductor -> Triton) MLP forward and backward
+./run_torch.sh tests/torch/compile.py      # torch.compile (Inductor -> Triton), also mode="reduce-overhead"
 
 tools/setup_torch.sh --cuda13              # the CUDA 13.4 build in .work/torch-cf13
 ./run_torch.sh --env .work/torch-cf13 torch13_ops
 ```
 
-`torch_mlp`, `torch_ops` and `torch_split` are C++ tests against the environment's libtorch
+`torch_mlp`, `torch_ops`, `torch_split` and `torch_graph` are C++ tests against the environment's libtorch
 (`tests/torch/*.cpp`); CMake builds them when `.work/torch-cf` exists at configure time, and as `torch13_*`
 against `.work/torch-cf13`. For an environment with `libcudart.so.13` (a CUDA 13 build), `run_torch.sh`
 loads the libraries from `build/lib/cuda13`.
@@ -204,7 +205,8 @@ Full list: [plan.md, section 4](plan.md).
 ### Limitations
 
 - No SASS execution: only binaries containing PTX run.
-- CUDA Graphs: only manually built graphs (`cudaGraphCreate` / `AddKernelNode`); no stream capture.
+- CUDA Graphs: stream capture and replay work (llama.cpp's graphs, PyTorch `CUDAGraph`,
+  `torch.compile(mode="reduce-overhead")`); no child graphs, memory nodes or conditional nodes.
 - Not (yet) supported: VMM, textures, cuDNN, NCCL, multi-GPU.
 - llama.cpp flash attention runs correctly (`tools/build_llama.sh --fa`), but without tensor cores prompt
   processing is slower with it, so it is off by default.

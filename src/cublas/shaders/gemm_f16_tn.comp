@@ -21,6 +21,14 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U1
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
 
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
+
 layout(push_constant, std430) uniform Params {
     uint64_t a, b, c;
     int64_t strideA, strideB, strideC;  // elements between batch entries
@@ -41,12 +49,12 @@ shared float As[BK][BM + 4];
 shared float Bs[BK][BN + 4];
 #endif
 
-float loadHalf(uint64_t base, int64_t index) { return unpackHalf2x16(uint(U16(base + uint64_t(index) * 2ul).v)).x; }
+float loadHalf(uint64_t base, int64_t index) { return unpackHalf2x16(uint(U16(canon(base + uint64_t(index) * 2ul)).v)).x; }
 
 // 8 consecutive halves along k of row `row` (of A^T or B^T), zero outside the matrix.
 void loadRow8(uint64_t base, int ld, int row, int rows, int k, out float v[8]) {
     if (row < rows && k + 8 <= p.k) {
-        const uvec4 w = U16x8(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k)) * 2ul).v;
+        const uvec4 w = U16x8(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k)) * 2ul)).v;
         for (int q = 0; q < 4; ++q) {
             const vec2 h = unpackHalf2x16(w[q]);
             v[2 * q] = h.x;
@@ -89,20 +97,20 @@ void store(uint64_t C, int gm, int gn, float acc) {
     float v = p.alpha * acc;
 #ifdef C_F16
     if (p.beta != 0.0) v += p.beta * loadHalf(C, idx);
-    U16(C + uint64_t(idx) * 2ul).v = uint16_t(toHalfBits(v));
+    U16(canon(C + uint64_t(idx) * 2ul)).v = uint16_t(toHalfBits(v));
 #else
-    if (p.beta != 0.0) v += p.beta * F32(C + uint64_t(idx) * 4ul).v;
-    F32(C + uint64_t(idx) * 4ul).v = v;
+    if (p.beta != 0.0) v += p.beta * F32(canon(C + uint64_t(idx) * 4ul)).v;
+    F32(canon(C + uint64_t(idx) * 4ul)).v = v;
 #endif
 }
 
 #ifdef F16_MATH
 // 8 raw halves along k (2 per uint), zero outside the matrix.
 uvec4 loadRaw8(uint64_t base, int ld, int row, int rows, int k) {
-    if (row < rows && k + 8 <= p.k) return U16x8(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k)) * 2ul).v;
+    if (row < rows && k + 8 <= p.k) return U16x8(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k)) * 2ul)).v;
     uint h[8];
     for (int q = 0; q < 8; ++q)
-        h[q] = row < rows && k + q < p.k ? uint(U16(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k + q)) * 2ul).v) : 0u;
+        h[q] = row < rows && k + q < p.k ? uint(U16(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k + q)) * 2ul)).v) : 0u;
     return uvec4(h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16, h[6] | h[7] << 16);
 }
 

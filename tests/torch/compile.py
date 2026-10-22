@@ -1,5 +1,7 @@
 # torch.compile (Inductor -> Triton) on the Vulkanizer GPU against eager on the CPU, forward and
-# backward of a small MLP: ./run_torch.sh tests/torch/compile.py
+# backward of a small MLP, and the forward pass with mode="reduce-overhead" (the Triton kernels
+# replayed from CUDA graphs): ./run_torch.sh tests/torch/compile.py
+import copy
 import sys
 import torch
 
@@ -25,4 +27,13 @@ got = run("cuda", True)
 err = max((a - b).abs().max().item() / (1 + a.abs().max().item()) for a, b in zip(ref, got))
 ok = err < 1e-4
 print(f"{'OK' if ok else 'DIFF'} torch.compile MLP forward+backward: max rel err {err:.2e}")
+
+reference = copy.deepcopy(model).cpu()
+graphed = torch.compile(model.to("cuda"), mode="reduce-overhead")
+with torch.no_grad():
+    for step in range(4):  # the first calls record, later ones replay the CUDA graph
+        xs = torch.randn(128, 32)
+        e = (graphed(xs.cuda()).cpu() - reference(xs)).abs().max().item()
+        print(f"{'OK' if e < 1e-4 else 'DIFF'} reduce-overhead call {step}: max err {e:.2e}")
+        ok &= e < 1e-4
 sys.exit(0 if ok else 1)

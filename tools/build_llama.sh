@@ -33,9 +33,9 @@ if [[ ! -d "$SRC" ]]; then
 fi
 
 # PTX only (61-virtual: dp4a, no tensor-core paths), shared CUDA runtime, Vulkanizer's cuBLAS header
-# and library; VMM, CUDA graphs and NCCL are not supported by Vulkanizer yet.
+# and library; VMM and NCCL are not supported by Vulkanizer yet.
 cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_GRAPHS=OFF -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA=$FA \
+  -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_GRAPHS=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA=$FA \
   -DCMAKE_CUDA_ARCHITECTURES=61-virtual \
   -DCMAKE_CUDA_COMPILER="$ROOT/.cuda/bin/nvcc" -DCMAKE_CUDA_HOST_COMPILER=g++-13 \
   -DCUDAToolkit_ROOT="$ROOT/.cuda" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \

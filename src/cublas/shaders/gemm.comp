@@ -15,6 +15,14 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float 
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ptr { uint64_t v; };
 
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
+
 layout(push_constant, std430) uniform Params {
     uint64_t a, b, c;                 // matrices, or arrays of matrix pointers (kPointerArrays)
     int64_t strideA, strideB, strideC; // elements between batch entries
@@ -33,8 +41,8 @@ uint typeC() { return (p.flags >> 12) & 15u; }
 uint elemSize(uint t) { return t == kF32 ? 4u : 2u; }
 
 float load(uint64_t base, int64_t index, uint type) {
-    if (type == kF32) return F32(base + uint64_t(index) * 4ul).v;
-    const uint bits = uint(U16(base + uint64_t(index) * 2ul).v);
+    if (type == kF32) return F32(canon(base + uint64_t(index) * 4ul)).v;
+    const uint bits = uint(U16(canon(base + uint64_t(index) * 2ul)).v);
     if (type == kBF16) return uintBitsToFloat(bits << 16);
     return unpackHalf2x16(bits).x;
 }
@@ -64,8 +72,8 @@ uint roundToBits(float f, bool brain) {
 }
 
 void store(uint64_t base, int64_t index, uint type, float v) {
-    if (type == kF32) F32(base + uint64_t(index) * 4ul).v = v;
-    else U16(base + uint64_t(index) * 2ul).v = uint16_t(roundToBits(v, type == kBF16));
+    if (type == kF32) F32(canon(base + uint64_t(index) * 4ul)).v = v;
+    else U16(canon(base + uint64_t(index) * 2ul)).v = uint16_t(roundToBits(v, type == kBF16));
 }
 
 const int BM = 64, BN = 64, BK = 16;
@@ -76,9 +84,9 @@ void main() {
     const int batch = int(gl_WorkGroupID.z) + p.batchOffset;
     uint64_t A = p.a, B = p.b, C = p.c;
     if ((p.flags & kPointerArrays) != 0u) {
-        A = Ptr(p.a + uint64_t(batch) * 8ul).v;
-        B = Ptr(p.b + uint64_t(batch) * 8ul).v;
-        C = Ptr(p.c + uint64_t(batch) * 8ul).v;
+        A = Ptr(canon(p.a + uint64_t(batch) * 8ul)).v;
+        B = Ptr(canon(p.b + uint64_t(batch) * 8ul)).v;
+        C = Ptr(canon(p.c + uint64_t(batch) * 8ul)).v;
     } else {
         A += uint64_t(p.strideA * batch) * elemSize(typeA());
         B += uint64_t(p.strideB * batch) * elemSize(typeB());

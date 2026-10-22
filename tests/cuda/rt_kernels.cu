@@ -779,9 +779,41 @@ static bool testGraphs() {
     CHECK(cudaMemcpy(got.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost));
     CHECK(cudaGraphExecDestroy(exec));
     CHECK(cudaGraphDestroy(graph));
+    bool ok = expectEqual("graph replay", got, std::vector<float>(n, 746.0f));
+
+    // Stream capture, as llama.cpp uses it: <<<>>> launches and a memset are recorded, not run;
+    // a re-capture with other parameters updates the executable graph.
+    auto capture = [&](float s, float a) {
+        cudaGraph_t g;
+        CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed));
+        CHECK(cudaMemsetAsync(data, 0, n * sizeof(float), stream));
+        graphStep<<<(n + 127) / 128, 128, 0, stream>>>(data, s, a, n);
+        graphStep<<<(n + 127) / 128, 128, 0, stream>>>(data, s, a, n);
+        CHECK(cudaStreamEndCapture(stream, &g));
+        return g;
+    };
+    cudaGraph_t captured = capture(2.0f, 3.0f);  // 0 -> 3 -> 9
+    CHECK(cudaStreamSynchronize(stream));
+    CHECK(cudaMemcpy(got.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    ok &= expectEqual("nothing runs while capturing", got, std::vector<float>(n, 746.0f));
+    CHECK(cudaGraphInstantiate(&exec, captured, 0));
+    CHECK(cudaGraphLaunch(exec, stream));
+    CHECK(cudaStreamSynchronize(stream));
+    CHECK(cudaMemcpy(got.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    ok &= expectEqual("captured graph", got, std::vector<float>(n, 9.0f));
+    cudaGraph_t recaptured = capture(1.0f, 4.0f);  // 0 -> 4 -> 8
+    cudaGraphExecUpdateResultInfo info;
+    CHECK(cudaGraphExecUpdate(exec, recaptured, &info));
+    CHECK(cudaGraphLaunch(exec, stream));
+    CHECK(cudaStreamSynchronize(stream));
+    CHECK(cudaMemcpy(got.data(), data, n * sizeof(float), cudaMemcpyDeviceToHost));
+    ok &= expectEqual("updated graph", got, std::vector<float>(n, 8.0f));
+    CHECK(cudaGraphExecDestroy(exec));
+    CHECK(cudaGraphDestroy(captured));
+    CHECK(cudaGraphDestroy(recaptured));
     CHECK(cudaFreeAsync(data, stream));
     CHECK(cudaStreamDestroy(stream));
-    return expectEqual("graph replay", got, std::vector<float>(n, 746.0f));
+    return ok;
 }
 
 // ---- fma accuracy (emulated where the driver's Fma is not fused) ---------------------------------

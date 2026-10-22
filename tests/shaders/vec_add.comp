@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // Hand-written stand-in for what the PTX compiler will emit for vecAdd:
 // parameters arrive in the push constant block with the CUDA parameter-buffer
@@ -12,13 +13,21 @@ layout(buffer_reference, std430, buffer_reference_align = 4) buffer FloatPtr {
 };
 
 layout(push_constant, std430) uniform Params {
-    FloatPtr a;  // offset 0
-    FloatPtr b;  // offset 8
-    FloatPtr c;  // offset 16
+    uint64_t a;  // offset 0
+    uint64_t b;  // offset 8
+    uint64_t c;  // offset 16
     int n;       // offset 24
 } p;
 
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
+
 void main() {
     int i = int(gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x);
-    if (i < p.n) p.c.v[i] = p.a.v[i] + p.b.v[i];
+    if (i < p.n) FloatPtr(canon(p.c)).v[i] = FloatPtr(canon(p.a)).v[i] + FloatPtr(canon(p.b)).v[i];
 }

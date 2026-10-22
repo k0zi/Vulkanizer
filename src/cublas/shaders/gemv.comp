@@ -18,6 +18,14 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ptr { uint64_t v; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer U16x4 { uvec2 v; };
 
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
+
 layout(push_constant, std430) uniform Params {
     uint64_t m, v, y;                     // operands, or arrays of pointers (kPointerArrays)
     int64_t strideM, strideV, strideY;    // elements between batch entries
@@ -37,8 +45,8 @@ uint typeY() { return (p.flags >> 4) & 3u; }
 uint elemSize(uint t) { return t == kF32 ? 4u : 2u; }
 
 float load(uint64_t base, int64_t index, uint type) {
-    if (type == kF32) return F32(base + uint64_t(index) * 4ul).v;
-    const uint bits = uint(U16(base + uint64_t(index) * 2ul).v);
+    if (type == kF32) return F32(canon(base + uint64_t(index) * 4ul)).v;
+    const uint bits = uint(U16(canon(base + uint64_t(index) * 2ul)).v);
     if (type == kBF16) return uintBitsToFloat(bits << 16);
     return unpackHalf2x16(bits).x;
 }
@@ -68,8 +76,8 @@ uint roundToBits(float f, bool brain) {
 }
 
 void store(uint64_t base, int64_t index, uint type, float v) {
-    if (type == kF32) F32(base + uint64_t(index) * 4ul).v = v;
-    else U16(base + uint64_t(index) * 2ul).v = uint16_t(roundToBits(v, type == kBF16));
+    if (type == kF32) F32(canon(base + uint64_t(index) * 4ul)).v = v;
+    else U16(canon(base + uint64_t(index) * 2ul)).v = uint16_t(roundToBits(v, type == kBF16));
 }
 
 shared float partial[256];
@@ -78,9 +86,9 @@ void main() {
     const int batch = int(gl_WorkGroupID.z) + p.batchOffset;
     uint64_t M = p.m, V = p.v, Y = p.y;
     if ((p.flags & kPointerArrays) != 0u) {
-        M = Ptr(p.m + uint64_t(batch) * 8ul).v;
-        V = Ptr(p.v + uint64_t(batch) * 8ul).v;
-        Y = Ptr(p.y + uint64_t(batch) * 8ul).v;
+        M = Ptr(canon(p.m + uint64_t(batch) * 8ul)).v;
+        V = Ptr(canon(p.v + uint64_t(batch) * 8ul)).v;
+        Y = Ptr(canon(p.y + uint64_t(batch) * 8ul)).v;
     } else {
         M += uint64_t(p.strideM * batch) * elemSize(typeM());
         V += uint64_t(p.strideV * batch) * elemSize(typeV());
@@ -105,7 +113,7 @@ void main() {
             // 4 halves per 8-byte load; the row tail element by element
             const int vecEnd = p.len & ~3;
             for (int l = lane * 4; l < vecEnd; l += step * 4) {
-                const uvec2 w = U16x4(rowAddr + uint64_t(l) * 2ul).v;
+                const uvec2 w = U16x4(canon(rowAddr + uint64_t(l) * 2ul)).v;
                 const vec2 a01 = unpackHalf2x16(w.x), a23 = unpackHalf2x16(w.y);
                 sum += a01.x * load(V, int64_t(l) * p.incv, tv) + a01.y * load(V, int64_t(l + 1) * p.incv, tv) +
                        a23.x * load(V, int64_t(l + 2) * p.incv, tv) + a23.y * load(V, int64_t(l + 3) * p.incv, tv);

@@ -1,16 +1,25 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // fma_probe.comp for f64: with a = 1 + 2^-27 and c = -(1 + 2^-26), a fused fma(a, a, c)
 // is 2^-54; a multiply-then-add gives 0.
 layout(local_size_x = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer Out { double v; };
+
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
 layout(push_constant, std430) uniform Params {
-    Out out_;
+    uint64_t out_;
     double a, c;
 } p;
 
 void main() {
     precise double r = fma(p.a, p.a, p.c);
-    p.out_.v = r;
+    Out(canon(p.out_)).v = r;
 }

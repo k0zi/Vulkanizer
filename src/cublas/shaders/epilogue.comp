@@ -13,6 +13,14 @@ layout(local_size_x = 64, local_size_y = 4) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
 
+// Device addresses arrive without their sign extension (bits 63..48, see vk/device.h); the
+// hardware wants them canonical.
+uint64_t canon(uint64_t a) {  // on the high word alone: one bit-field extract
+    uvec2 w = unpackUint2x32(a);
+    w.y = uint(bitfieldExtract(int(w.y), 0, 16));
+    return packUint2x32(w);
+}
+
 layout(push_constant, std430) uniform Params {
     uint64_t d, bias;
     int64_t strideD, strideBias;  // elements between batch entries
@@ -25,8 +33,8 @@ const uint kRelu = 0x10u, kGelu = 0x20u, kBias = 0x40u;
 const uint kF32 = 0u, kF16 = 1u, kBF16 = 2u;
 
 float load(uint64_t base, int64_t index, uint type) {
-    if (type == kF32) return F32(base + uint64_t(index) * 4ul).v;
-    const uint bits = uint(U16(base + uint64_t(index) * 2ul).v);
+    if (type == kF32) return F32(canon(base + uint64_t(index) * 4ul)).v;
+    const uint bits = uint(U16(canon(base + uint64_t(index) * 2ul)).v);
     if (type == kBF16) return uintBitsToFloat(bits << 16);
     return unpackHalf2x16(bits).x;
 }
@@ -56,8 +64,8 @@ uint roundToBits(float f, bool brain) {
 }
 
 void store(uint64_t base, int64_t index, uint type, float v) {
-    if (type == kF32) F32(base + uint64_t(index) * 4ul).v = v;
-    else U16(base + uint64_t(index) * 2ul).v = uint16_t(roundToBits(v, type == kBF16));
+    if (type == kF32) F32(canon(base + uint64_t(index) * 4ul)).v = v;
+    else U16(canon(base + uint64_t(index) * 2ul)).v = uint16_t(roundToBits(v, type == kBF16));
 }
 
 void main() {

@@ -96,6 +96,16 @@ typedef enum cudaError_enum {
     CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE = 720,
     CUDA_ERROR_NOT_PERMITTED = 800,
     CUDA_ERROR_NOT_SUPPORTED = 801,
+    CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED = 900,
+    CUDA_ERROR_STREAM_CAPTURE_INVALIDATED = 901,
+    CUDA_ERROR_STREAM_CAPTURE_MERGE = 902,
+    CUDA_ERROR_STREAM_CAPTURE_UNMATCHED = 903,
+    CUDA_ERROR_STREAM_CAPTURE_UNJOINED = 904,
+    CUDA_ERROR_STREAM_CAPTURE_ISOLATION = 905,
+    CUDA_ERROR_STREAM_CAPTURE_IMPLICIT = 906,
+    CUDA_ERROR_CAPTURED_EVENT = 907,
+    CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD = 908,
+    CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE = 910,
     CUDA_ERROR_UNKNOWN = 999
 } CUresult;
 
@@ -445,6 +455,88 @@ typedef struct CUctxCreateParams_st {
     CUctxCigParam* cigParams;
 } CUctxCreateParams;
 
+// ---- CUDA graphs and stream capture -----------------------------------------------------------
+typedef void (*CUhostFn)(void* userData);
+typedef struct CUkern_st* CUkernel;
+typedef struct CUgraph_st* CUgraph;
+typedef struct CUgraphNode_st* CUgraphNode;
+typedef struct CUgraphExec_st* CUgraphExec;
+typedef enum CUgraphNodeType_enum {
+    CU_GRAPH_NODE_TYPE_KERNEL = 0,
+    CU_GRAPH_NODE_TYPE_MEMCPY = 1,
+    CU_GRAPH_NODE_TYPE_MEMSET = 2,
+    CU_GRAPH_NODE_TYPE_HOST = 3,
+    CU_GRAPH_NODE_TYPE_GRAPH = 4,
+    CU_GRAPH_NODE_TYPE_EMPTY = 5,
+    CU_GRAPH_NODE_TYPE_WAIT_EVENT = 6,
+    CU_GRAPH_NODE_TYPE_EVENT_RECORD = 7,
+    CU_GRAPH_NODE_TYPE_MEM_ALLOC = 10,
+    CU_GRAPH_NODE_TYPE_MEM_FREE = 11,
+} CUgraphNodeType;
+typedef enum CUstreamCaptureStatus_enum {
+    CU_STREAM_CAPTURE_STATUS_NONE = 0,
+    CU_STREAM_CAPTURE_STATUS_ACTIVE = 1,
+    CU_STREAM_CAPTURE_STATUS_INVALIDATED = 2
+} CUstreamCaptureStatus;
+typedef enum CUstreamCaptureMode_enum {
+    CU_STREAM_CAPTURE_MODE_GLOBAL = 0,
+    CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1,
+    CU_STREAM_CAPTURE_MODE_RELAXED = 2
+} CUstreamCaptureMode;
+typedef struct CUDA_KERNEL_NODE_PARAMS_st {  // _v1
+    CUfunction func;
+    unsigned int gridDimX, gridDimY, gridDimZ;
+    unsigned int blockDimX, blockDimY, blockDimZ;
+    unsigned int sharedMemBytes;
+    void** kernelParams;
+    void** extra;
+} CUDA_KERNEL_NODE_PARAMS_v1;
+typedef struct CUDA_KERNEL_NODE_PARAMS_v2_st {
+    CUfunction func;
+    unsigned int gridDimX, gridDimY, gridDimZ;
+    unsigned int blockDimX, blockDimY, blockDimZ;
+    unsigned int sharedMemBytes;
+    void** kernelParams;
+    void** extra;
+    CUkernel kern;  // not supported: must be NULL
+    CUcontext ctx;
+} CUDA_KERNEL_NODE_PARAMS_v2;
+typedef CUDA_KERNEL_NODE_PARAMS_v2 CUDA_KERNEL_NODE_PARAMS;
+typedef struct CUDA_MEMSET_NODE_PARAMS_st {
+    CUdeviceptr dst;
+    size_t pitch;
+    unsigned int value;
+    unsigned int elementSize;
+    size_t width;
+    size_t height;
+} CUDA_MEMSET_NODE_PARAMS;
+typedef struct CUDA_HOST_NODE_PARAMS_st {
+    CUhostFn fn;
+    void* userData;
+} CUDA_HOST_NODE_PARAMS;
+typedef enum CUgraphExecUpdateResult_enum {
+    CU_GRAPH_EXEC_UPDATE_SUCCESS = 0x0,
+    CU_GRAPH_EXEC_UPDATE_ERROR = 0x1,
+    CU_GRAPH_EXEC_UPDATE_ERROR_TOPOLOGY_CHANGED = 0x2,
+    CU_GRAPH_EXEC_UPDATE_ERROR_NODE_TYPE_CHANGED = 0x3,
+    CU_GRAPH_EXEC_UPDATE_ERROR_FUNCTION_CHANGED = 0x4,
+    CU_GRAPH_EXEC_UPDATE_ERROR_PARAMETERS_CHANGED = 0x5,
+    CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED = 0x6,
+    CU_GRAPH_EXEC_UPDATE_ERROR_UNSUPPORTED_FUNCTION_CHANGE = 0x7,
+    CU_GRAPH_EXEC_UPDATE_ERROR_ATTRIBUTES_CHANGED = 0x8
+} CUgraphExecUpdateResult;
+typedef struct CUgraphExecUpdateResultInfo_st {
+    CUgraphExecUpdateResult result;
+    CUgraphNode errorNode;
+    CUgraphNode errorFromNode;
+} CUgraphExecUpdateResultInfo;
+typedef struct CUgraphEdgeData_st {
+    unsigned char from_port;
+    unsigned char to_port;
+    unsigned char type;
+    unsigned char reserved[5];
+} CUgraphEdgeData;
+
 typedef struct CUlaunchConfig_st {
     unsigned int gridDimX;
     unsigned int gridDimY;
@@ -555,6 +647,14 @@ typedef enum CUtensorMapFloatOOBfill_enum {
 #define cuMemHostGetDevicePointer cuMemHostGetDevicePointer_v2
 #define cuStreamDestroy cuStreamDestroy_v2
 #define cuEventDestroy cuEventDestroy_v2
+#define cuStreamBeginCapture cuStreamBeginCapture_v2
+#define cuStreamGetCaptureInfo cuStreamGetCaptureInfo_v2
+#define cuGraphInstantiate cuGraphInstantiateWithFlags
+#define cuGraphExecUpdate cuGraphExecUpdate_v2
+#define cuGraphAddKernelNode cuGraphAddKernelNode_v2
+#define cuGraphKernelNodeGetParams cuGraphKernelNodeGetParams_v2
+#define cuGraphKernelNodeSetParams cuGraphKernelNodeSetParams_v2
+#define cuGraphExecKernelNodeSetParams cuGraphExecKernelNodeSetParams_v2
 
 /* ------------------------------------------------------------------------ */
 /* Initialization, version, errors                                          */
@@ -737,6 +837,49 @@ CUresult CUDAAPI cuEventSynchronize(CUevent hEvent);
 CUresult CUDAAPI cuEventQuery(CUevent hEvent);
 CUresult CUDAAPI cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUevent hEnd);
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent);
+
+/* Stream capture and graphs. Captured work is recorded in order and replayed in that order on
+   the launch stream (a valid topological order: capture follows the streams' order). */
+CUresult CUDAAPI cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void* userData);
+CUresult CUDAAPI cuStreamBeginCapture(CUstream hStream, CUstreamCaptureMode mode);
+CUresult CUDAAPI cuStreamBeginCapture_v2_ptsz(CUstream hStream, CUstreamCaptureMode mode);
+CUresult CUDAAPI cuStreamEndCapture(CUstream hStream, CUgraph* phGraph);
+CUresult CUDAAPI cuStreamIsCapturing(CUstream hStream, CUstreamCaptureStatus* captureStatus);
+CUresult CUDAAPI cuStreamGetCaptureInfo(CUstream hStream, CUstreamCaptureStatus* captureStatus_out,
+                                        cuuint64_t* id_out, CUgraph* graph_out,
+                                        const CUgraphNode** dependencies_out, size_t* numDependencies_out);
+CUresult CUDAAPI cuStreamGetCaptureInfo_v3(CUstream hStream, CUstreamCaptureStatus* captureStatus_out,
+                                           cuuint64_t* id_out, CUgraph* graph_out,
+                                           const CUgraphNode** dependencies_out,
+                                           const CUgraphEdgeData** edgeData_out, size_t* numDependencies_out);
+CUresult CUDAAPI cuThreadExchangeStreamCaptureMode(CUstreamCaptureMode* mode);
+CUresult CUDAAPI cuStreamUpdateCaptureDependencies_v2(CUstream hStream, CUgraphNode* dependencies,
+                                                      const CUgraphEdgeData* dependencyData, size_t numDependencies,
+                                                      unsigned int flags);
+CUresult CUDAAPI cuGraphCreate(CUgraph* phGraph, unsigned int flags);
+CUresult CUDAAPI cuGraphDestroy(CUgraph hGraph);
+CUresult CUDAAPI cuGraphAddKernelNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                      size_t numDependencies, const CUDA_KERNEL_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphKernelNodeGetParams(CUgraphNode hNode, CUDA_KERNEL_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphKernelNodeSetParams(CUgraphNode hNode, const CUDA_KERNEL_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphAddMemsetNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                      size_t numDependencies, const CUDA_MEMSET_NODE_PARAMS* memsetParams,
+                                      CUcontext ctx);
+CUresult CUDAAPI cuGraphAddHostNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                    size_t numDependencies, const CUDA_HOST_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphAddEmptyNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                     size_t numDependencies);
+CUresult CUDAAPI cuGraphGetNodes(CUgraph hGraph, CUgraphNode* nodes, size_t* numNodes);
+CUresult CUDAAPI cuGraphNodeGetType(CUgraphNode hNode, CUgraphNodeType* type);
+CUresult CUDAAPI cuGraphNodeGetDependencies_v2(CUgraphNode hNode, CUgraphNode* dependencies, CUgraphEdgeData* edgeData,
+                                               size_t* numDependencies);
+CUresult CUDAAPI cuGraphInstantiate(CUgraphExec* phGraphExec, CUgraph hGraph, unsigned long long flags);
+CUresult CUDAAPI cuGraphExecKernelNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode,
+                                                const CUDA_KERNEL_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphExecUpdate(CUgraphExec hGraphExec, CUgraph hGraph, CUgraphExecUpdateResultInfo* resultInfo);
+CUresult CUDAAPI cuGraphUpload(CUgraphExec hGraphExec, CUstream hStream);
+CUresult CUDAAPI cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream);
+CUresult CUDAAPI cuGraphExecDestroy(CUgraphExec hGraphExec);
 
 #ifdef __cplusplus
 }

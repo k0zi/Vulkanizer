@@ -11,6 +11,13 @@
 namespace vulkanizer::vk {
 
 // A device allocation addressable from shaders through its buffer device address.
+// The device addresses Vulkanizer hands out (CUdeviceptr, Buffer::address) are the buffer device
+// addresses without their sign extension: RADV places buffers in the upper half of the 48-bit
+// address space (0xffff8...), which as a signed 64-bit integer is negative and breaks programs
+// that keep pointers in an int64 (PyTorch's CUDA graph trees, ctypes). Kernels restore bits
+// 63..48 from bit 47 before every access (the PTX compiler, and canon() in the GLSL shaders).
+constexpr uint64_t kAddressMask = 0x0000FFFFFFFFFFFFull;
+
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
