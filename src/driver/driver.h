@@ -255,6 +255,7 @@ struct DeviceSlot {
     bool assertArmed = false;
     CUresult stickyError = CUDA_SUCCESS;
     vk::Buffer gridWorkspace;  // cooperative launches' {size, barrier} (cooperative groups' grid.sync())
+    vk::Buffer heap;           // device-side malloc's heap (ptx/heap.h), made with the first module that uses it
 };
 
 class Driver {
@@ -372,6 +373,9 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
 CUresult checkDeviceAssert(DeviceSlot& slot, bool waited);
 // Clears the assert state of a device whose primary context is reset.
 void resetDeviceAssert(DeviceSlot& slot);
+
+// The value cuCtxSetLimit last set (or the default) of `limit` (api_context.cpp).
+size_t contextLimit(CUlimit limit);
 
 // cuGetExportTable's private interfaces (export_tables.cpp, VULKANIZER_EXPORT_TABLES): nullptr when
 // the interface is not provided.

@@ -26,6 +26,7 @@ struct Buffer {
     bool hostCached = false;  // host reads of `mapped` are cached (otherwise write-combined: very slow)
     bool hostAddressed = false;  // host memory at its own address (address == mapped)
     bool placedMapping = false;  // our memory, mapped at a chosen address (allocateHostMemory)
+    bool adopted = false;  // our memory over the application's pages (adoptHostMemory)
     // Memory that other processes can import (exportMemory, importMemory: CUDA IPC). The buffer's
     // and memory's creation parameters, which the importer has to repeat.
     bool exportable = false;
@@ -62,6 +63,8 @@ struct Features {
     bool hostMemoryImport = false;  // host memory at device address h | hostAddressBits() (importHostMemory)
     bool hostMemoryAlloc = false;   // the same for memory of our own (allocateHostMemory)
     bool memoryExport = false;      // device allocations are exportable as opaque fds (CUDA IPC)
+    // S of the S x S x S f16 x f16 -> f32 cooperative matrices of subgroup scope (16 or 8), 0 if none
+    uint32_t coopMatrixSize = 0;
 };
 
 // One page range of a sparse buffer bound to `memory` (or unbound if VK_NULL_HANDLE).
@@ -120,6 +123,14 @@ public:
     // imported memory (userptr), it costs nothing per submit: the kernel revalidates every
     // imported page on each submission. `size` is rounded up to whole sparsePageSize() units.
     VkResult allocateHostMemory(VkDeviceSize size, Buffer& out);
+    // The same over [host, host + size) of the application's own pages, with their contents: the
+    // memory replaces them at the same address (registered memory without the per-submit cost of an
+    // import). Only for private anonymous memory nothing else uses meanwhile; host and size must be
+    // multiples of placedMapAlignment(). Fails (pages untouched) where the address cannot be placed.
+    VkResult adoptHostMemory(void* host, VkDeviceSize size, Buffer& out);
+    // Puts anonymous memory with the contents back at the address and frees the buffer.
+    void releaseAdoptedHostMemory(Buffer& buf);
+    VkDeviceSize placedMapAlignment() const { return placedMapAlignment_; }
     VkResult createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, Buffer& out, uint64_t& opaqueOut);
     VkResult allocateMemory(VkDeviceSize size, VkDeviceMemory& out);  // for sparse binding
     void freeMemory(VkDeviceMemory memory);
@@ -279,6 +290,7 @@ private:
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
     VkDeviceSize hostImportAlignment_ = 0;
+    VkDeviceSize placedMapAlignment_ = 4096;
     uint32_t addressHigh_ = 0;  // hostAddressBits() >> 32
     PFN_vkGetMemoryHostPointerPropertiesEXT getHostPointerProperties_ = nullptr;
     PFN_vkMapMemory2KHR mapMemory2_ = nullptr;

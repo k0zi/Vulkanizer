@@ -768,14 +768,85 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
 **C. Teljesítmény**
 - [ ] **6.6** `VK_KHR_cooperative_matrix`: előbb a cuBLAS f16/bf16 GEMM, utána a PTX `mma`/`wmma` (shared
   scratch-en át), ha gyorsabb a shuffle-emulációnál. A fejlesztőgép (GFX9) nem tudja: más hardver kell.
-- [ ] **6.7** Regisztrált host-memória: privát anonim mappingnél saját host-cached memória `VK_EXT_map_memory_placed`-del
+  - cuBLAS kész (2026-10-23): `src/cublas/shaders/gemm_coopmat.comp` (a `gemm_f16_tn` szerződése: f16 A^T·B,
+    f32 akkumulálás, f16/f32 C). S×S×S mátrixok (S = 16, llvmpipe-on 8), a workgroup 4 subgroup 2×2-ben, mindegyik
+    2×2 mátrixot számol: 4S×4S csempék, k 2S-es lépésekben shared memórián át; a C shared memórián át megy ki
+    (alpha/beta, szélek). Vulkan 1.2-re (SPIR-V 1.5) fordul, így a subgroup mérete a device-é: 4 × subgroup szál.
+  - Driver: `VK_KHR_cooperative_matrix` bekapcsolva, ha van négyzetes f16×f16→f32 subgroup-alakja (16 vagy 8);
+    `vulkanizerGetFeature(VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16 / _SUBGROUP_SIZE)`. `VULKANIZER_COOPMAT`:
+    alapból csak GPU-n (llvmpipe emulálja: 512³ f16 GEMM 23 vs 37 GFLOP/s a sima kernellel), `0` ki, `1` mindenhol.
+  - Teszt: `cublas_coopmat` (`VULKANIZER_COOPMAT=1`): llvmpipe-on a 6 f16 TN eset (szélek, batch, f16/f32 C) helyes.
+    A RADV GFX9 nem hirdeti a kiterjesztést, ott a régi kernel fut. Az S = 16-os változat és a sebesség GPU-n
+    (RDNA3, NVIDIA) kipróbálatlan; az Intel Arc nem négyzetes alakjai (8×16×16) nem használhatók vele.
+  - Hátra: a PTX `mma` / `wmma` (csak mérhető hardveren, ha gyorsabb a shuffle-emulációnál).
+- [x] **6.7** Regisztrált host-memória: privát anonim mappingnél saját host-cached memória `VK_EXT_map_memory_placed`-del
   ugyanarra a címre (tartalommásolással), így nincs userptr és nincs submitonkénti lassulás.
+  - Kész (2026-10-23): `vk::Device::adoptHostMemory` / `releaseAdoptedHostMemory`, `cuMemHostRegister`-ben az import
+    előtt (`adoptPages`, `api_host.cpp`). Feltétel: a lapokra kerekített tartomány egyetlen privát, anonim, rw
+    leképezésben van (`/proc/self/maps`; nem `[heap]`/`[stack]`, ahol más adat osztozik a lapokon), és a device oda
+    tud sima buffert tenni (RADV: 64 KiB-os, 2 MiB-tól 2 MiB-os igazítás). A tartalom egy ideiglenes mappingen át
+    kerül a memóriába, utána placed map ugyanarra a címre; feloldáskor friss anonim lapokba másolja, és `mremap`
+    (`MREMAP_FIXED`) teszi vissza, így a cím sosem marad üresen. A `destroyBuffer` is ezen az úton adja vissza a lapokat.
+    `VULKANIZER_HOST_ADOPT=0` kikapcsolja.
+  - Mérés (RADV, 256 MB `mmap`): launch+sync 2,93 → 0,058 ms; a regisztrálás 47 → 137 ms, a feloldás 0,7 → 212 ms
+    (a két másolás). Teszt: `tests/host_memory.cpp` (4 MiB 2 MiB-os határon, tartalom, kernel- és host-írás, feloldás
+    utáni tartalom és szomszédok, újraregisztrálás); `VULKANIZER_HOST_ADOPT=0`-val és llvmpipe-on is.
+  - Korlátok: `fork()` után a gyerek ugyanazokat a lapokat látja (megosztott DRM-mapping, nincs copy-on-write);
+    a nem igazított tartomány marad import. A nagy, `malloc`-ból jövő (glibc mmap-chunk, 16 bájttal a lap után kezdődő)
+    tartomány se adoptálni, se importálni nem lehet (az import 64 KiB-ra bővít a chunkon kívülre): ez a 6.7 előtt is így volt.
 - [ ] **6.8** `eigh`/SVD tridiagonalizálással/bidiagonalizálással; cuFFT four-step és Bluestein; GPU-s SpGEMM és rendezés.
+  - `eigh` kész (2026-10-23): egy mátrixra (batch 1, n ≥ 32) Householder-tridiagonalizálás a GPU-n
+    (`src/linalg/shaders/trd.comp`: reflektor, `p = τSv`, `w`, rang-2 frissítés; oszloponként 4 indítás), a
+    tridiagonális feladat a hoston f64-ben (`tridiagonalQl`, implicit QL Wilkinson-shifttel, a forgatások rögzítve), a
+    sajátvektorok a GPU-n (a forgatások soronként, legfeljebb ~2^26 elemfrissítés indításonként), Q az `ormqr`-rel (a
+    reflektorok egy sorral lejjebb), a rendezés az `eig_finish`-sel. Kis n-re és batch-re a Jacobi marad;
+    `VULKANIZER_EIG_JACOBI=1` mindig azt használja. A workspace n² + 5n.
+    Mérés (RADV, f32, debug build): n = 256: 183 → 58 ms, 512: 1364 → 225 ms, 1024: 13,7 → 1,15 s; a maradék
+    |Av − λv| is kisebb (1024: 7,9e-4 → 5,1e-5). Teszt: `tests/cusolver.cpp` (f32 100, 300 upper; f64 45, 128; RADV, llvmpipe).
+  - cuFFT kész: four-step a 2048-nál (f64: 1024) hosszabb, N1·N2-re (mindkettő a határon belül) bontható hosszakra,
+    a Bluestein hatványkettes hosszára is. Az első lépés egy N1-es `fft_local` N2·inner lépésközzel, a második
+    N2-es, betöltéskor twiddle-lel (w_N^(e·k1)), tárolásnál transzponálva a másik pufferbe (`kFourStep`). Mérés (RADV,
+    f32): 2^20: 8,3 → 5,0 ms; 1 000 003 (Bluestein): 41,5 → 23,8 ms; a 2048-as változatlan. Teszt: `tests/cufft.cpp`
+    (4096×3 a 0. tengelyen, 6000 inverz, R2C 5000, Bluestein 5003, Z2Z 3072).
+  - Halasztva: SVD bidiagonalizálással (a Jacobi SVD 512×512-n 0,51 s, 1024-en ~4 s: a nyereség kisebb, a munka nagy);
+    GPU-s SpGEMM és rendezés (a host Gustavson-algoritmusa sűrű akkumulátorral; integrált GPU-n a másolás memcpy,
+    a GPU-s változat haszna csak diszkrét GPU-n mérhető).
 
 **D. Teljesség**
-- [ ] **6.9** Fordító: indirekt hívás (függvény-azonosító + `OpSwitch`), device `malloc`/`free` (heap a
+- [x] **6.9** Fordító: indirekt hívás (függvény-azonosító + `OpSwitch`), device `malloc`/`free` (heap a
   `CU_LIMIT_MALLOC_HEAP_SIZE` szerint).
-- [ ] **6.10** Textúrák: mipmap, cube map, texture reference, formázott `sust.p`.
+  - Kész (2026-10-23). Függvénycím: azonosító, `kFunctionIdBase | (1 + index)` (`Module::functionId`); az
+    inicializálókban (vtable, függvénypointer-tábla) a parser írja be, a `mov %rd, f` alakot az inliner írja át.
+    Indirekt hívás (`call (r), %reg, (a), proto`): az inliner a modul minden ilyen alakú (paraméter- és eredményszám,
+    a hívás `.param` változóinak mérete) függvényére `setp.eq.u64` + `bra`, ágankénti inline, a végén `trap`, ha egyik
+    sem illik (`OpSwitch` helyett, mert minden hívás inline-olódik). A `.callprototype` / `.calltargets` sort a
+    törzsparser átugorja. A könyvtár (`__vulkanizer_`) függvényei nem jelöltek. Rekurzió továbbra sincs.
+  - Heap: `src/ptx/heap_lib.cu` (→ `heap_lib.ptx`, `tools/gen_heap_lib.sh`, beágyazva), `ptx::appendDeviceHeap` a
+    modulhoz fűzi, ha `.extern` `malloc`/`free` van benne; az inliner a `__vulkanizer_malloc` / `__vulkanizer_free`-t
+    hívja helyettük. Kettő hatvány méretosztályok (32 B-tól, 16 bájtos fejléc, 16 bájtos igazítás), osztályonkénti
+    szabadlista 64 bites, számlálós fejjel (CAS, ABA ellen), különben a tetejéről vág; ha nem fér el, NULL. Eszközönként
+    egy buffer (`DeviceSlot::heap`) az első ilyen modul betöltésekor, a `cuCtxSetLimit(CU_LIMIT_MALLOC_HEAP_SIZE)` szerint
+    (alap 8 MiB); a címét a driver a modul `__vulkanizer_heap` változójába írja. A runtime kapott
+    `cudaDeviceSetLimit`/`cudaDeviceGetLimit`-et. A fordító a 64 bites atomikus műveletet local memórián is tudja
+    (sima olvasás-írás: a szál saját memóriája), mert a generikus című CAS-nál a local ág is elkészül.
+  - Tesztek: `tests/cuda/rt_device_calls.cu` (virtuális hívás, `__device__` függvénytábla, hostról kapott függvénypointer,
+    `malloc`/`free` 512 szálon 4 körben, NULL a heapnél nagyobb kérésre, `cudaDeviceSetLimit`; CUDA 12 és 13, RADV és
+    llvmpipe); `tests/ptx_parse.cpp` (azonosítók az inicializálóban és a `mov`-ban, a jelöltek szűrése).
+- [x] **6.10** Textúrák: mipmap, cube map, texture reference, formázott `sust.p`.
+  - Kész (2026-10-23): cube map és layered cube map (`CUDA_ARRAY3D_CUBEMAP`, 6 / 6n réteg, négyzetes lapok;
+    `VK_TEX_CUBE`), mipmapped array (`cuMipmappedArrayCreate/GetLevel/Destroy`, runtime: `cudaMallocMipmappedArray`,
+    `cudaGetMipmappedArrayLevel`, `cudaFreeMipmappedArray`; a szintek közönséges arrayk, az objektum szintenként egy
+    leíró egymás után, a 0. szintű tartja a szintszámot, a bias-t és a clampeket). A PTX-ben `tex.cube`, `tex.acube`,
+    `tex.level.*`, `tex.grad.*` → `__vulkanizer_tex_ex_{f,i}` (`texture_lib.cu`): LOD clamp, legközelebbi szint vagy
+    két szint 8 bites súllyal (`VK_TEX_MIP_LINEAR`), a gradiens hossza level-0 texelben; a cube lap kiválasztása a
+    szokásos főtengely-táblával, laponként normalizált, clamp-elt 2D mintavétel (a lapok szélén át nincs szűrés).
+    `txq.num_mipmap_levels` és `txq.level.*` a leíróból. Egy hívásban egy `sample`-példány (a szintek ciklusban):
+    a 10 textúrahívásos tesztkernelt az llvmpipe LLVM-je különben nem fordította le 10 perc alatt sem (most ~30 s).
+  - Nem készül: texture reference (a CUDA 12 eltávolította a `texture<>`-t és a `cudaBindTexture`-t, mai nvcc nem
+    generál `.texref`-et) és `sust.p` (a CUDA C `surf*write`-ja `sust.b`, a cube surface `a2d`; ellenőrizve az nvcc
+    12.9 kimenetén). A `cuMemcpy3D` `srcLOD`/`dstLOD`-ja továbbra sem támogatott (a szint arrayjét kell másolni).
+  - Teszt: `tests/cuda/rt_texture_mip.cu` (a 6 lap, lapon belüli texel, layered cube, `texCubemapLod`, `tex2DLod`
+    pont- és lineáris szintszűréssel, max clamp és bias, `tex2DGrad`, egész textúra; CUDA 12 és 13, RADV és llvmpipe).
 - [ ] **6.11** cuSOLVER komplex, `geev`, `sytrf`, `gesvda`; cuFFT callbackek (elő/utó-kernel); cuSPARSE BSR és komplex;
   cuRAND MT19937/MTGP32 a nyilvános algoritmus, paramétertáblák és dokumentált elrendezés szerint (a hivatalos
   kimenettel csak ellenőrizve), `curand_discrete`. (Az NVIDIA-azonos scrambled Sobol és Poisson: plan_non_clean.md.)
@@ -789,7 +860,8 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
 - **GPU-timeout**: a kernel driver reseteli a GPU-t, ha egy submit túl sokáig fut (amdgpu: 2 s). A batchek mért
   kernelidők alapján legfeljebb `VULKANIZER_BATCH_MS`-nyi munkát kapnak. Ha egyetlen workgroup is tovább fut a
   limitnél, vagy a becslés nagyon alulmér (ugyanaz a pipeline sokkal nagyobb K-val), a reset továbbra is előfordulhat.
-- **Vulkan shader modell**: nincs rekurzió, nincs függvénypointer, structured CF kötelező, kernelből `malloc`/`printf` nincs (printf később emulálható bufferrel).
+- **Vulkan shader modell**: nincs rekurzió, structured CF kötelező. A függvénypointer és a virtuális hívás modulon belül
+  összehasonlítás-lánc (6.9); a device `printf` és `malloc` saját bufferen/heapen.
 - **Warp size ≠ 32** eszközökön a warp-szintű kód lassú vagy részlegesen támogatott.
 - **Device-címek**: a RADV a buffereket a 48 bites címtér felső felébe teszi (0xffff8...), ami int64-ként negatív
   (a PyTorch CUDA graph tree-je, `ctypes` ettől elbukik). A Vulkanizer ezért a bitek 63..48 nélkül adja ki a címeket
@@ -799,8 +871,9 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
   host-memória h címe is érvényes device-cím (lásd 5.2). Mérhető ára nincs.
 - **UVA**: több Vulkan device címtere ütközhet; a pointer-keresés a current context device-án belül történik
   (eszközök között `cudaMemcpyPeer` működik, a `cudaMemcpyDefault` két eszköz pointerével nem).
-- **Regisztrált host-memória** (`cuMemHostRegister`): amíg él, minden GPU-submit lassabb (a kernel minden submitnál
-  újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát ez nem érinti.
+- **Regisztrált host-memória** (`cuMemHostRegister`): ha nem adoptálható (6.7), importálva, és amíg él, minden GPU-submit
+  lassabb (a kernel minden submitnál újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát
+  ez nem érinti.
 - **Jogi**: NVIDIA EULA (CUDA ≥ 11.6) tiltja az SDK kimenetének visszafejtését/átfordítását nem-NVIDIA platformra. Clean-room API implementáció; NVIDIA headert/binárist nem teszünk a repóba. Publikálás előtt jogi átnézés.
 
 ## 4. Konfiguráció (környezeti változók)
@@ -828,6 +901,10 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
 | `VULKANIZER_NO_VMM` | `1` = nincs sparse binding, így nincs CUDA VMM (`cuMemAddressReserve` stb. `NOT_SUPPORTED`) |
 | `VULKANIZER_NO_SUBALLOC` | `1` = minden `cuMemAlloc` külön Vulkan-memóriát kap (nincs sub-allokátor) |
 | `VULKANIZER_NO_PACK` | `1` = nincs block packing (minden CUDA block külön workgroup) |
+| `VULKANIZER_EIG_JACOBI` | `1` = az `eigh` egy mátrixra is Jacobi-iterációval (nem tridiagonalizálással, 6.8) |
+| `VULKANIZER_HOST_ADOPT` | `0` = a regisztrált host-memória mindig importálva (nem adoptálva, 6.7) |
+| `VULKANIZER_COOPMAT` | Cooperative matrix a cuBLAS f16 GEMM-hez: alapból csak GPU-n, `0` = ki, `1` = CPU-s eszközön is (6.6) |
+| `VULKANIZER_TORCH_SDPA` | `mem_efficient,flash`: a `run_torch.sh` ezeket a fused attention backendeket nem tiltja, és `VULKANIZER_CC=80`-at állít (6.3) |
 | `VULKANIZER_GEMM_F32` | `1` = a cuBLAS `COMPUTE_16F` GEMM-ek is f32 szorzással futnak (alapból packed f16, ha az eszköz tud f16 aritmetikát) |
 
 ## 5. Referenciák

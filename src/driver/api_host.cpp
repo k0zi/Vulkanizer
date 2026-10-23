@@ -7,9 +7,12 @@
 //
 // Managed memory never migrates: it stays host memory the device reads and writes in place
 // Pinned and managed memory is the device's own host-cached memory mapped at an address of our
-// choosing (vk::Device::allocateHostMemory); registered memory is the application's pages imported
-// (vk::Device::importHostMemory). Imported pages cost time on every GPU submission (the kernel
-// revalidates them), so they are only used where the application owns the memory.
+// choosing (vk::Device::allocateHostMemory). Registered memory is, where its pages are private
+// anonymous memory of their own (an mmap, a large malloc), the same memory placed over them with
+// their contents (vk::Device::adoptHostMemory; the pages come back at unregistration), otherwise the
+// application's pages imported (vk::Device::importHostMemory). Imported pages cost time on every GPU
+// submission (the kernel revalidates them, ~4 ms per 256 MB), so they are only used where the
+// application owns the memory.
 //
 // (on an integrated GPU that is the same memory anyway). Advice and prefetches are accepted and
 // ignored. Registration of pages that are already imported (two registrations sharing a page) and
@@ -21,6 +24,9 @@
 
 #include <sys/mman.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 
 using namespace vulkanizer;
@@ -70,6 +76,42 @@ bool importPages(ApiScope& s, uintptr_t p, size_t size, HostRange& r) {
                          size_t(end - begin), vr);
         return false;
     }
+    s.slot->allocations[buf.address] = buf;
+    r.pages = buf.address;
+    r.pagesSize = end - begin;
+    return true;
+}
+
+// Whether [begin, end) lies in one private, anonymous, read-write mapping (not the brk heap or a
+// stack, whose pages other data shares): its pages may be replaced by adoptHostMemory.
+bool adoptable(uintptr_t begin, uintptr_t end) {
+    FILE* maps = std::fopen("/proc/self/maps", "re");
+    if (!maps) return false;
+    bool ok = false;
+    char line[512];
+    while (std::fgets(line, sizeof line, maps)) {
+        unsigned long lo, hi, offset, inode;
+        char perms[8] = {}, dev[16] = {}, path[256] = {};
+        if (std::sscanf(line, "%lx-%lx %7s %lx %15s %lu %255s", &lo, &hi, perms, &offset, dev, &inode, path) < 6) continue;
+        if (begin < lo || begin >= hi) continue;
+        ok = end <= hi && !std::strcmp(perms, "rw-p") && inode == 0 && path[0] == '\0';
+        break;
+    }
+    std::fclose(maps);
+    return ok;
+}
+
+// Our own memory over the pages around [p, p + size), recorded as an allocation of the slot.
+bool adoptPages(ApiScope& s, uintptr_t p, size_t size, HostRange& r) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("VULKANIZER_HOST_ADOPT");
+        return !env || std::strcmp(env, "0") != 0;
+    }();
+    const size_t align = size_t(s.dev->placedMapAlignment());
+    const uintptr_t begin = p / align * align, end = (p + size + align - 1) / align * align;
+    if (!enabled || !s.dev->features().hostMemoryAlloc || !adoptable(begin, end)) return false;
+    vk::Buffer buf;
+    if (s.dev->adoptHostMemory(reinterpret_cast<void*>(begin), end - begin, buf) != VK_SUCCESS) return false;
     s.slot->allocations[buf.address] = buf;
     r.pages = buf.address;
     r.pagesSize = end - begin;
@@ -203,7 +245,8 @@ CUresult CUDAAPI cuMemHostRegister_v2(void* p, size_t bytesize, unsigned int Fla
     r.size = bytesize;
     r.flags = Flags;
     // With unified addressing CUDA maps every registration; only DEVICEMAP insists on it.
-    if (!importPages(s, begin, bytesize, r) && (Flags & CU_MEMHOSTREGISTER_DEVICEMAP)) return CUDA_ERROR_NOT_SUPPORTED;
+    if (!adoptPages(s, begin, bytesize, r) && !importPages(s, begin, bytesize, r) && (Flags & CU_MEMHOSTREGISTER_DEVICEMAP))
+        return CUDA_ERROR_NOT_SUPPORTED;
     ranges[begin] = r;
     return CUDA_SUCCESS;
 }

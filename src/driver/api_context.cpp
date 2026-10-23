@@ -219,8 +219,9 @@ CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int* version) {
     return CUDA_SUCCESS;
 }
 
-// Limits are remembered and reported back; the kernels do not depend on them (no device-side
-// malloc or stack, and device printf has its own buffer).
+// Limits are remembered and reported back. The kernels depend only on the malloc heap size (the
+// device heap is made with the first module that calls malloc); there is no stack, and device
+// printf has its own buffer.
 static size_t g_limits[7] = {1024, 1 << 20, 8 << 20, 2, 2048, 64, 0};
 
 CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value) {
@@ -243,3 +244,7 @@ CUresult CUDAAPI cuCtxGetLimit(size_t* pvalue, CUlimit limit) {
 }
 
 }  // extern "C"
+
+size_t vulkanizer::driver::contextLimit(CUlimit limit) {
+    return unsigned(limit) < sizeof g_limits / sizeof g_limits[0] ? g_limits[limit] : 0;
+}

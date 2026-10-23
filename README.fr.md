@@ -268,9 +268,13 @@ Liste complète : [plan.md, section 4](plan.md).
   mémoire (allocation ordonnée par flux pendant la capture) et les nœuds conditionnels (if, while, switch ; à chacun,
   l’hôte attend le GPU).
 - Pas (encore) pris en charge : cuDNN.
+- Code device : pas de récursion. Les appels indirects (fonctions virtuelles, pointeurs de fonction) comparent la
+  cible à chaque fonction du module de cette forme et n’atteignent que les fonctions du même module. `malloc`/`free`
+  travaillent sur un tas de `cudaLimitMallocHeapSize` (8 Mio par défaut), qui demande des atomiques 64 bits.
 - Les textures et surfaces (objets texture et surface, tableaux CUDA) sont échantillonnées en logiciel, avec
-  l’adressage et le filtrage de CUDA ; pas de mipmaps, de cubemaps, de références de texture ni d’écritures de surface
-  formatées.
+  l’adressage et le filtrage de CUDA, les mipmaps (niveau de détail et gradients) et les cubemaps (filtrées dans une
+  face, pas à travers ses bords). Pas de références de texture (retirées dans CUDA 12) ni d’écritures de surface
+  formatées (`sust.p`, que CUDA C n’émet pas).
 - L’IPC CUDA (`cudaIpc*`, `torch.multiprocessing` de PyTorch) fonctionne entre processus du même utilisateur ; un
   événement interprocessus est terminé dès son enregistrement (l’enregistrement attend le périphérique).
 - NCCL (`libnccl.so.2`, le backend « nccl » de `torch.distributed` : DDP, FSDP) fonctionne entre les rangs d’une
@@ -281,15 +285,20 @@ Liste complète : [plan.md, section 4](plan.md).
   fonctionnent jusqu’au nombre de blocs qui tiennent simultanément sur le GPU.
 - La mémoire managed, épinglée et enregistrée est de la mémoire hôte que le GPU utilise sur place, à la même adresse ;
   la mémoire managed ne migre jamais vers le GPU (sur un GPU intégré, c’est de toute façon la même mémoire).
-- Tant que de la mémoire hôte enregistrée (`cuMemHostRegister`) existe, chaque soumission au GPU est plus lente (le noyau
-  revalide les pages importées, ~4 ms pour 256 Mo) ; la mémoire épinglée et managed n’est pas concernée.
+- La mémoire hôte enregistrée (`cuMemHostRegister`) qui est un mappage à part entière (`mmap`) à une adresse où le GPU
+  peut placer de la mémoire (RADV : alignée sur 64 Kio, à partir de 2 Mio sur 2 Mio) est remplacée par de la mémoire
+  visible du GPU au même contenu : l’enregistrement et le désenregistrement la copient, et après `fork()` l’enfant
+  partage ces pages au lieu de les copier. Le reste de la mémoire enregistrée est importé ; tant qu’il existe, chaque
+  soumission au GPU est plus lente (le noyau revalide les pages importées, ~4 ms pour 256 Mo). La mémoire épinglée et
+  managed n’est pas concernée.
 - La flash attention de llama.cpp fonctionne correctement (`tools/build_llama.sh --fa`), mais sans tensor cores le
   traitement du prompt est plus lent avec elle ; elle est donc désactivée par défaut.
 - PyTorch : pas de kernels cuDNN ni d’attention fusionnée.
 - cuSOLVER : types réels (f32, f64) uniquement, pas de `gesvda`, de LDL^T (`sytrf`) ni de problèmes aux valeurs
-  propres non symétriques (`geev`) ; `eigh` et la SVD utilisent des itérations de Jacobi, lentes pour les grandes
-  matrices (n ≳ 1000). cuFFT : pas de callbacks ni de plans multi-GPU ; les transformées de plus de 2048 points (f64 :
-  1024) font un passage en mémoire par radix. cuSPARSE : pas de matrices creuses par blocs (BSR) ni de valeurs
+  propres non symétriques (`geev`) ; `eigh` d’une matrice la tridiagonalise (Householder) et résout sur l’hôte (QL) ;
+  `eigh` par lots et la SVD utilisent des itérations de Jacobi, la SVD est lente pour les grandes matrices (n ≳ 1000).
+  cuFFT : pas de callbacks ni de plans multi-GPU ; les transformées de plus de 2048 points (f64 : 1024) font deux passages
+  en mémoire si leur longueur se décompose en deux facteurs dans cette limite, sinon un par radix. cuSPARSE : pas de matrices creuses par blocs (BSR) ni de valeurs
   complexes ; SpGEMM et les routines de tri tournent sur l’hôte.
 - cuRAND : XORWOW, MRG32k3a, Philox et Sobol donnent les suites de NVIDIA (lois normale et log-normale à l’arrondi
   près) ; MTGP32 et MT19937 sont acceptés mais donnent d’autres suites, de même que Sobol brouillé et Poisson ; les
@@ -331,7 +340,7 @@ src/compiler          CFG + structuration, générateur SPIR-V, compilateur PTX 
 src/driver            la surface d’API de libcuda.so
 src/runtime           libcudart.so.12 et .so.13 (API CUDA Runtime sur l’API Driver, une seule source)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM avec des kernels GLSL), include/cublas/cublas_v2.h
-src/linalg            factorisations denses (LU, Cholesky, QR, eigh/SVD de Jacobi) en GLSL, communes à cuBLAS et cuSOLVER
+src/linalg            factorisations denses (LU, Cholesky, QR, eigh, SVD de Jacobi) en GLSL, communes à cuBLAS et cuSOLVER
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (FFT de Stockham et de Bluestein en GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 en GLSL), include/cusparse/cusparse.h

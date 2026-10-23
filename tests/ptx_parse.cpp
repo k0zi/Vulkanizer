@@ -6,6 +6,7 @@
 #include "ptx/parser.h"
 
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -254,6 +255,47 @@ void testModuleLayout() {
     EXPECT(!p.fn.instructions.empty() && p.fn.instructions[0].line == 18);
 }
 
+// Function addresses: ids in initializers (a vtable) and as mov operands; an indirect call becomes
+// a comparison with each candidate of its shape (here f and g, not h with two parameters).
+void testIndirectCalls() {
+    Parsed p;
+    parse(p, R"(.version 7.8
+.target sm_52
+.address_size 64
+.func (.param .b32 r) f(.param .b32 a) { .reg .b32 %x; ld.param.b32 %x, [a]; st.param.b32 [r], %x; ret; }
+.func (.param .b32 r) g(.param .b32 a) { .reg .b32 %x; ld.param.b32 %x, [a]; add.s32 %x, %x, 1; st.param.b32 [r], %x; ret; }
+.func (.param .b32 r) h(.param .b32 a, .param .b32 b) { st.param.b32 [r], 0; ret; }
+.global .align 8 .u64 table[3] = {0, f, g};
+.visible .entry k(.param .u64 k_p0)
+{
+    .reg .b64 %fp;
+    .reg .b32 %v;
+    mov.u64 %fp, g;
+    {
+    .param .b32 a0;
+    st.param.b32 [a0], 5;
+    .param .b32 r0;
+    proto : .callprototype (.param .b32 _) _ (.param .b32 _);
+    call (r0), %fp, (a0), proto;
+    ld.param.b32 %v, [r0];
+    }
+    ret;
+}
+)");
+    const ptx::GlobalVar* t = p.module.findGlobal("table");
+    EXPECT(t && t->init.size() == 24);
+    uint64_t ids[3];
+    std::memcpy(ids, t->init.data(), sizeof ids);
+    EXPECT(ids[0] == 0 && ids[1] == p.module.functionId("f") && ids[2] == p.module.functionId("g"));
+    EXPECT(ids[1] != ids[2] && (ids[1] & ptx::kFunctionIdBase) == ptx::kFunctionIdBase && !p.module.functionId("table"));
+    // mov of a function name is its id; two candidates, each compared and inlined
+    EXPECT(p.fn.instructions[0].opcode == "mov" && p.fn.instructions[0].operands[1].kind == ptx::OperandKind::Immediate &&
+           p.fn.instructions[0].operands[1].imm == ids[2]);
+    int compares = 0;
+    for (const ptx::Instruction& ins : p.fn.instructions) compares += ins.opcode == "setp";
+    EXPECT(compares == 2);
+}
+
 int main() {
     testSha256();
     testModuleLayout();
@@ -261,6 +303,7 @@ int main() {
     testOperands();
     testShadowingScopes();
     testStructurizer();
+    testIndirectCalls();
     std::printf("OK\n");
     return 0;
 }

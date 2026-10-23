@@ -14,6 +14,8 @@ enum {
     VK_TEX_LINEAR_FILTER = 2,     /* bilinear (trilinear) filtering, else nearest */
     VK_TEX_READ_AS_INTEGER = 4,   /* 8/16-bit integers are not promoted to [0, 1] / [-1, 1] floats */
     VK_TEX_SRGB = 8,              /* sRGB to linear conversion of the color channels */
+    VK_TEX_CUBE = 16,             /* a cube map: layers are faces (+x, -x, +y, -y, +z, -z), 6 per cube */
+    VK_TEX_MIP_LINEAR = 32,       /* linear filtering between mipmap levels, else the nearest level */
 };
 
 enum { VK_ADDRESS_WRAP = 0, VK_ADDRESS_CLAMP = 1, VK_ADDRESS_MIRROR = 2, VK_ADDRESS_BORDER = 3 };
@@ -42,4 +44,8 @@ typedef struct VkTexDesc {
     uint32_t address[3];
     uint32_t dimensions; /* 1, 2 or 3 (layers are separate) */
     float border[4];
+    /* Mipmaps: the descriptor of level l is l descriptors after level 0's; level 0's says how many
+       there are (1: no mipmaps) and how the level is chosen: lod + bias, clamped to [minLod, maxLod]. */
+    uint32_t levels;
+    float lodBias, minLod, maxLod;
 } VkTexDesc;

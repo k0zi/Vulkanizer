@@ -262,9 +262,13 @@ Lista completa: [plan.md, seção 4](plan.md).
   `torch.compile(mode="reduce-overhead")`); também grafos filhos e nós de memória (alocação
   ordenada por stream durante a captura) e nós condicionais (if, while, switch; em cada um o host espera pela GPU).
 - (Ainda) não suportado: cuDNN.
+- Código de dispositivo: sem recursão. Chamadas indiretas (funções virtuais, ponteiros de função) comparam o
+  destino com cada função do módulo dessa forma e só alcançam funções do mesmo módulo. `malloc`/`free` usam um heap
+  de `cudaLimitMallocHeapSize` (8 MiB por padrão), que exige atômicos de 64 bits.
 - Texturas e superfícies (objetos de textura e de superfície, arrays CUDA) são amostradas em software, com o
-  endereçamento e a filtragem do CUDA; sem mipmaps, cubemaps, referências de textura nem escritas formatadas em
-  superfície.
+  endereçamento e a filtragem do CUDA, mipmaps (nível de detalhe e gradientes) e cubemaps (filtrados dentro de uma face,
+  não através das bordas). Sem referências de textura (removidas no CUDA 12) nem escritas formatadas em superfície
+  (`sust.p`, que o CUDA C não gera).
 - O IPC do CUDA (`cudaIpc*`, `torch.multiprocessing` do PyTorch) funciona entre processos do mesmo usuário; um evento
   entre processos está concluído assim que é registrado (registrá-lo espera pelo dispositivo).
 - NCCL (`libnccl.so.2`, o backend "nccl" do `torch.distributed`: DDP, FSDP) funciona entre os ranks de uma máquina,
@@ -275,14 +279,19 @@ Lista completa: [plan.md, seção 4](plan.md).
   número de blocos que cabem ao mesmo tempo na GPU.
 - A memória managed, fixada (pinned) e registrada é memória do host que a GPU usa no lugar, no mesmo endereço;
   a memória managed nunca migra para a GPU (numa GPU integrada é a mesma memória de qualquer forma).
-- Enquanto existir memória do host registrada (`cuMemHostRegister`), cada submissão à GPU fica mais lenta (o kernel
-  revalida as páginas importadas, ~4 ms por 256 MB); a memória fixada e a managed não são afetadas.
+- A memória do host registrada (`cuMemHostRegister`) que é um mapeamento próprio (`mmap`) num endereço onde a GPU pode
+  colocar memória (RADV: alinhado a 64 KiB, a partir de 2 MiB a 2 MiB) é substituída por memória visível à GPU com o
+  mesmo conteúdo: registrar e desregistrar a copiam, e após `fork()` o filho compartilha essas páginas em vez de
+  copiá-las. O restante da memória registrada é importado e, enquanto existir, cada submissão à GPU fica mais lenta (o
+  kernel revalida as páginas importadas, ~4 ms por 256 MB). A memória fixada e a managed não são afetadas.
 - A flash attention do llama.cpp funciona corretamente (`tools/build_llama.sh --fa`), mas sem tensor cores o
   processamento do prompt fica mais lento com ela, por isso vem desativada.
 - PyTorch: sem kernels de cuDNN ou atenção fundida.
 - cuSOLVER: apenas tipos reais (f32, f64), sem `gesvda`, LDL^T (`sytrf`) nem problemas de autovalores não simétricos
-  (`geev`); `eigh` e a SVD usam iterações de Jacobi, lentas para matrizes grandes (n ≳ 1000). cuFFT: sem callbacks nem
-  planos multi-GPU; transformadas com mais de 2048 pontos (f64: 1024) fazem uma passada pela memória por radix.
+  (`geev`); o `eigh` de uma matriz a tridiagonaliza (Householder) e resolve no host (QL); o `eigh` em lote e a SVD
+  usam iterações de Jacobi, a SVD é lenta para matrizes grandes (n ≳ 1000). cuFFT: sem callbacks nem planos multi-GPU;
+  transformadas com mais de 2048 pontos (f64: 1024) fazem duas passadas pela memória se o comprimento se
+  decompõe em dois fatores dentro desse limite, senão uma por radix.
   cuSPARSE: sem matrizes esparsas por blocos (BSR) nem valores complexos; o SpGEMM e as rotinas de ordenação rodam no
   host.
 - cuRAND: XORWOW, MRG32k3a, Philox e Sobol dão as sequências da NVIDIA (normais e lognormais a menos de
@@ -325,7 +334,7 @@ src/compiler          CFG + estruturação, gerador de SPIR-V, compilador PTX ->
 src/driver            a superfície de API da libcuda.so
 src/runtime           libcudart.so.12 e .so.13 (API CUDA Runtime sobre a API Driver, um só fonte)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM com kernels GLSL), include/cublas/cublas_v2.h
-src/linalg            fatorações densas (LU, Cholesky, QR, eigh/SVD de Jacobi) em GLSL, compartilhadas por cuBLAS e cuSOLVER
+src/linalg            fatorações densas (LU, Cholesky, QR, eigh, SVD de Jacobi) em GLSL, compartilhadas por cuBLAS e cuSOLVER
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (FFTs de Stockham e de Bluestein em GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 em GLSL), include/cusparse/cusparse.h

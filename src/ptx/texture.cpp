@@ -53,7 +53,7 @@ struct Coords {
 };
 
 // The coordinate vector of a geometry: 1d {x}, 2d {x, y}, 3d {x, y, z, _}, a1d {layer, x},
-// a2d {layer, x, y, _}.
+// a2d {layer, x, y, _}, cube {x, y, z, _} (a direction), acube {layer, x, y, z}.
 bool parseCoords(const std::string& geom, const std::vector<std::string>& c, Coords& out) {
     auto at = [&](size_t i) { return i < c.size() && c[i] != "_" ? c[i] : std::string(); };
     if (geom == "1d") out.x = at(0);
@@ -61,6 +61,8 @@ bool parseCoords(const std::string& geom, const std::vector<std::string>& c, Coo
     else if (geom == "3d") out.x = at(0), out.y = at(1), out.z = at(2);
     else if (geom == "a1d") out.layer = at(0), out.x = at(1);
     else if (geom == "a2d") out.layer = at(0), out.x = at(1), out.y = at(2);
+    else if (geom == "cube") out.x = at(0), out.y = at(1), out.z = at(2);
+    else if (geom == "acube") out.layer = at(0), out.x = at(1), out.y = at(2), out.z = at(3);
     else return false;
     return !out.x.empty();
 }
@@ -159,8 +161,13 @@ private:
     // tex{.level,.grad}.geom.v4.dtype.ctype d, [h, c]{, lod or gradients}{, offset}{, depth}
     bool tex(const std::vector<std::string>& mods, const std::vector<std::string>& ops) {
         std::vector<std::string> m = mods;
-        if (!m.empty() && (m[0] == "level" || m[0] == "grad" || m[0] == "base")) m.erase(m.begin());  // one level only
+        std::string lodMode;  // "level", "grad" or empty (base level)
+        if (!m.empty() && (m[0] == "level" || m[0] == "grad" || m[0] == "base")) {
+            if (m[0] != "base") lodMode = m[0];
+            m.erase(m.begin());
+        }
         if (m.size() != 4 || m[1] != "v4") return fail("unsupported tex form");
+        if (!lodMode.empty() || m[0] == "cube" || m[0] == "acube") return texEx(m, lodMode, ops);
         const std::string &geom = m[0], &dtype = m[2], &ctype = m[3];
         if (ops.size() < 2) return fail("malformed tex");
         std::string h;
@@ -184,6 +191,53 @@ private:
         store(pl, "s32", xyz.layer.empty() ? "0" : xyz.layer);
         const std::string fn = std::string(fetch ? "__vulkanizer_fetch_" : "__vulkanizer_tex_") + (floatResult ? "f" : "i");
         body_ += "call.uni (" + name("r") + "), " + fn + ", (" + ph + ", " + px + ", " + py + ", " + pz + ", " + pl + "); ";
+        const std::vector<std::string> d = destinations(ops[0], floatResult ? "f32" : "b32", 4);
+        body_ += std::string("ld.param.v4.") + (floatResult ? "f32" : "b32") + " " + vector(d) + ", [" + name("r") + "]; ";
+        return true;
+    }
+
+    // tex.level / tex.grad, and cube maps: __vulkanizer_tex_ex_* with the level of detail or the
+    // derivatives (gradient vectors have one element per dimension, a cube's three plus a pad)
+    bool texEx(const std::vector<std::string>& m, const std::string& lodMode, const std::vector<std::string>& ops) {
+        const std::string &geom = m[0], &dtype = m[2], &ctype = m[3];
+        if (ctype != "f32") return fail("tex." + lodMode + " needs f32 coordinates");
+        const bool floatResult = dtype == "f32";
+        if (!floatResult && dtype != "s32" && dtype != "u32") return fail("unsupported tex result type ." + dtype);
+        if (ops.size() < 2 + (lodMode == "level" ? 1 : lodMode == "grad" ? 2 : 0)) return fail("malformed tex." + lodMode);
+        std::string h;
+        std::vector<std::string> c;
+        if (!handle(ops[1], h, c)) return false;
+        Coords xyz;
+        if (!parseCoords(geom, c, xyz)) return fail("unsupported texture geometry ." + geom);
+        const std::string zero = "0f00000000";
+        auto orZero = [&](const std::string& v) { return v.empty() || v == "_" ? zero : v; };
+        std::vector<std::string> dx(3, zero), dy(3, zero);
+        if (lodMode == "grad") {
+            const std::vector<std::string> gx = elements(ops[2]), gy = elements(ops[3]);
+            for (size_t i = 0; i < 3; ++i) {
+                if (i < gx.size()) dx[i] = orZero(gx[i]);
+                if (i < gy.size()) dy[i] = orZero(gy[i]);
+            }
+        }
+        const std::string ph = param("h", "b64"), px = param("x", "f32"), py = param("y", "f32"), pz = param("z", "f32"),
+                          pl = param("l", "s32"), pg = param("g", "s32"), plod = param("lod", "f32");
+        std::string args = "(" + ph + ", " + px + ", " + py + ", " + pz + ", " + pl + ", " + pg + ", " + plod;
+        store(ph, "b64", h);
+        store(px, "f32", xyz.x);
+        store(py, "f32", orZero(xyz.y));
+        store(pz, "f32", orZero(xyz.z));
+        store(pl, "s32", xyz.layer.empty() ? "0" : xyz.layer);
+        store(pg, "s32", lodMode == "grad" ? "1" : "0");
+        store(plod, "f32", lodMode == "level" ? ops[2] : zero);
+        for (int k = 0; k < 6; ++k) {
+            const std::string pd = param(("d" + std::to_string(k)).c_str(), "f32");
+            store(pd, "f32", k < 3 ? dx[size_t(k)] : dy[size_t(k - 3)]);
+            args += ", " + pd;
+        }
+        args += ")";
+        decls_ += ".param .align 16 .b8 " + name("r") + "[16]; ";
+        body_ += "call.uni (" + name("r") + "), " + std::string(floatResult ? "__vulkanizer_tex_ex_f" : "__vulkanizer_tex_ex_i") +
+                 ", " + args + "; ";
         const std::vector<std::string> d = destinations(ops[0], floatResult ? "f32" : "b32", 4);
         body_ += std::string("ld.param.v4.") + (floatResult ? "f32" : "b32") + " " + vector(d) + ", [" + name("r") + "]; ";
         return true;
@@ -215,20 +269,17 @@ private:
     // txq{.level}.query.b32 d, [h]{, lod}; suq.query.b32 d, [h]
     bool query(const std::string& op, const std::vector<std::string>& mods, const std::vector<std::string>& ops) {
         std::vector<std::string> m = mods;
-        if (!m.empty() && m[0] == "level") m.erase(m.begin());
-        if (m.size() != 2 || ops.size() < 2) return fail("malformed " + op);
+        const bool level = !m.empty() && m[0] == "level";
+        if (level) m.erase(m.begin());
+        if (m.size() != 2 || ops.size() < (level ? 3u : 2u)) return fail("malformed " + op);
         const std::string& q = m[0];
-        if (q == "num_mipmap_levels") {
-            body_ += "mov.b32 " + ops[0] + ", 1; ";
-            return true;
-        }
         if (q == "num_samples" || q == "memory_layout") {
             body_ += "mov.b32 " + ops[0] + ", 0; ";
             return true;
         }
         static const char* const kQueries[] = {"width", "height", "depth", "channel_data_type", "channel_order",
                                                "normalized_coords", "filter_mode", "addr_mode_0", "addr_mode_1",
-                                               "addr_mode_2", "array_size"};
+                                               "addr_mode_2", "array_size", "num_mipmap_levels"};
         int index = -1;
         for (int i = 0; i < int(std::size(kQueries)); ++i)
             if (q == kQueries[i]) index = i;
@@ -236,11 +287,12 @@ private:
         std::string h;
         std::vector<std::string> c;
         if (!handle(ops[1], h, c)) return false;
-        const std::string ph = param("h", "b64"), pq = param("q", "s32");
+        const std::string ph = param("h", "b64"), pq = param("q", "s32"), pl = param("lvl", "s32");
         decls_ += ".param .b32 " + name("r") + "; ";
         store(ph, "b64", h);
         store(pq, "s32", std::to_string(index));
-        body_ += "call.uni (" + name("r") + "), __vulkanizer_query, (" + ph + ", " + pq + "); ";
+        store(pl, "s32", level ? ops[2] : "0");
+        body_ += "call.uni (" + name("r") + "), __vulkanizer_query, (" + ph + ", " + pq + ", " + pl + "); ";
         body_ += "ld.param.b32 " + ops[0] + ", [" + name("r") + "]; ";
         return true;
     }

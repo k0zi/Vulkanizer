@@ -260,9 +260,13 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
   `torch.compile(mode="reduce-overhead")`）。子グラフとメモリノード（キャプチャ中のストリーム順序付き割り当て）にも対応しています。
   条件ノード（if、while、switch）にも対応していますが、各条件ノードでホストが GPU を待ちます。
 - （まだ）未対応：cuDNN。
+- デバイスコード：再帰は使えません。間接呼び出し（仮想関数、関数ポインタ）は呼び出し先を、モジュール内の同じ形の
+  すべての関数と比較し、同じモジュールの関数だけを呼べます。`malloc`/`free` は `cudaLimitMallocHeapSize`（既定 8 MiB）
+  のヒープ上で動作し、64 ビットのアトミック操作が必要です。
 - テクスチャとサーフェス（テクスチャ／サーフェスオブジェクト、CUDA 配列）はソフトウェアでサンプリングされ、CUDA と同じ
-  アドレッシングとフィルタリングを行います。ミップマップ、キューブマップ、テクスチャ参照、フォーマット付きサーフェス書き込みは
-  未対応です。
+  アドレッシングとフィルタリングを行い、ミップマップ（LOD と勾配）とキューブマップ（面内でフィルタリングし、面の境界をまたいだ
+  フィルタリングはしません）にも対応します。テクスチャ参照（CUDA 12 で削除）とフォーマット付きサーフェス書き込み（`sust.p`、
+  CUDA C は生成しません）は未対応です。
 - CUDA IPC（`cudaIpc*`、PyTorch の `torch.multiprocessing`）は同じユーザーのプロセス間で動作します。プロセス間イベントは
   記録した時点で完了します（記録はデバイスを待ちます）。
 - NCCL（`libnccl.so.2`、`torch.distributed` の "nccl" バックエンド：DDP、FSDP）は 1 台のマシンのランク間で動作し、
@@ -272,14 +276,18 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
   載るブロック数まで動作します。
 - マネージド、ピン留め、登録済みのメモリはホストメモリであり、GPU は同じアドレスでその場で使います。マネージドメモリが
   GPU に移動することはありません（統合 GPU ではいずれにせよ同じメモリです）。
-- 登録済みホストメモリ（`cuMemHostRegister`）が存在する間は、GPU への投入がすべて遅くなります（カーネルがインポートされた
-  ページを毎回再検証するため、256 MB あたり約 4 ms）。ピン留めメモリとマネージドメモリは影響を受けません。
+- 登録済みホストメモリ（`cuMemHostRegister`）が独立したマッピング（`mmap`）で、GPU がメモリを配置できるアドレス
+  （RADV：64 KiB 境界、2 MiB 以上は 2 MiB 境界）にある場合は、同じ内容の GPU から見えるメモリに置き換えられます。
+  登録と登録解除のたびに内容がコピーされ、`fork()` 後の子プロセスはそのページをコピーせず共有します。それ以外の登録済み
+  メモリはインポートされ、存在する間は GPU への投入がすべて遅くなります（カーネルがインポートされたページを毎回再検証
+  するため、256 MB あたり約 4 ms）。ピン留めメモリとマネージドメモリは影響を受けません。
 - llama.cpp の flash attention は正しく動作します（`tools/build_llama.sh --fa`）が、tensor core がない環境では
   プロンプト処理が遅くなるため、既定では無効です。
 - PyTorch：cuDNN と融合 attention のカーネルはありません。
-- cuSOLVER：実数型（f32、f64）のみで、`gesvda`、LDL^T（`sytrf`）、非対称固有値問題（`geev`）はありません。`eigh` と
-  SVD は Jacobi 反復を使うため、大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランは
-  ありません。長さが 2048（f64：1024）を超える変換は基数ごとにメモリを 1 回走査します。cuSPARSE：ブロック疎行列（BSR）
+- cuSOLVER：実数型（f32、f64）のみで、`gesvda`、LDL^T（`sytrf`）、非対称固有値問題（`geev`）はありません。単一行列の
+  `eigh` は Householder 法で三重対角化し、ホストで QL 法により解きます。バッチの `eigh` と SVD は Jacobi 反復を使い、
+  SVD は大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランはありません。長さが 2048
+  （f64：1024）を超える変換は、長さをこの上限以内の 2 つの因数に分解できればメモリを 2 回、できなければ基数ごとに 1 回走査します。cuSPARSE：ブロック疎行列（BSR）
   と複素数値はありません。SpGEMM とソートルーチンはホストで実行されます。
 - cuRAND：XORWOW、MRG32k3a、Philox、Sobol は NVIDIA と同じ系列を返します（正規分布・対数正規分布は丸め誤差の範囲で一致）。
   MTGP32 と MT19937 は受け付けますが別の系列になり、スクランブル Sobol と Poisson も同様です。double 出力には
@@ -320,7 +328,7 @@ src/compiler          CFG と構造化、SPIR-V ビルダ、PTX -> SPIR-V コン
 src/driver            libcuda.so の API 面
 src/runtime           libcudart.so.12 と .so.13（Driver API 上に構築した CUDA Runtime API、同一ソース）
 src/cublas            libcublas.so.12/.13（GLSL カーネルによる GEMM/TRSM）、include/cublas/cublas_v2.h
-src/linalg            GLSL による密行列分解（LU、Cholesky、QR、Jacobi eigh/SVD）、cuBLAS と cuSOLVER で共用
+src/linalg            GLSL による密行列分解（LU、Cholesky、QR、eigh、Jacobi SVD）、cuBLAS と cuSOLVER で共用
 src/cusolver          libcusolver.so.11/.12、include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL による Stockham と Bluestein の FFT）、include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL による SpMV/SpMM/SDDMM/SpSV/csrgeam2）、include/cusparse/cusparse.h

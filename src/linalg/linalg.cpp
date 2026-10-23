@@ -5,7 +5,10 @@
 #include "common/log.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <map>
 #include <mutex>
 
@@ -110,6 +113,12 @@ const uint32_t kGemm32[] = {
 const uint32_t kGemm64[] = {
 #include "gemm_f64.comp.inc"
 };
+const uint32_t kTrd32[] = {
+#include "trd.comp.inc"
+};
+const uint32_t kTrd64[] = {
+#include "trd_f64.comp.inc"
+};
 
 // Push constants of every kernel (shaders/common.glsl, std430).
 struct Params {
@@ -135,7 +144,7 @@ constexpr uint32_t kPtrA = 1, kPtrB = 2, kUpper = 4, kTrans = 8, kUnit = 16, kNo
 constexpr unsigned kMaxGridZ = 65535;
 
 enum Kernel { LuPanel, LuUpdate, TriSolve, CholPanel, CholUpdate, QrPanel, HouseholderApply, OrgqrColumn, EigSetup, JacobiRound, EigFinish,
-             SvdSetup, SvdRound, SvdFinish, SvdSign, Gemm, KernelCount };
+             SvdSetup, SvdRound, SvdFinish, SvdSign, Gemm, Trd, KernelCount };
 
 struct Kernels {
     CUfunction f[KernelCount][2] = {};
@@ -171,6 +180,7 @@ CUresult function(Kernel kernel, bool f64, CUfunction& out) {
             {{kSvdFinish32, std::size(kSvdFinish32)}, {kSvdFinish64, std::size(kSvdFinish64)}},
             {{kSvdSign32, std::size(kSvdSign32)}, {kSvdSign64, std::size(kSvdSign64)}},
             {{kGemm32, std::size(kGemm32)}, {kGemm64, std::size(kGemm64)}},
+            {{kTrd32, std::size(kTrd32)}, {kTrd64, std::size(kTrd64)}},
         };
         const Code& s = sources[kernel][f64];
         if (CUresult r = vulkanizerCreateSpirvFunction(&f, s.words, s.count, "main",
@@ -364,11 +374,195 @@ CUresult trsm(CUstream stream, bool f64, bool right, bool upper, bool trans, boo
     return launch(stream, TriSolve, f64, unsigned(rhs), 1, 256, 1, p, batch);
 }
 
-int64_t syevjWorkspace(int n) { return int64_t(n) * n + n + (n & 1); }
+// Jacobi: S (n x n), then the n ranks and a pad; the tridiagonal path: S, then d, e, pv, wv and tau.
+int64_t syevjWorkspace(int n) { return int64_t(n) * n + std::max<int64_t>(n + (n & 1), 5 * int64_t(n)); }
+
+namespace {
+
+// Eigenvalues of the symmetric tridiagonal matrix with diagonal d and subdiagonal e (e[i] between
+// rows i and i + 1; e[n-1] unused) by the implicit QL method with Wilkinson shifts (as in EISPACK's
+// tql2), in place of d, unsorted. With `rotations`, every plane rotation the eigenvectors need is
+// appended in order: column i of (i, i + 1) to idx, (c, s) to cs; applied to the identity from the
+// right (Z(:, i+1) = s Z(:, i) + c Z(:, i+1), Z(:, i) = c Z(:, i) - s Z(:, i+1)) they give the
+// eigenvectors. False if an eigenvalue did not converge.
+bool tridiagonalQl(std::vector<double>& d, std::vector<double>& e, bool rotations, std::vector<int32_t>& idx,
+                   std::vector<double>& cs) {
+    const int n = int(d.size());
+    if (n == 0) return true;
+    e[n - 1] = 0;
+    constexpr double eps = 0x1p-52;
+    double f = 0, tst1 = 0;
+    for (int l = 0; l < n; ++l) {
+        tst1 = std::max(tst1, std::fabs(d[l]) + std::fabs(e[l]));
+        int m = l;
+        while (m < n - 1 && std::fabs(e[m]) > eps * tst1) ++m;
+        if (m > l) {
+            for (int iter = 0;; ++iter) {
+                if (iter == 30 * n) return false;
+                double g = d[l], p = (d[l + 1] - g) / (2 * e[l]), r = std::hypot(p, 1.0);
+                if (p < 0) r = -r;
+                d[l] = e[l] / (p + r);
+                d[l + 1] = e[l] * (p + r);
+                const double dl1 = d[l + 1];
+                double h = g - d[l];
+                for (int i = l + 2; i < n; ++i) d[i] -= h;
+                f += h;
+                p = d[m];
+                double c = 1, c2 = 1, c3 = 1, s = 0, s2 = 0;
+                const double el1 = e[l + 1];
+                for (int i = m - 1; i >= l; --i) {
+                    c3 = c2;
+                    c2 = c;
+                    s2 = s;
+                    g = c * e[i];
+                    h = c * p;
+                    r = std::hypot(p, e[i]);
+                    e[i + 1] = s * r;
+                    s = e[i] / r;
+                    c = p / r;
+                    p = c * d[i] - s * g;
+                    d[i + 1] = h + s * (c * g + s * d[i]);
+                    if (rotations) {
+                        idx.push_back(i);
+                        cs.push_back(c);
+                        cs.push_back(s);
+                    }
+                }
+                p = -s * s2 * c3 * el1 * e[l] / dl1;
+                e[l] = s * p;
+                d[l] = c * p;
+                if (std::fabs(e[l]) <= eps * tst1) break;
+            }
+        }
+        d[l] += f;
+        e[l] = 0;
+    }
+    return true;
+}
+
+// One n x n matrix by Householder tridiagonalization on the device (trd.comp), the tridiagonal
+// problem on the host (tridiagonalQl) and its rotations and Q back on the device: O(n) launches
+// instead of the Jacobi sweeps' O(n) per sweep.
+CUresult syevTridiagonal(CUstream stream, bool f64, bool upper, bool vectors, int n, const Matrices& a, CUdeviceptr w,
+                         CUdeviceptr work) {
+    const size_t rb = f64 ? 8 : 4;
+    Params p = base(a, n, n);
+    setB(p, Matrices{work, false, 0, n}, 0);
+    const uint32_t common = p.flags | (upper ? kUpper : 0) | (vectors ? 0 : kNoVectors);
+    p.flags = common;
+    if (CUresult r = launch(stream, EigSetup, f64, unsigned(n), 1, 256, 1, p, 1)) return r;  // S
+    p.flags = common | kTrans;
+    if (CUresult r = launch(stream, EigSetup, f64, unsigned(n), 1, 256, 1, p, 1)) return r;  // A = I
+    p.flags = common;
+    auto step = [&](int mode, int k, unsigned groupsX) {
+        p.nrhs = mode;
+        p.k = k;
+        return launch(stream, Trd, f64, groupsX, 1, 256, 1, p, 1);
+    };
+    for (int k = 0; k + 1 < n; ++k) {
+        if (CUresult r = step(0, k, 1)) return r;
+        if (k + 2 == n) break;  // nothing below S(k+1, k) to annihilate
+        if (CUresult r = step(1, k, unsigned(n - k - 1))) return r;
+        if (CUresult r = step(2, k, 1)) return r;
+        if (CUresult r = step(3, k, unsigned(n - k - 1))) return r;
+    }
+    if (CUresult r = step(4, 0, groups(n, 256))) return r;
+
+    // d and e (n each, after S) to the host
+    const CUdeviceptr dAddr = work + CUdeviceptr(size_t(n) * n * rb);
+    std::vector<uint8_t> raw(2 * size_t(n) * rb);
+    if (CUresult r = cuMemcpyDtoHAsync(raw.data(), dAddr, raw.size(), stream)) return r;
+    if (CUresult r = cuStreamSynchronize(stream)) return r;
+    std::vector<double> d(n), e(n);
+    for (int i = 0; i < n; ++i) {
+        if (f64) {
+            std::memcpy(&d[i], &raw[i * 8], 8);
+            std::memcpy(&e[i], &raw[(n + i) * 8], 8);
+        } else {
+            float x, y;
+            std::memcpy(&x, &raw[i * 4], 4);
+            std::memcpy(&y, &raw[(n + i) * 4], 4);
+            d[i] = x, e[i] = y;
+        }
+    }
+    std::vector<int32_t> idx;
+    std::vector<double> cs;
+    if (!tridiagonalQl(d, e, vectors, idx, cs)) VULKANIZER_WARN("syevd: the QL iteration did not converge (n = %d)", n);
+
+    if (vectors && !idx.empty()) {
+        // Rotation chunks of at most ~2^26 element updates per launch (the GPU timeout).
+        const size_t chunk = std::max<size_t>(1, (size_t(1) << 26) / size_t(n));
+        const size_t count = std::min(chunk, idx.size());
+        CUdeviceptr dIdx = 0, dCs = 0;
+        if (CUresult r = cuMemAlloc(&dIdx, count * 4)) return r;
+        if (CUresult r = cuMemAlloc(&dCs, 2 * count * rb)) {
+            cuMemFree(dIdx);
+            return r;
+        }
+        std::vector<uint8_t> csRaw(2 * count * rb);
+        CUresult res = CUDA_SUCCESS;
+        Params q = p;
+        q.nrhs = 6;
+        q.ipiv = dIdx;
+        q.c = dCs;
+        q.k = 0;
+        for (size_t first = 0; first < idx.size() && res == CUDA_SUCCESS; first += count) {
+            const size_t m = std::min(count, idx.size() - first);
+            for (size_t t = 0; t < 2 * m; ++t) {
+                if (f64) std::memcpy(&csRaw[t * 8], &cs[2 * first + t], 8);
+                else {
+                    const float v = float(cs[2 * first + t]);
+                    std::memcpy(&csRaw[t * 4], &v, 4);
+                }
+            }
+            // in queue order: the previous chunk's launch has read the buffers before they change
+            if ((res = cuMemcpyHtoD(dIdx, idx.data() + first, m * 4)) != CUDA_SUCCESS) break;
+            if ((res = cuMemcpyHtoD(dCs, csRaw.data(), 2 * m * rb)) != CUDA_SUCCESS) break;
+            q.ldc = int(m);
+            res = launch(stream, Trd, f64, groups(n, 256), 1, 256, 1, q, 1);
+        }
+        cuMemFree(dIdx);
+        cuMemFree(dCs);
+        if (res) return res;
+        // A = Q Z: the reflectors are geqrf's one row down (rows 1.., of S and of A)
+        if (n > 2) {
+            if (CUresult r = ormqr(stream, f64, false, false, n - 1, n, n - 2, Matrices{work + rb, false, 0, n},
+                                   work + CUdeviceptr(size_t(n) * n * rb + 4 * size_t(n) * rb), 0,
+                                   Matrices{a.base + rb, false, 0, a.ld}, 1))
+                return r;
+        }
+    }
+    // the eigenvalues on S's diagonal, for eig_finish to sort (with the vectors)
+    std::vector<uint8_t> dRaw(size_t(n) * rb);
+    for (int i = 0; i < n; ++i) {
+        if (f64) std::memcpy(&dRaw[i * 8], &d[i], 8);
+        else {
+            const float v = float(d[i]);
+            std::memcpy(&dRaw[i * 4], &v, 4);
+        }
+    }
+    if (CUresult r = cuMemcpyHtoD(dAddr, dRaw.data(), dRaw.size())) return r;
+    if (CUresult r = step(5, 0, groups(n, 256))) return r;
+    p.nrhs = 0;
+    p.k = 0;
+    p.tau = w;
+    p.strideP = n;
+    p.flags = common;
+    return launch(stream, EigFinish, f64, 1, 1, 256, 1, p, 1);
+}
+
+}  // namespace
 
 CUresult syevj(CUstream stream, bool f64, bool upper, bool vectors, int n, const Matrices& a, CUdeviceptr w,
                int64_t wStride, CUdeviceptr work, int64_t workStride, int batch) {
     if (n <= 0) return CUDA_SUCCESS;
+    // One larger matrix: tridiagonalization (VULKANIZER_EIG_JACOBI=1 keeps the Jacobi iteration).
+    static const bool jacobiOnly = [] {
+        const char* env = std::getenv("VULKANIZER_EIG_JACOBI");
+        return env && *env && std::strcmp(env, "0") != 0;
+    }();
+    if (batch == 1 && n >= 32 && !a.pointerArray && !jacobiOnly)
+        return syevTridiagonal(stream, f64, upper, vectors, n, a, w, work);
     Params p = base(a, n, n);
     setB(p, Matrices{work, false, workStride, n}, 0);
     p.tau = w;

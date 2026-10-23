@@ -38,6 +38,19 @@ const uint32_t kGemmF16TnMSpirv[] = {
 const uint32_t kGemmF16TnMHSpirv[] = {
 #include "gemm_f16_tn_mh.comp.inc"
 };
+// gemm_coopmat.comp: S = 16 and 8, each with f32 and f16 C
+const uint32_t kGemmCoop16Spirv[] = {
+#include "gemm_coopmat16.comp.inc"
+};
+const uint32_t kGemmCoop16HSpirv[] = {
+#include "gemm_coopmat16_h.comp.inc"
+};
+const uint32_t kGemmCoop8Spirv[] = {
+#include "gemm_coopmat8.comp.inc"
+};
+const uint32_t kGemmCoop8HSpirv[] = {
+#include "gemm_coopmat8_h.comp.inc"
+};
 const uint32_t kGemvSpirv[] = {
 #include "gemv.comp.inc"
 };
@@ -125,6 +138,10 @@ struct cublasContext {
     // gemm_f16_tn.comp variants, indexed by bit 0 = f16 C, bit 1 = f16 math
     CUfunction gemmF16Tn[4] = {};
     int float16 = -1;  // device has f16 arithmetic (-1: not queried yet)
+    // gemm_coopmat.comp, indexed by f16 C; its matrix size S (0: no cooperative matrices, -1: not
+    // queried yet) and the subgroup size (a workgroup is 4 subgroups)
+    CUfunction gemmCoop[2] = {};
+    int coopSize = -1, subgroupSize = 0;
     CUfunction trsm = nullptr;
 };
 
@@ -310,13 +327,21 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     // CUBLAS_COMPUTE_16F permits f16 arithmetic: packed f16 products where the device has it.
     if (fast && h->float16 < 0 && vulkanizerGetFeature(VULKANIZER_FEATURE_FLOAT16_ARITHMETIC, &h->float16) != CUDA_SUCCESS)
         h->float16 = 0;
-    const bool f16Math = fast && h->float16 > 0 &&
+    // On cooperative matrices where the device has them: f16 products, f32 sums.
+    if (fast && h->coopSize < 0) {
+        if (vulkanizerGetFeature(VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16, &h->coopSize) != CUDA_SUCCESS ||
+            vulkanizerGetFeature(VULKANIZER_FEATURE_SUBGROUP_SIZE, &h->subgroupSize) != CUDA_SUCCESS ||
+            4 * h->subgroupSize > 1024)
+            h->coopSize = 0;
+    }
+    const bool coop = fast && h->coopSize > 0;
+    const bool f16Math = fast && !coop && h->float16 > 0 &&
                          (g.compute == CUBLAS_COMPUTE_16F || g.compute == CUBLAS_COMPUTE_32F_FAST_16F) &&
                          !std::getenv("VULKANIZER_GEMM_F32");
     VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d types %u/%u/%u compute %d batch %d%s -> %s", g.transa ? 'T' : 'N',
                 g.transb ? 'T' : 'N', g.m, g.n, g.k, ta, tb, tc, int(g.compute), g.batch, g.pointerArrays ? " (arrays)" : "",
                 !fast ? (g.m >= int(kFastTile) && g.n >= int(kFastTile) ? "tiled" : "generic")
-                      : f16Math ? "f16 tn, f16 math" : "f16 tn");
+                      : coop ? "f16 tn, cooperative matrices" : f16Math ? "f16 tn, f16 math" : "f16 tn");
     const int variant = (tc == 1 ? 1 : 0) | (f16Math ? 2 : 0);
     // The rest: 128 x 128 tiles once both dimensions fill one, compiled for the operands' layout:
     // contiguous along k or not, the types, and 16-byte loads where every row start is 16-byte
@@ -333,6 +358,28 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
         config = (alongKA ? 1u : 0u) | (alongKB ? 2u : 0u) | ta << 2 | tb << 4 |
                  (vec(g.a, g.strideA, g.lda, ta, alongKA ? g.k : g.m) ? 64u : 0u) |
                  (vec(g.b, g.strideB, g.ldb, tb, alongKB ? g.k : g.n) ? 128u : 0u);
+    }
+    if (coop) {
+        CUfunction& fn = h->gemmCoop[tc == 1 ? 1 : 0];
+        if (!fn) {
+            const bool s16 = h->coopSize == 16, halfC = tc == 1;
+            const uint32_t* code = s16 ? (halfC ? kGemmCoop16HSpirv : kGemmCoop16Spirv) : (halfC ? kGemmCoop8HSpirv : kGemmCoop8Spirv);
+            const size_t words = (s16 ? (halfC ? sizeof kGemmCoop16HSpirv : sizeof kGemmCoop16Spirv)
+                                      : (halfC ? sizeof kGemmCoop8HSpirv : sizeof kGemmCoop8Spirv)) / 4;
+            if (vulkanizerCreateSpirvFunction(&fn, code, words, "main", sizeof(GemmParams)) != CUDA_SUCCESS)
+                return CUBLAS_STATUS_INTERNAL_ERROR;
+        }
+        const unsigned tile = 4 * unsigned(h->coopSize);  // 2 x 2 subgroups of 2 x 2 matrices
+        const unsigned gx = (unsigned(g.m) + tile - 1) / tile, gy = (unsigned(g.n) + tile - 1) / tile;
+        for (int first = 0; first < g.batch; first += int(kMaxGridZ)) {
+            p.batchOffset = first;
+            size_t size = sizeof p;
+            void* extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, &p, CU_LAUNCH_PARAM_BUFFER_SIZE, &size, CU_LAUNCH_PARAM_END};
+            const unsigned gz = unsigned(std::min<int>(g.batch - first, int(kMaxGridZ)));
+            if (cuLaunchKernel(fn, gx, gy, gz, 4 * unsigned(h->subgroupSize), 1, 1, 0, h->stream, nullptr, extra) != CUDA_SUCCESS)
+                return CUBLAS_STATUS_EXECUTION_FAILED;
+        }
+        return CUBLAS_STATUS_SUCCESS;
     }
     CUfunction* fn = fast ? &h->gemmF16Tn[variant] : tiled ? &h->gemmTiled[config] : &h->gemm;
     if (!*fn) {

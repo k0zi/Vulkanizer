@@ -24,9 +24,12 @@ CUresult CUDAAPI vulkanizerCreateSpirvFunction(CUfunction* function, const uint3
 typedef enum VulkanizerFeature {
     VULKANIZER_FEATURE_FLOAT16_ARITHMETIC = 1,  // shaderFloat16: f16 math in shaders (not just storage)
     VULKANIZER_FEATURE_FLOAT64 = 2,             // shaderFloat64: f64 in shaders
+    // VK_KHR_cooperative_matrix: S of the S x S x S f16 x f16 -> f32 matrices of subgroup scope (16 or 8)
+    VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16 = 3,
+    VULKANIZER_FEATURE_SUBGROUP_SIZE = 4,       // the subgroup size of compute shaders
 } VulkanizerFeature;
 
-// *value = 1 if the current context's device has the feature, else 0.
+// *value = 1 if the current context's device has the feature, else 0 (sizes: the size, 0 if none).
 CUresult CUDAAPI vulkanizerGetFeature(VulkanizerFeature feature, int* value);
 
 #ifdef __cplusplus

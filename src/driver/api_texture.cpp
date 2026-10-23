@@ -1,7 +1,9 @@
 // CUDA arrays, 2D/3D copies, texture and surface objects. Textures are sampled in software
 // (ptx/texture.h): an array is plain device memory, rows of tightly packed texels, and a texture or
 // surface object handle is the device address of a descriptor (common/texture_desc.h) the kernels'
-// texture functions read. Mipmapped arrays and cube maps are not supported.
+// texture functions read. A cube map is a layered array of 6 faces per cube (VK_TEX_CUBE); a
+// mipmapped array is one array per level, and its texture object one descriptor per level, side by
+// side.
 
 #include "driver/driver.h"
 
@@ -10,6 +12,7 @@
 
 #include <cstring>
 #include <map>
+#include <vector>
 
 using namespace vulkanizer;
 using namespace vulkanizer::driver;
@@ -22,6 +25,14 @@ struct CUarray_st {
     size_t texelBytes = 0;
     size_t pitch = 0;  // bytes per row
     size_t slice = 0;  // bytes per depth slice or layer
+    bool ownedByMipmap = false;  // a level of a mipmapped array: destroyed with it
+};
+
+struct CUmipmappedArray_st {
+    static constexpr uint32_t kMagic = 0x504d4d53;  // 'SMMP'
+    uint32_t magic = kMagic;
+    CUDA_ARRAY3D_DESCRIPTOR desc{};  // of level 0
+    std::vector<CUarray> levels;
 };
 
 namespace {
@@ -128,8 +139,9 @@ CUresult describe(const CUDA_RESOURCE_DESC& res, const CUDA_TEXTURE_DESC* tex, V
     case CU_RESOURCE_TYPE_ARRAY: {
         CUarray a = res.res.array.hArray;
         if (!validHandle(a)) return CUDA_ERROR_INVALID_HANDLE;
-        if (a->desc.Flags & CUDA_ARRAY3D_CUBEMAP) return CUDA_ERROR_NOT_SUPPORTED;
-        const bool layered = a->desc.Flags & CUDA_ARRAY3D_LAYERED;
+        const bool cube = a->desc.Flags & CUDA_ARRAY3D_CUBEMAP;
+        const bool layered = cube || (a->desc.Flags & CUDA_ARRAY3D_LAYERED);
+        if (cube) d.flags |= VK_TEX_CUBE;
         d.data = a->data;
         d.pitch = a->pitch;
         d.slice = a->slice;
@@ -173,7 +185,7 @@ CUresult describe(const CUDA_RESOURCE_DESC& res, const CUDA_TEXTURE_DESC* tex, V
         d.texelBytes = uint32_t(texel);
         break;
     }
-    default: return CUDA_ERROR_NOT_SUPPORTED;  // mipmapped arrays
+    default: return CUDA_ERROR_NOT_SUPPORTED;  // mipmapped arrays: describeAll
     }
     if (tex) {
         for (int i = 0; i < 3; ++i) d.address[i] = uint32_t(tex->addressMode[i]);
@@ -181,10 +193,38 @@ CUresult describe(const CUDA_RESOURCE_DESC& res, const CUDA_TEXTURE_DESC* tex, V
         if (tex->flags & CU_TRSF_NORMALIZED_COORDINATES) d.flags |= VK_TEX_NORMALIZED_COORDS;
         if (tex->flags & CU_TRSF_READ_AS_INTEGER) d.flags |= VK_TEX_READ_AS_INTEGER;
         if (tex->flags & CU_TRSF_SRGB) d.flags |= VK_TEX_SRGB;
+        if (tex->mipmapFilterMode == CU_TR_FILTER_MODE_LINEAR) d.flags |= VK_TEX_MIP_LINEAR;
+        d.lodBias = tex->mipmapLevelBias;
+        d.minLod = tex->minMipmapLevelClamp;
+        d.maxLod = tex->maxMipmapLevelClamp;
         std::memcpy(d.border, tex->borderColor, sizeof d.border);
     } else {
         d.address[0] = d.address[1] = d.address[2] = VK_ADDRESS_CLAMP;
     }
+    return CUDA_SUCCESS;
+}
+
+// The descriptors of a resource: one, or one per level of a mipmapped array (level 0 first, with
+// the number of levels).
+CUresult describeAll(const CUDA_RESOURCE_DESC& res, const CUDA_TEXTURE_DESC* tex, std::vector<VkTexDesc>& out) {
+    out.clear();
+    if (res.resType != CU_RESOURCE_TYPE_MIPMAPPED_ARRAY) {
+        out.resize(1);
+        if (CUresult r = describe(res, tex, out[0])) return r;
+        out[0].levels = 1;
+        if (!tex || out[0].maxLod < out[0].minLod) out[0].minLod = out[0].maxLod = 0;
+        return CUDA_SUCCESS;
+    }
+    CUmipmappedArray m = res.res.mipmap.hMipmappedArray;
+    if (!validHandle(m)) return CUDA_ERROR_INVALID_HANDLE;
+    for (CUarray level : m->levels) {
+        CUDA_RESOURCE_DESC one{};
+        one.resType = CU_RESOURCE_TYPE_ARRAY;
+        one.res.array.hArray = level;
+        out.emplace_back();
+        if (CUresult r = describe(one, tex, out.back())) return r;
+    }
+    out[0].levels = uint32_t(out.size());
     return CUDA_SUCCESS;
 }
 
@@ -194,11 +234,11 @@ CUresult createObject(unsigned long long* handle, const CUDA_RESOURCE_DESC* res,
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     if (surface && res->resType != CU_RESOURCE_TYPE_ARRAY) return CUDA_ERROR_INVALID_VALUE;
-    VkTexDesc d;
-    if (CUresult r = describe(*res, surface ? nullptr : tex, d)) return r;
+    std::vector<VkTexDesc> d;
+    if (CUresult r = describeAll(*res, surface ? nullptr : tex, d)) return r;
     CUdeviceptr p;
-    if (CUresult r = cuMemAlloc(&p, sizeof d)) return r;
-    if (CUresult r = cuMemcpyHtoD(p, &d, sizeof d)) {
+    if (CUresult r = cuMemAlloc(&p, d.size() * sizeof(VkTexDesc))) return r;
+    if (CUresult r = cuMemcpyHtoD(p, d.data(), d.size() * sizeof(VkTexDesc))) {
         cuMemFree(p);
         return r;
     }
@@ -233,7 +273,10 @@ CUresult CUDAAPI cuArray3DCreate_v2(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIP
     VULKANIZER_TRACE_API();
     if (!pHandle || !d || !d->Width || !validChannels(d->NumChannels) || !channelBytes(d->Format))
         return CUDA_ERROR_INVALID_VALUE;
-    if (d->Flags & CUDA_ARRAY3D_CUBEMAP) return CUDA_ERROR_NOT_SUPPORTED;
+    // a cube map: square faces, 6 of them (a multiple of 6 when layered)
+    if ((d->Flags & CUDA_ARRAY3D_CUBEMAP) &&
+        (d->Width != d->Height || !d->Depth || d->Depth % 6 || (!(d->Flags & CUDA_ARRAY3D_LAYERED) && d->Depth != 6)))
+        return CUDA_ERROR_INVALID_VALUE;
     if (d->Height == 0 && d->Depth && !(d->Flags & CUDA_ARRAY3D_LAYERED)) return CUDA_ERROR_INVALID_VALUE;
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
@@ -274,11 +317,67 @@ CUresult CUDAAPI cuArrayGetDescriptor_v2(CUDA_ARRAY_DESCRIPTOR* out, CUarray hAr
 
 CUresult CUDAAPI cuArrayDestroy(CUarray hArray) {
     VULKANIZER_TRACE_API();
-    if (!validHandle(hArray)) return CUDA_ERROR_INVALID_HANDLE;
+    if (!validHandle(hArray) || hArray->ownedByMipmap) return CUDA_ERROR_INVALID_HANDLE;
     const CUresult r = cuMemFree(hArray->data);
     Driver::get().unregisterHandle(hArray);
     delete hArray;
     return r;
+}
+
+// Mipmapped arrays: level l is an array of max(1, size >> l) in each dimension (layers and cube faces
+// stay), all levels allocated up front.
+CUresult CUDAAPI cuMipmappedArrayCreate(CUmipmappedArray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* d,
+                                        unsigned int numMipmapLevels) {
+    VULKANIZER_TRACE_API();
+    if (!pHandle || !d || !numMipmapLevels) return CUDA_ERROR_INVALID_VALUE;
+    const bool layered = d->Flags & (CUDA_ARRAY3D_LAYERED | CUDA_ARRAY3D_CUBEMAP);
+    size_t largest = std::max<size_t>(d->Width, d->Height);
+    if (!layered) largest = std::max<size_t>(largest, d->Depth);
+    unsigned maxLevels = 1;
+    while ((largest >> maxLevels) > 0) ++maxLevels;
+    if (numMipmapLevels > maxLevels) return CUDA_ERROR_INVALID_VALUE;
+    auto* m = new CUmipmappedArray_st();
+    m->desc = *d;
+    for (unsigned l = 0; l < numMipmapLevels; ++l) {
+        CUDA_ARRAY3D_DESCRIPTOR ld = *d;
+        auto shrink = [&](size_t v) { return v ? std::max<size_t>(v >> l, 1) : 0; };
+        ld.Width = shrink(d->Width);
+        ld.Height = shrink(d->Height);
+        if (!layered) ld.Depth = shrink(d->Depth);
+        CUarray a = nullptr;
+        if (CUresult r = cuArray3DCreate_v2(&a, &ld)) {
+            for (CUarray made : m->levels) made->ownedByMipmap = false, cuArrayDestroy(made);
+            delete m;
+            return r;
+        }
+        a->ownedByMipmap = true;
+        m->levels.push_back(a);
+    }
+    Driver::get().registerHandle(m);
+    *pHandle = m;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuMipmappedArrayGetLevel(CUarray* pLevelArray, CUmipmappedArray hMipmappedArray, unsigned int level) {
+    VULKANIZER_TRACE_API();
+    if (!pLevelArray) return CUDA_ERROR_INVALID_VALUE;
+    if (!validHandle(hMipmappedArray)) return CUDA_ERROR_INVALID_HANDLE;
+    if (level >= hMipmappedArray->levels.size()) return CUDA_ERROR_INVALID_VALUE;
+    *pLevelArray = hMipmappedArray->levels[level];
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuMipmappedArrayDestroy(CUmipmappedArray hMipmappedArray) {
+    VULKANIZER_TRACE_API();
+    if (!validHandle(hMipmappedArray)) return CUDA_ERROR_INVALID_HANDLE;
+    CUresult result = CUDA_SUCCESS;
+    for (CUarray a : hMipmappedArray->levels) {
+        a->ownedByMipmap = false;
+        if (CUresult r = cuArrayDestroy(a)) result = r;
+    }
+    Driver::get().unregisterHandle(hMipmappedArray);
+    delete hMipmappedArray;
+    return result;
 }
 
 CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D* pCopy) {

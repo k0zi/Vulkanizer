@@ -6,7 +6,9 @@
 // transforms it along each axis with Stockham passes of radix 4, 2, 3, 5, 7, 11 and 13 (lengths with
 // a larger prime factor go through Bluestein's algorithm, with power-of-two FFTs), and scatters the
 // result to the output. Lengths up to 2048 (f64: 1024) take all their passes in one dispatch, in
-// shared memory, several lines per workgroup; longer ones one dispatch per pass. Real transforms are done as complex ones of the full length. The tables
+// shared memory, several lines per workgroup; longer ones that split into two such factors N1 N2
+// (up to 2048^2, f64: 1024^2) take two (the four-step FFT: N1-long FFTs at stride N2, then N2-long
+// ones twiddled and stored transposed), and the rest one dispatch per pass. Real transforms are done as complex ones of the full length. The tables
 // (roots of unity, Bluestein's chirp and filter) are computed on the host in f64 when the plan is made.
 
 #include <cufft/cufft.h>
@@ -77,6 +79,7 @@ constexpr uint32_t kF32 = 0, kF64 = 1, kF16 = 2;
 constexpr uint32_t kModeShift = 2, kC2C = 0, kR2C = 1, kC2R = 2;
 constexpr uint32_t kInverse = 16;
 constexpr uint32_t kStepShift = 5, kPre = 0, kMultiply = 1, kPost = 2;
+constexpr uint32_t kFourStep = 128;
 constexpr int kRadices[] = {4, 2, 3, 5, 7, 11, 13};  // in the order passes take them
 
 enum Kernel { Gather, Pass, Local, Bluestein, Scatter, KernelCount };
@@ -150,6 +153,11 @@ void hostFft(std::vector<Complex>& a) {
     }
 }
 
+// Longest transform fft_local.comp does in shared memory (two buffers of 16 KiB).
+int localLimit(bool f64) { return f64 ? 1024 : 2048; }
+
+std::vector<Complex> roots(int64_t n);
+
 std::vector<Complex> roots(int64_t n) {
     std::vector<Complex> t(static_cast<size_t>(n));
     for (int64_t m = 0; m < n; ++m) t[size_t(m)] = std::polar(1.0, -2 * M_PI * double(m) / double(n));
@@ -164,7 +172,33 @@ struct Axis {
     int m = 0;                     // Bluestein: the power-of-two length
     size_t rootsOffset = 0;        // into the plan's table buffer, in complex elements: roots of n (or m)
     size_t chirpOffset = 0, filterOffset = 0;  // Bluestein: chirp (n), filter (2m: forward, inverse)
+    // The four-step split of the transformed length (n, or m) when it is too long for one
+    // shared-memory dispatch: n1 x n2 (0: none), their radices and roots.
+    int n1 = 0, n2 = 0;
+    std::vector<int> radices1, radices2;
+    size_t roots1Offset = 0, roots2Offset = 0;
 };
+
+// The four-step split of `len` (radices known to factor it) for an axis: n2 as large as possible
+// with both factors within the local limit; the factors' roots are appended to the table.
+void splitFourStep(Axis& a, int len, bool f64, std::vector<Complex>& table) {
+    const int limit = localLimit(f64);
+    if (len <= limit || int64_t(limit) * limit < len) return;
+    for (int n2 = limit; n2 >= 2; --n2) {
+        if (len % n2 || len / n2 > limit) continue;
+        a.n1 = len / n2;
+        a.n2 = n2;
+        factor(a.n1, a.radices1);
+        factor(a.n2, a.radices2);
+        a.roots1Offset = table.size();
+        const auto r1 = roots(a.n1);
+        table.insert(table.end(), r1.begin(), r1.end());
+        a.roots2Offset = table.size();
+        const auto r2 = roots(a.n2);
+        table.insert(table.end(), r2.begin(), r2.end());
+        return;
+    }
+}
 
 struct Layout {
     int64_t dist = 0;
@@ -272,6 +306,7 @@ cufftResult makePlan(Plan& plan, int rank, const long long* n, const long long* 
             a.rootsOffset = table.size();
             const auto r = roots(a.n);
             table.insert(table.end(), r.begin(), r.end());
+            splitFourStep(a, a.n, f64, table);
             continue;
         }
         a.m = 1;
@@ -280,6 +315,7 @@ cufftResult makePlan(Plan& plan, int rank, const long long* n, const long long* 
         a.rootsOffset = table.size();
         const auto r = roots(a.m);
         table.insert(table.end(), r.begin(), r.end());
+        splitFourStep(a, a.m, f64, table);
         a.chirpOffset = table.size();
         std::vector<Complex> chirp(size_t(a.n));
         for (int64_t k = 0; k < a.n; ++k)  // exp(-pi i k^2 / n), k^2 reduced mod 2n for accuracy
@@ -326,17 +362,39 @@ cufftResult makePlan(Plan& plan, int rank, const long long* n, const long long* 
     return CUFFT_SUCCESS;
 }
 
-// Longest transform fft_local.comp does in shared memory (two buffers of 16 KiB).
-int localLimit(bool f64) { return f64 ? 1024 : 2048; }
 
-// Stockham passes of one axis: all in shared memory if the length allows (in place on *cur), else
-// one dispatch each, ping-ponging between *cur and *other (swapped as they go).
 CUresult passes(const Plan& plan, Params p, const std::vector<int>& radices, int len, int inner, int64_t elements,
-                CUdeviceptr& cur, CUdeviceptr& other, bool inverse) {
+                CUdeviceptr& cur, CUdeviceptr& other, bool inverse, CUdeviceptr into = 0);
+
+// The transform of one axis of length len (the axis's n, or its Bluestein length m; p.table: the
+// roots' offset): four-step where the axis has a split (the result in *other, then swapped),
+// otherwise passes().
+CUresult transformAxis(const Plan& plan, const Axis& a, Params p, int len, int inner, int64_t elements,
+                       CUdeviceptr& cur, CUdeviceptr& other, bool inverse) {
+    if (!a.n1) return passes(plan, p, a.radices, len, inner, elements, cur, other, inverse);
+    const size_t complexBytes = plan.f64 ? 16 : 8;
+    Params q = p;
+    q.table = a.roots1Offset * complexBytes;  // N1-long FFTs along the matrix's columns
+    if (CUresult r = passes(plan, q, a.radices1, a.n1, a.n2 * inner, elements, cur, other, inverse)) return r;
+    q = p;
+    q.table = a.roots2Offset * complexBytes;  // twiddled N2-long FFTs along its rows, stored transposed
+    q.aux = plan.tables + CUdeviceptr(p.table);
+    q.stride[0] = a.n1;
+    q.stride[1] = len;
+    q.flags = kFourStep;
+    if (CUresult r = passes(plan, q, a.radices2, a.n2, inner, elements, cur, other, inverse, other)) return r;
+    std::swap(cur, other);
+    return CUDA_SUCCESS;
+}
+
+// Stockham passes of one axis: all in shared memory if the length allows (in place on *cur, or into
+// `into`), else one dispatch each, ping-ponging between *cur and *other (swapped as they go).
+CUresult passes(const Plan& plan, Params p, const std::vector<int>& radices, int len, int inner, int64_t elements,
+                CUdeviceptr& cur, CUdeviceptr& other, bool inverse, CUdeviceptr into) {
     p.table = plan.tables + CUdeviceptr(p.table);
     p.len = len;
     p.inner = inner;
-    p.flags = inverse ? kInverse : 0;
+    p.flags = (inverse ? kInverse : 0) | (p.flags & kFourStep);
     if (len <= localLimit(plan.f64) && radices.size() <= 16) {
         uint64_t packed = 0;
         for (size_t i = 0; i < radices.size(); ++i) packed |= uint64_t(radices[i]) << (4 * i);
@@ -346,7 +404,8 @@ CUresult passes(const Plan& plan, Params p, const std::vector<int>& radices, int
         while (group < 64 && 2 * group * len <= localLimit(plan.f64) && (inner == 1 || inner % (2 * group) == 0))
             group *= 2;
         p.dist = int64_t(packed);
-        p.src = p.dst = cur;
+        p.src = cur;
+        p.dst = into ? into : cur;
         p.radix = group;
         p.span = int(std::min<int64_t>(lines, INT32_MAX));
         p.items = (lines + group - 1) / group;
@@ -407,7 +466,7 @@ cufftResult exec(Plan* plan, const void* input, void* output, int direction) {
         Params q{};
         q.table = a.rootsOffset * complexBytes;
         if (!a.bluestein) {
-            if (passes(*plan, q, a.radices, a.n, inner, plan->total, cur, other, inverse)) return CUFFT_EXEC_FAILED;
+            if (transformAxis(*plan, a, q, a.n, inner, plan->total, cur, other, inverse)) return CUFFT_EXEC_FAILED;
             continue;
         }
         const int64_t lines = plan->total / a.n, elements = lines * a.m;
@@ -424,11 +483,11 @@ cufftResult exec(Plan* plan, const void* input, void* output, int direction) {
         b.flags = dir | kPre << kStepShift;
         if (launch(stream, Bluestein, plan->f64, b)) return CUFFT_EXEC_FAILED;
         CUdeviceptr bcur = blue0, bother = blue0 + elements * complexBytes;
-        if (passes(*plan, q, a.radices, a.m, 1, elements, bcur, bother, false)) return CUFFT_EXEC_FAILED;
+        if (transformAxis(*plan, a, q, a.m, 1, elements, bcur, bother, false)) return CUFFT_EXEC_FAILED;
         b.src = b.dst = bcur;
         b.flags = dir | kMultiply << kStepShift;
         if (launch(stream, Bluestein, plan->f64, b)) return CUFFT_EXEC_FAILED;
-        if (passes(*plan, q, a.radices, a.m, 1, elements, bcur, bother, true)) return CUFFT_EXEC_FAILED;
+        if (transformAxis(*plan, a, q, a.m, 1, elements, bcur, bother, true)) return CUFFT_EXEC_FAILED;
         b.src = bcur;
         b.dst = cur;
         b.items = plan->total;

@@ -1,0 +1,148 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// gemm_f16_tn.comp on cooperative matrices (VK_KHR_cooperative_matrix: the GPU's matrix units where
+// it has them): C = alpha * A^T * B + beta * C with f16 A and B, both contiguous along k (lda, ldb
+// multiples of 8, 16-byte aligned), f32 accumulation, C in f16 (C_F16 defined) or f32.
+// S x S x S matrices (S = 16, or 8 on llvmpipe). A workgroup is 4 subgroups side by side in 2 x 2,
+// each computing 2 x 2 output matrices: tiles of 4S x 4S, k in steps of 2S through shared memory.
+// Compiled for Vulkan 1.2 (SPIR-V 1.5), so the subgroup size is the device's: the launch's
+// 4 * subgroup size threads are exactly 4 subgroups.
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U16x8 { uvec4 v; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
+
+// The device's address bits 63..47 (vk::Device::addressHighBits), specialization constant 5.
+layout(constant_id = 5) const uint kAddressHigh = 0xFFFF8000u;
+uint64_t canon(uint64_t a) {  // on the high word alone
+    uvec2 w = unpackUint2x32(a);
+    w.y |= kAddressHigh;
+    return packUint2x32(w);
+}
+
+layout(push_constant, std430) uniform Params {
+    uint64_t a, b, c;
+    int64_t strideA, strideB, strideC;  // elements between batch entries
+    int m, n, k;
+    int lda, ldb, ldc;
+    float alpha, beta;
+    uint flags;                         // unused here, layout shared with gemm.comp
+    int batchOffset;
+} p;
+
+const int BM = 4 * S, BN = 4 * S, BK = 2 * S;
+const int LD = BK + 8;  // row pitch in halves: a multiple of 16 bytes, rows on different banks
+shared float16_t As[BM * LD];  // row i of A^T, along k
+shared float16_t Bs[BN * LD];  // column j of B, along k
+shared float Cs[BM * BN];      // the result tile, column major
+
+float loadHalf(uint64_t base, int64_t index) { return unpackHalf2x16(uint(U16(canon(base + uint64_t(index) * 2ul)).v)).x; }
+
+// 8 raw halves along k (2 per uint) of row `row` (of A^T or B^T), zero outside the matrix.
+uvec4 loadRaw8(uint64_t base, int ld, int row, int rows, int k) {
+    if (row < rows && k + 8 <= p.k) return U16x8(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k)) * 2ul)).v;
+    uint h[8];
+    for (int q = 0; q < 8; ++q)
+        h[q] = row < rows && k + q < p.k ? uint(U16(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k + q)) * 2ul)).v) : 0u;
+    return uvec4(h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16, h[6] | h[7] << 16);
+}
+
+uint toHalfBits(float f) {  // round to nearest even (packHalf2x16 rounding is implementation-defined)
+    const uint u = floatBitsToUint(f), sign = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+    if (a > 0x7F800000u) return sign | 0x7E00u;
+    if (a >= 0x477FF000u) return sign | 0x7C00u;
+    uint h;
+    if (a < 0x38800000u) {
+        const uint e = a >> 23;
+        if (e < 102u) return sign;
+        const uint mant = (a & 0x7FFFFFu) | 0x800000u, s = 126u - e;
+        h = mant >> s;
+        const uint rem = mant & ((1u << s) - 1u), half_ = 1u << (s - 1u);
+        if (rem > half_ || (rem == half_ && (h & 1u) != 0u)) ++h;
+    } else {
+        const uint x = a - (112u << 23);
+        h = x >> 13;
+        const uint rem = x & 0x1FFFu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;
+    }
+    return sign | h;
+}
+
+uint64_t batchBase(uint64_t base, int64_t stride, int batch, uint64_t size) {
+    return base + uint64_t(stride * batch) * size;
+}
+
+void store(uint64_t C, int gm, int gn, float acc) {
+    if (gm >= p.m || gn >= p.n) return;
+    const int64_t idx = int64_t(gm) + int64_t(gn) * p.ldc;
+    float v = p.alpha * acc;
+#ifdef C_F16
+    if (p.beta != 0.0) v += p.beta * loadHalf(C, idx);
+    U16(canon(C + uint64_t(idx) * 2ul)).v = uint16_t(toHalfBits(v));
+#else
+    if (p.beta != 0.0) v += p.beta * F32(canon(C + uint64_t(idx) * 4ul)).v;
+    F32(canon(C + uint64_t(idx) * 4ul)).v = v;
+#endif
+}
+
+void main() {
+    const int batch = int(gl_WorkGroupID.z) + p.batchOffset;
+    const uint64_t A = batchBase(p.a, p.strideA, batch, 2ul), B = batchBase(p.b, p.strideB, batch, 2ul);
+#ifdef C_F16
+    const uint64_t C = batchBase(p.c, p.strideC, batch, 2ul);
+#else
+    const uint64_t C = batchBase(p.c, p.strideC, batch, 4ul);
+#endif
+    const int tileM = int(gl_WorkGroupID.x) * BM, tileN = int(gl_WorkGroupID.y) * BN;
+    const int tid = int(gl_LocalInvocationIndex);
+    const int threads = int(gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z);
+    // this subgroup's 2S x 2S part of the tile
+    const int sm = int(gl_SubgroupID & 1u) * 2 * S, sn = int(gl_SubgroupID >> 1) * 2 * S;
+
+    coopmat<float, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator> acc[2][2];
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) acc[i][j] = coopmat<float, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator>(0.0);
+
+    for (int k0 = 0; k0 < p.k; k0 += BK) {
+        for (int idx = tid; idx < BM * BK / 8; idx += threads) {  // 8 halves per load
+            const int row = idx / (BK / 8), k = idx % (BK / 8) * 8;
+            const uvec4 wa = loadRaw8(A, p.lda, tileM + row, p.m, k0 + k);
+            const uvec4 wb = loadRaw8(B, p.ldb, tileN + row, p.n, k0 + k);
+            for (int q = 0; q < 4; ++q) {
+                const f16vec2 ha = unpackFloat2x16(wa[q]), hb = unpackFloat2x16(wb[q]);
+                As[row * LD + k + 2 * q] = ha.x;
+                As[row * LD + k + 2 * q + 1] = ha.y;
+                Bs[row * LD + k + 2 * q] = hb.x;
+                Bs[row * LD + k + 2 * q + 1] = hb.y;
+            }
+        }
+        barrier();
+        for (int kk = 0; kk < BK; kk += S) {
+            coopmat<float16_t, gl_ScopeSubgroup, S, S, gl_MatrixUseA> a[2];
+            coopmat<float16_t, gl_ScopeSubgroup, S, S, gl_MatrixUseB> b[2];
+            for (int i = 0; i < 2; ++i)
+                coopMatLoad(a[i], As, (sm + i * S) * LD + kk, LD, gl_CooperativeMatrixLayoutRowMajor);
+            for (int j = 0; j < 2; ++j)  // B (k x n) column j is a row of Bs
+                coopMatLoad(b[j], Bs, (sn + j * S) * LD + kk, LD, gl_CooperativeMatrixLayoutColumnMajor);
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < 2; ++j) acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            coopMatStore(acc[i][j], Cs, (sm + i * S) + (sn + j * S) * BM, BM, gl_CooperativeMatrixLayoutColumnMajor);
+    barrier();
+    for (int idx = tid; idx < BM * BN; idx += threads) store(C, tileM + idx % BM, tileN + idx / BM, Cs[idx]);
+}

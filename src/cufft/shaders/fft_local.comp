@@ -7,6 +7,10 @@
 // in contiguous runs), runs all the Stockham passes of radix.glsl on them (the radices packed
 // 4 bits each into `dist`, first pass lowest), ping-ponging between two shared buffers, and
 // stores them back (dst may be src). Line l of the axis is lines `count` = span in total.
+// kFourStep: the second step of a four-step FFT of length N = N1 N2 (stride[0] = N1, stride[1] = N,
+// aux: the roots of N), on lines of length N2: line l is row k1 = (l / inner) % N1 of the N1 x N2
+// matrix; element e is twiddled by w_N^(e k1) on load and stored transposed, at k1 + N1 e of the
+// N-long line (dst must not be src). The first step is a plain pass of length N1 at stride N2 inner.
 
 #ifdef DOUBLE
 const int kLocal = 1024;
@@ -30,7 +34,13 @@ void main() {
         const int sub = p.inner == 1 ? t / len : t % L, e = p.inner == 1 ? t % len : t / L;
         const int line = first + sub;
         if (line >= p.span) continue;
-        buffers[0][e * L + sub] = at(p.src, (line / p.inner) * len * p.inner + line % p.inner + e * p.inner).v;
+        cplx x = at(p.src, (line / p.inner) * len * p.inner + line % p.inner + e * p.inner).v;
+        if ((p.flags & kFourStep) != 0u) {
+            const int k1 = (line / p.inner) % int(p.stride[0]);
+            const cplx w = at(p.aux, (e * k1) % int(p.stride[1])).v;
+            x = cmul(x, inverse() ? conjugate(w) : w);
+        }
+        buffers[0][e * L + sub] = x;
     }
     barrier();
     g_in = 0;
@@ -51,6 +61,11 @@ void main() {
         const int sub = p.inner == 1 ? t / len : t % L, e = p.inner == 1 ? t % len : t / L;
         const int line = first + sub;
         if (line >= p.span) continue;
-        at(p.dst, (line / p.inner) * len * p.inner + line % p.inner + e * p.inner).v = buffers[g_in][e * L + sub];
+        int to = (line / p.inner) * len * p.inner + line % p.inner + e * p.inner;
+        if ((p.flags & kFourStep) != 0u) {
+            const int n1 = int(p.stride[0]), row = line / p.inner;
+            to = (row / n1) * int(p.stride[1]) * p.inner + (row % n1 + n1 * e) * p.inner + line % p.inner;
+        }
+        at(p.dst, to).v = buffers[g_in][e * L + sub];
     }
 }

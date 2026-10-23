@@ -1128,13 +1128,12 @@ private:
         const bool cta = ins.has(".cta");
 
         withSpace(a.space, address(ins, ins.operands[first], a.space), [&](Space sp, uint32_t at) {
-            if (sp == Space::Local && t.width == 64) fail(ins, "64-bit atomics on local memory are not supported");
             uint32_t ptr;
             if (sp == Space::Local) {
-                ptr = wordPointer(sp, wordIndex(at));
+                // the thread's own memory: a plain read-modify-write is atomic
                 auto asBits = [&](uint32_t v) { return t.isFloat() ? b_.op(spv::OpBitcast, itype, {v}) : v; };
-                const uint32_t bv = asBits(b), ft = tFloat(32);
-                const uint32_t old = rmwWord(sp, ptr, itype, spv::ScopeInvocation, [&](uint32_t cur) {
+                const uint32_t bv = asBits(b), ft = tFloat(t.width);
+                auto update = [&](uint32_t cur) {
                     if (t.isFloat()) {
                         const uint32_t f = b_.op(spv::OpBitcast, ft, {cur});
                         uint32_t r = b;
@@ -1161,7 +1160,19 @@ private:
                     const uint32_t wrap = b_.op(spv::OpLogicalOr, tBool(), {b_.op(spv::OpIEqual, tBool(), {cur, zero}),
                                                                          b_.op(spv::OpUGreaterThan, tBool(), {cur, bv})});
                     return b_.op(spv::OpSelect, itype, {wrap, bv, b_.op(spv::OpISub, itype, {cur, one})});
-                });
+                };
+                uint32_t old;
+                if (t.width == 64) {  // two words
+                    const uint32_t index = wordIndex(at), v2 = b_.typeVector(tU32(), 2);
+                    const uint32_t p0 = wordPointer(sp, index), p1 = wordPointer(sp, b_.op(spv::OpIAdd, tU32(), {index, cU32(1)}));
+                    old = b_.op(spv::OpBitcast, itype, {b_.op(spv::OpCompositeConstruct, v2,
+                                                              {b_.op(spv::OpLoad, tU32(), {p0}), b_.op(spv::OpLoad, tU32(), {p1})})});
+                    const uint32_t words = b_.op(spv::OpBitcast, v2, {update(old)});
+                    b_.opVoid(spv::OpStore, {p0, b_.op(spv::OpCompositeExtract, tU32(), {words, 0})});
+                    b_.opVoid(spv::OpStore, {p1, b_.op(spv::OpCompositeExtract, tU32(), {words, 1})});
+                } else {
+                    old = rmwWord(sp, wordPointer(sp, wordIndex(at)), itype, spv::ScopeInvocation, update);
+                }
                 if (!isRed)
                     storeReg(ins, dstReg(ins).name, t, t.isFloat() ? b_.op(spv::OpBitcast, ft, {old}) : old);
                 return;

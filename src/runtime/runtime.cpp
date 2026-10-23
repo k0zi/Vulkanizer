@@ -429,6 +429,15 @@ cudaError_t CUDARTAPI cudaDeviceSetCacheConfig(int cacheConfig) {
     ENTER();
     return cudaSuccess;
 }
+// cudaLimit has CUlimit's values.
+cudaError_t CUDARTAPI cudaDeviceSetLimit(int limit, size_t value) {
+    ENTER();
+    return record(cuCtxSetLimit(CUlimit(limit), value));
+}
+cudaError_t CUDARTAPI cudaDeviceGetLimit(size_t* pValue, int limit) {
+    ENTER();
+    return record(cuCtxGetLimit(pValue, CUlimit(limit)));
+}
 
 // ---- errors -----------------------------------------------------------------------------------
 
@@ -1638,7 +1647,11 @@ cudaError_t driverResource(const cudaResourceDesc* r, CUDA_RESOURCE_DESC& out) {
         out.res.pitch2D = {reinterpret_cast<CUdeviceptr>(r->res.pitch2D.devPtr), format, channels, r->res.pitch2D.width,
                            r->res.pitch2D.height, r->res.pitch2D.pitchInBytes};
         return cudaSuccess;
-    default: return cudaErrorNotSupported;  // mipmapped arrays
+    case cudaResourceTypeMipmappedArray:
+        out.resType = CU_RESOURCE_TYPE_MIPMAPPED_ARRAY;
+        out.res.mipmap.hMipmappedArray = r->res.mipmap.mipmap;
+        return cudaSuccess;
+    default: return cudaErrorInvalidValue;
     }
 }
 
@@ -1688,6 +1701,26 @@ cudaError_t CUDARTAPI cudaMalloc3DArray(cudaArray_t* array, const cudaChannelFor
 cudaError_t CUDARTAPI cudaMallocArray(cudaArray_t* array, const cudaChannelFormatDesc* desc, size_t width,
                                       size_t height, unsigned int flags) {
     return cudaMalloc3DArray(array, desc, cudaExtent{width, height, 0}, flags);
+}
+
+cudaError_t CUDARTAPI cudaMallocMipmappedArray(cudaMipmappedArray_t* mipmappedArray, const cudaChannelFormatDesc* desc,
+                                               cudaExtent extent, unsigned int numLevels, unsigned int flags) {
+    ENTER();
+    if (!mipmappedArray || !desc) return record(cudaErrorInvalidValue);
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (!driverFormat(*desc, d.Format, d.NumChannels)) return record(cudaErrorInvalidChannelDescriptor);
+    d.Width = extent.width, d.Height = extent.height, d.Depth = extent.depth;
+    d.Flags = flags;
+    return record(cuMipmappedArrayCreate(mipmappedArray, &d, numLevels));
+}
+cudaError_t CUDARTAPI cudaGetMipmappedArrayLevel(cudaArray_t* levelArray, cudaMipmappedArray_t mipmappedArray,
+                                                 unsigned int level) {
+    ENTER();
+    return record(cuMipmappedArrayGetLevel(levelArray, mipmappedArray, level));
+}
+cudaError_t CUDARTAPI cudaFreeMipmappedArray(cudaMipmappedArray_t mipmappedArray) {
+    ENTER();
+    return record(cuMipmappedArrayDestroy(mipmappedArray));
 }
 
 cudaError_t CUDARTAPI cudaFreeArray(cudaArray_t array) {
@@ -1879,6 +1912,10 @@ cudaError_t CUDARTAPI cudaCreateTextureObject(cudaTextureObject_t* texObject, co
     if (texDesc->readMode == cudaReadModeElementType) t.flags |= CU_TRSF_READ_AS_INTEGER;
     if (texDesc->normalizedCoords) t.flags |= CU_TRSF_NORMALIZED_COORDINATES;
     if (texDesc->sRGB) t.flags |= CU_TRSF_SRGB;
+    t.mipmapFilterMode = CUfilter_mode(texDesc->mipmapFilterMode);
+    t.mipmapLevelBias = texDesc->mipmapLevelBias;
+    t.minMipmapLevelClamp = texDesc->minMipmapLevelClamp;
+    t.maxMipmapLevelClamp = texDesc->maxMipmapLevelClamp;
     std::memcpy(t.borderColor, texDesc->borderColor, sizeof t.borderColor);
     return record(cuTexObjectCreate(texObject, &r, &t, nullptr));
 }

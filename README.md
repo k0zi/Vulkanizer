@@ -260,8 +260,12 @@ Full list: [plan.md, section 4](plan.md).
   `torch.compile(mode="reduce-overhead")`); child graphs and memory nodes (stream-ordered allocation during
   capture) too, and conditional nodes (if, while, switch; the host waits for the GPU at each of them).
 - Not (yet) supported: cuDNN.
+- Device code: no recursion. Indirect calls (virtual functions, function pointers) compare the target with every
+  function of the module of that shape, and only reach functions of the same module. `malloc`/`free` work on a heap
+  of `cudaLimitMallocHeapSize` (default 8 MiB), which needs 64-bit atomics.
 - Textures and surfaces (texture and surface objects, CUDA arrays) are sampled in software, with CUDA's addressing
-  and filtering; no mipmaps, cube maps, texture references or formatted surface stores.
+  and filtering, mipmaps (level of detail and gradients) and cube maps (filtered within a face, not across its
+  edges). No texture references (removed in CUDA 12) or formatted surface stores (`sust.p`, which CUDA C does not emit).
 - CUDA IPC (`cudaIpc*`, PyTorch's `torch.multiprocessing`) works between processes of the same user; an interprocess
   event is complete once recorded (recording it waits for the device).
 - NCCL (`libnccl.so.2`, PyTorch's `torch.distributed` "nccl" backend: DDP, FSDP) works between the ranks of one
@@ -272,14 +276,19 @@ Full list: [plan.md, section 4](plan.md).
   once.
 - Managed, pinned and registered memory are host memory the GPU uses in place at the same address; managed memory
   never migrates to the GPU (on an integrated GPU it is the same memory anyway).
-- While registered host memory (`cuMemHostRegister`) exists, every GPU submission is slower (the kernel revalidates
-  the imported pages, ~4 ms per 256 MB); pinned and managed memory are not affected.
+- Registered host memory (`cuMemHostRegister`) that is a mapping of its own (`mmap`) at an address the GPU can place
+  memory at (RADV: 64 KiB aligned, from 2 MiB on 2 MiB aligned) is replaced by GPU-visible memory with the same
+  contents: registering and unregistering copy it, and after `fork()` the child shares those pages instead of copying
+  them. Other registered memory is imported, and while it exists every GPU submission is slower (the kernel
+  revalidates the imported pages, ~4 ms per 256 MB). Pinned and managed memory are not affected.
 - llama.cpp flash attention runs correctly (`tools/build_llama.sh --fa`), but without tensor cores prompt
   processing is slower with it, so it is off by default.
 - PyTorch: no cuDNN or fused attention kernels.
 - cuSOLVER: real types (f32, f64) only, no `gesvda`, LDL^T (`sytrf`) or non-symmetric eigenproblems (`geev`); `eigh`
-  and SVD use Jacobi iterations, slow for large matrices (n ≳ 1000). cuFFT: no callbacks or multi-GPU plans;
-  transforms longer than 2048 (f64: 1024) take one pass over memory per radix. cuSPARSE: no block sparse (BSR) or
+  of one matrix tridiagonalizes it (Householder) and solves on the host (QL); batched `eigh` and SVD use Jacobi
+  iterations, the SVD is slow for large matrices (n ≳ 1000). cuFFT: no callbacks or multi-GPU plans; transforms longer
+  than 2048 (f64: 1024) take two passes over memory where their length splits into two factors within that limit,
+  otherwise one per radix. cuSPARSE: no block sparse (BSR) or
   complex values; SpGEMM and the sorting routines run on the host.
 - cuRAND: XORWOW, MRG32k3a, Philox and Sobol give NVIDIA's sequences (normals and log-normals equal to rounding);
   MTGP32 and MT19937 are accepted but give other sequences, as do scrambled Sobol and Poisson; double outputs need
@@ -321,7 +330,7 @@ src/compiler          CFG + structurization, SPIR-V builder, PTX -> SPIR-V compi
 src/driver            the libcuda.so API surface
 src/runtime           libcudart.so.12 and .so.13 (CUDA Runtime API built on the Driver API, one source)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM with GLSL kernels), include/cublas/cublas_v2.h
-src/linalg            dense factorizations (LU, Cholesky, QR, Jacobi eigh/SVD) in GLSL, shared by cuBLAS and cuSOLVER
+src/linalg            dense factorizations (LU, Cholesky, QR, eigh, Jacobi SVD) in GLSL, shared by cuBLAS and cuSOLVER
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham and Bluestein FFTs in GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 in GLSL), include/cusparse/cusparse.h

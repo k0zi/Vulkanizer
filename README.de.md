@@ -265,8 +265,13 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
   (stream-geordnete Allokation während der Aufzeichnung) und bedingte Knoten (if, while, switch; an jedem wartet
   der Host auf die GPU).
 - (Noch) nicht unterstützt: cuDNN.
+- Gerätecode: keine Rekursion. Indirekte Aufrufe (virtuelle Funktionen, Funktionszeiger) vergleichen das Ziel mit
+  jeder Funktion des Moduls dieser Form und erreichen nur Funktionen desselben Moduls. `malloc`/`free` arbeiten auf
+  einem Heap von `cudaLimitMallocHeapSize` (Standard 8 MiB), der 64-Bit-Atomics braucht.
 - Texturen und Surfaces (Texture- und Surface-Objekte, CUDA-Arrays) werden in Software abgetastet, mit der Adressierung
-  und Filterung von CUDA; keine Mipmaps, Cubemaps, Texture-Referenzen oder formatierten Surface-Schreibzugriffe.
+  und Filterung von CUDA, Mipmaps (Level of Detail und Gradienten) und Cubemaps (innerhalb einer Fläche gefiltert,
+  nicht über ihre Kanten). Keine Texture-Referenzen (in CUDA 12 entfernt) und keine formatierten Surface-Schreibzugriffe
+  (`sust.p`, das CUDA C nicht erzeugt).
 - CUDA-IPC (`cudaIpc*`, `torch.multiprocessing` von PyTorch) funktioniert zwischen Prozessen desselben Benutzers; ein
   Interprozess-Event ist fertig, sobald es aufgezeichnet ist (das Aufzeichnen wartet auf das Gerät).
 - NCCL (`libnccl.so.2`, das „nccl“-Backend von `torch.distributed`: DDP, FSDP) funktioniert zwischen den Rängen eines
@@ -277,14 +282,20 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
   Anzahl Blöcke, die gleichzeitig auf die GPU passen.
 - Managed-, Pinned- und registrierter Speicher sind Host-Speicher, den die GPU direkt unter derselben Adresse nutzt;
   Managed-Speicher wird nie auf die GPU migriert (auf einer integrierten GPU ist es ohnehin derselbe Speicher).
-- Solange registrierter Host-Speicher (`cuMemHostRegister`) existiert, ist jede GPU-Übermittlung langsamer (der Kernel
-  prüft die importierten Seiten erneut, ~4 ms pro 256 MB); Pinned- und Managed-Speicher sind nicht betroffen.
+- Registrierter Host-Speicher (`cuMemHostRegister`), der ein eigenes Mapping (`mmap`) an einer Adresse ist, an die die
+  GPU Speicher legen kann (RADV: 64 KiB ausgerichtet, ab 2 MiB auf 2 MiB), wird durch GPU-sichtbaren Speicher mit
+  demselben Inhalt ersetzt: Registrieren und Deregistrieren kopieren ihn, und nach `fork()` teilt das Kind diese Seiten,
+  statt sie zu kopieren. Anderer registrierter Speicher wird importiert; solange er existiert, ist jede
+  GPU-Übermittlung langsamer (der Kernel prüft die importierten Seiten erneut, ~4 ms pro 256 MB). Pinned- und
+  Managed-Speicher sind nicht betroffen.
 - Flash Attention in llama.cpp läuft korrekt (`tools/build_llama.sh --fa`), aber ohne Tensor Cores ist die
   Prompt-Verarbeitung damit langsamer, daher ist sie standardmäßig aus.
 - PyTorch: keine cuDNN- oder fusionierten Attention-Kernel.
 - cuSOLVER: nur reelle Typen (f32, f64), kein `gesvda`, kein LDL^T (`sytrf`), keine unsymmetrischen Eigenwertprobleme
-  (`geev`); `eigh` und SVD nutzen Jacobi-Iterationen, langsam für große Matrizen (n ≳ 1000). cuFFT: keine Callbacks
-  und keine Multi-GPU-Pläne; Transformationen länger als 2048 (f64: 1024) brauchen einen Speicherdurchlauf pro Radix.
+  (`geev`); `eigh` einer Matrix tridiagonalisiert sie (Householder) und löst auf dem Host (QL); gebündeltes `eigh`
+  und SVD nutzen Jacobi-Iterationen, die SVD ist langsam für große Matrizen (n ≳ 1000). cuFFT: keine Callbacks und
+  keine Multi-GPU-Pläne; Transformationen länger als 2048 (f64: 1024) brauchen zwei Speicherdurchläufe, wenn sich ihre Länge
+  in zwei Faktoren innerhalb dieser Grenze zerlegen lässt, sonst einen pro Radix.
   cuSPARSE: kein Block-Sparse (BSR) und keine komplexen Werte; SpGEMM und die Sortierroutinen laufen auf dem Host.
 - cuRAND: XORWOW, MRG32k3a, Philox und Sobol liefern die Folgen von NVIDIA (Normal- und Lognormalverteilung bis
   auf Rundung); MTGP32 und MT19937 werden angenommen, liefern aber andere Folgen, ebenso scrambled Sobol und Poisson;
@@ -326,7 +337,7 @@ src/compiler          CFG + Strukturierung, SPIR-V-Builder, PTX -> SPIR-V-Compil
 src/driver            die API-Oberfläche von libcuda.so
 src/runtime           libcudart.so.12 und .so.13 (CUDA Runtime API auf der Driver API, eine Quelle)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM mit GLSL-Kerneln), include/cublas/cublas_v2.h
-src/linalg            dichte Zerlegungen (LU, Cholesky, QR, Jacobi-eigh/SVD) in GLSL, gemeinsam für cuBLAS und cuSOLVER
+src/linalg            dichte Zerlegungen (LU, Cholesky, QR, eigh, Jacobi-SVD) in GLSL, gemeinsam für cuBLAS und cuSOLVER
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham- und Bluestein-FFTs in GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 in GLSL), include/cusparse/cusparse.h

@@ -251,8 +251,10 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
   也支持子图、内存节点（捕获期间的流序分配）和条件节点（if、while、switch；每个条件节点处主机都会等待 GPU）。
 - （尚）不支持：cuDNN。
-- 纹理和表面（纹理对象、表面对象、CUDA 数组）以软件方式采样，采用 CUDA 的寻址与过滤方式；不支持 mipmap、立方体贴图、
-  纹理引用和格式化的表面写入。
+- 设备代码：不支持递归。间接调用（虚函数、函数指针）会把目标与模块中所有同形的函数逐一比较，且只能调用同一模块的函数。
+  `malloc`/`free` 使用大小为 `cudaLimitMallocHeapSize`（默认 8 MiB）的堆，需要 64 位原子操作。
+- 纹理和表面（纹理对象、表面对象、CUDA 数组）以软件方式采样，采用 CUDA 的寻址与过滤方式；支持 mipmap（LOD 与梯度）和
+  立方体贴图（在一个面内过滤，不跨面的边缘过滤）。不支持纹理引用（CUDA 12 已移除）和格式化的表面写入（`sust.p`，CUDA C 不会生成）。
 - CUDA IPC（`cudaIpc*`、PyTorch 的 `torch.multiprocessing`）可在同一用户的进程之间使用；跨进程事件在记录时即完成（记录会等待设备）。
 - NCCL（`libnccl.so.2`，`torch.distributed` 的 "nccl" 后端：DDP、FSDP）可在同一台机器的各 rank 之间使用，它们也可以共用一块 GPU；
   多于一个 rank 时数据经由主机内存传输。
@@ -260,14 +262,16 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
   （没有对等访问）。协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU
   （在集成 GPU 上本来就是同一块内存）。
-- 只要存在已注册的主机内存（`cuMemHostRegister`），每次 GPU 提交都会变慢（内核会重新验证导入的页面，每 256 MB 约 4 ms）；
-  锁页内存和托管内存不受影响。
+- 已注册的主机内存（`cuMemHostRegister`）如果是独立的映射（`mmap`），且位于 GPU 可以放置内存的地址（RADV：64 KiB 对齐，
+  2 MiB 及以上为 2 MiB 对齐），会被内容相同、GPU 可见的内存替换：注册和取消注册时会复制内容，`fork()` 之后子进程共享
+  这些页面而不是复制。其他已注册内存会被导入，只要它存在，每次 GPU 提交都会变慢（内核会重新验证导入的页面，每 256 MB
+  约 4 ms）。锁页内存和托管内存不受影响。
 - llama.cpp 的 flash attention 可以正确运行（`tools/build_llama.sh --fa`），但在没有 tensor core 的情况下，
   它会让提示词处理变慢，因此默认关闭。
 - PyTorch：没有 cuDNN 和融合 attention 内核。
-- cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；`eigh` 和 SVD
-  使用 Jacobi 迭代，对大矩阵（n ≳ 1000）较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换每个基数
-  遍历一次内存。cuSPARSE：没有块稀疏（BSR）格式和复数值；SpGEMM 和排序例程在主机上运行。
+- cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；单个矩阵的
+  `eigh` 先用 Householder 三对角化，再在主机上用 QL 求解；批量 `eigh` 和 SVD 使用 Jacobi 迭代，SVD 对大矩阵（n ≳ 1000）
+  较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换，如果长度能分解为两个都不超过该上限的因子，则遍历内存两次，否则每个基数遍历一次。cuSPARSE：没有块稀疏（BSR）格式和复数值；SpGEMM 和排序例程在主机上运行。
 - cuRAND：XORWOW、MRG32k3a、Philox 和 Sobol 给出与 NVIDIA 相同的序列（正态与对数正态分布在舍入误差内一致）；
   MTGP32 和 MT19937 可以创建，但给出不同的序列，加扰 Sobol 和 Poisson 也是如此；double 输出需要 `shaderFloat64`。
   设备 API（`curand_kernel.h`）可用，但不支持在主机上创建的分布（`curand_discrete`）。
@@ -307,7 +311,7 @@ src/compiler          CFG + 结构化、SPIR-V 生成器、PTX -> SPIR-V 编译�
 src/driver            libcuda.so 的 API 接口
 src/runtime           libcudart.so.12 和 .so.13（基于 Driver API 的 CUDA Runtime API，同一份源码）
 src/cublas            libcublas.so.12/.13（使用 GLSL 内核的 GEMM/TRSM），include/cublas/cublas_v2.h
-src/linalg            GLSL 编写的稠密分解（LU、Cholesky、QR、Jacobi eigh/SVD），由 cuBLAS 和 cuSOLVER 共用
+src/linalg            GLSL 编写的稠密分解（LU、Cholesky、QR、eigh、Jacobi SVD），由 cuBLAS 和 cuSOLVER 共用
 src/cusolver          libcusolver.so.11/.12，include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL 编写的 Stockham 与 Bluestein FFT），include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL 编写的 SpMV/SpMM/SDDMM/SpSV/csrgeam2），include/cusparse/cusparse.h

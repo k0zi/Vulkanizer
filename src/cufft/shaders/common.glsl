@@ -53,6 +53,7 @@ const uint kTypeMask = 3u, kF32 = 0u, kF64 = 1u, kF16 = 2u;
 const uint kModeShift = 2u, kC2C = 0u, kR2C = 1u, kC2R = 2u;
 const uint kInverse = 16u;
 const uint kStepShift = 5u, kPre = 0u, kMultiply = 1u, kPost = 2u;
+const uint kFourStep = 128u;  // fft_local.comp: the second step of a four-step FFT
 
 uint elementType() { return p.flags & kTypeMask; }
 uint mode() { return (p.flags >> kModeShift) & 3u; }

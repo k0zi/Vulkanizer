@@ -5,6 +5,7 @@
 #include "test_util.h"
 
 #include <cstring>
+#include <sys/mman.h>
 #include <vector>
 
 namespace {
@@ -146,6 +147,35 @@ int main() {
     CHECK_CU(cuMemHostUnregister(plain.data() + 1));
     EXPECT_CU(CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED, cuMemHostUnregister(neighbour));
     (void)small;
+
+    // Registered memory that is a mapping of its own (adopted where the device can place memory
+    // there: our memory replaces the pages, with their contents, and they come back at
+    // unregistration): 4 MiB at a 2 MiB boundary inside an 8 MiB mmap.
+    {
+        const size_t mib = size_t(1) << 20;
+        char* map = static_cast<char*>(mmap(nullptr, 8 * mib, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        EXPECT(map != MAP_FAILED);
+        float* big = reinterpret_cast<float*>((uintptr_t(map) + 2 * mib) / (2 * mib) * (2 * mib));  // after map[0]
+        const unsigned count = unsigned(4 * mib / 4);
+        for (unsigned i = 0; i < count; ++i) big[i] = 4.0f;
+        big[-1] = big[count] = 7.0f;  // outside the registration
+        CHECK_CU(cuMemHostRegister(big, 4 * mib, 0));
+        EXPECT(all(big, count, 4.0f));  // the contents came along
+        axpb(CUdeviceptr(big), count, 0.5f, 1.0f);
+        EXPECT(all(big, count, 3.0f));
+        big[5] = 9.0f;  // host writes reach the device
+        axpb(CUdeviceptr(big) + 5 * 4, 1, 2.0f, 0.0f);
+        EXPECT(big[5] == 18.0f);
+        CHECK_CU(cuMemHostUnregister(big));
+        EXPECT(big[5] == 18.0f && big[6] == 3.0f && big[count - 1] == 3.0f);  // kept after unregistration
+        EXPECT(big[-1] == 7.0f && big[count] == 7.0f);
+        big[7] = 1.0f;  // and writable
+        CHECK_CU(cuMemHostRegister(big, 4 * mib, 0));  // again, on the restored pages
+        axpb(CUdeviceptr(big), 8, 1.0f, 1.0f);
+        EXPECT(big[7] == 2.0f && big[6] == 4.0f);
+        CHECK_CU(cuMemHostUnregister(big));
+        munmap(map, 8 * mib);
+    }
 
     CHECK_CU(cuCtxDestroy(ctx));
     std::printf("OK\n");

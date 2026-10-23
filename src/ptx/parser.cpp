@@ -19,6 +19,18 @@ const DeviceFunction* Module::findFunction(std::string_view name) const {
     return found;
 }
 
+uint64_t Module::functionId(std::string_view name) const {
+    uint64_t index = 0;
+    for (size_t i = 0; i < functions.size(); ++i) {
+        bool first = true;  // declarations and the definition share one id
+        for (size_t j = 0; j < i && first; ++j) first = functions[j].name != functions[i].name;
+        if (!first) continue;
+        ++index;
+        if (functions[i].name == name) return kFunctionIdBase | index;
+    }
+    return 0;
+}
+
 const GlobalVar* Module::findGlobal(std::string_view name) const {
     for (const GlobalVar& g : globals)
         if (g.name == name) return &g;
@@ -347,6 +359,8 @@ private:
                     bits = std::bit_cast<uint32_t>(float(std::bit_cast<double>(bits)));
                 else if (g.elemSize == 8 && width == 32)
                     bits = std::bit_cast<uint64_t>(double(std::bit_cast<float>(uint32_t(bits))));
+            } else if (v.kind == TokenKind::Identifier && g.elemSize == 8 && !negative) {
+                g.functionRefs.emplace_back(g.init.size(), std::string(v.text));  // resolved by parseModule
             } else {
                 return fail(v, "unsupported initializer element '" + std::string(v.text) + "'");
             }
@@ -542,6 +556,15 @@ bool parseModule(std::string_view source, Module& out, ParseError& err) {
         offset += g.size;
     }
     out.globalsSize = offset;
+    for (GlobalVar& g : out.globals)
+        for (const auto& [at, name] : g.functionRefs) {
+            const uint64_t id = out.functionId(name);
+            if (!id) {
+                err = {"unsupported initializer element '" + name + "' in '" + g.name + "'", 1};
+                return false;
+            }
+            for (int i = 0; i < 8; ++i) g.init[at + i] = uint8_t(id >> (8 * i));
+        }
     if (out.version.empty()) {
         err = {"missing .version directive", 1};
         return false;

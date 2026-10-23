@@ -227,6 +227,48 @@ VkResult Device::init() {
         }
         if (externalFd) extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     }
+    // Cooperative matrices (tensor cores, WMMA): cuBLAS's f16 GEMM uses square f16 x f16 -> f32 ones
+    // of subgroup scope. VULKANIZER_COOPMAT: unset = on GPUs (CPU implementations emulate them, slower
+    // than plain code: llvmpipe 22 vs 36 GFLOP/s), 0 = off, 1 = on everywhere.
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMatrix{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    uint32_t coopMatrixSize = 0;
+    const char* coopEnv = std::getenv("VULKANIZER_COOPMAT");
+    const bool coopWanted = coopEnv && *coopEnv ? std::strcmp(coopEnv, "0") != 0
+                                                : info_.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU;
+    if (coopWanted) {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> props(count);
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, props.data());
+        bool has = false;
+        for (const VkExtensionProperties& p : props) has |= !std::strcmp(p.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        if (has) {
+            VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            f2.pNext = &supported;
+            vkGetPhysicalDeviceFeatures2(info_.handle, &f2);
+        }
+        auto getProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+            vkGetInstanceProcAddr(Instance::get()->handle(), "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        if (has && supported.cooperativeMatrix && getProps && e12.shaderFloat16 && e12.vulkanMemoryModel) {
+            uint32_t n = 0;
+            getProps(info_.handle, &n, nullptr);
+            std::vector<VkCooperativeMatrixPropertiesKHR> shapes(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            getProps(info_.handle, &n, shapes.data());
+            for (const VkCooperativeMatrixPropertiesKHR& m : shapes)
+                if (m.scope == VK_SCOPE_SUBGROUP_KHR && m.MSize == m.NSize && m.MSize == m.KSize &&
+                    (m.MSize == 8 || m.MSize == 16) && m.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                    m.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                    m.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && !m.saturatingAccumulation)
+                    coopMatrixSize = std::max(coopMatrixSize, m.MSize);
+        }
+        if (coopMatrixSize) {
+            extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+            coopMatrix.cooperativeMatrix = VK_TRUE;
+            coopMatrix.pNext = en.pNext;
+            en.pNext = &coopMatrix;
+        }
+    }
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineStats{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     if (const char* env = std::getenv("VULKANIZER_PIPELINE_STATS"); env && *env && std::strcmp(env, "0") != 0) {
@@ -258,6 +300,7 @@ VkResult Device::init() {
     features_.bufferInt64Atomics = e12.shaderBufferInt64Atomics;
     features_.sharedInt64Atomics = e12.shaderSharedInt64Atomics;
     features_.vulkanMemoryModel = e12.vulkanMemoryModel;
+    features_.coopMatrixSize = coopMatrixSize;
     features_.subgroupSizeControl = e13.subgroupSizeControl;
     features_.computeFullSubgroups = e13.computeFullSubgroups;
     features_.timelineSemaphore = e12.timelineSemaphore;
@@ -368,6 +411,11 @@ VkResult Device::init() {
         unmapMemory2_ = reinterpret_cast<PFN_vkUnmapMemory2KHR>(vkGetDeviceProcAddr(device_, "vkUnmapMemory2KHR"));
         // h | hostAddressBits() must be outside the host's half of the address space
         features_.hostMemoryAlloc = mapMemory2_ && unmapMemory2_ && (addressHigh_ & 0x8000u);
+        VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &pp;
+        vkGetPhysicalDeviceProperties2(info_.handle, &p2);
+        placedMapAlignment_ = std::max<VkDeviceSize>(pp.minPlacedMemoryMapAlignment, 4096);
     }
     if (hostImport && features_.sparseBuffers) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
@@ -530,6 +578,7 @@ VkResult Device::allocateDedicated(VkDeviceSize size, Buffer& out) {
 }
 
 void Device::destroyBuffer(Buffer& buf) {
+    if (buf.adopted) return releaseAdoptedHostMemory(buf);  // the application's pages come back
     if (buf.placedMapping) {
         // Back to a reserved range first: nothing else may be mapped there before the munmap.
         VkMemoryUnmapInfoKHR ui{VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR};
@@ -888,6 +937,63 @@ VkResult Device::allocateHostMemory(VkDeviceSize size, Buffer& out) {
     out.address = h;
     out.hostAddressed = true;
     return VK_SUCCESS;
+}
+
+VkResult Device::adoptHostMemory(void* host, VkDeviceSize size, Buffer& out) {
+    out = Buffer{};
+    const uint64_t h = reinterpret_cast<uint64_t>(host);
+    if (!features_.hostMemoryAlloc || !size || h % placedMapAlignment_ || size % placedMapAlignment_)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    // A plain buffer only: bound to a sparse one, system memory costs as much per submit as the import.
+    VkResult r = placeHostMemory(h, size, false, out);
+    VULKANIZER_DEBUG("adopting host memory at 0x%llx (%llu bytes): %d", (unsigned long long)h, (unsigned long long)size, r);
+    if (r != VK_SUCCESS) return r;
+    // The contents first, through a mapping of our own, then the memory over the pages.
+    void* staging = nullptr;
+    if ((r = vkMapMemory(device_, out.memory, 0, VK_WHOLE_SIZE, 0, &staging)) == VK_SUCCESS) {
+        std::memcpy(staging, host, size_t(size));
+        vkUnmapMemory(device_, out.memory);
+        VkMemoryMapPlacedInfoEXT placed{VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT};
+        placed.pPlacedAddress = host;
+        VkMemoryMapInfoKHR mi{VK_STRUCTURE_TYPE_MEMORY_MAP_INFO_KHR};
+        mi.pNext = &placed;
+        mi.flags = VK_MEMORY_MAP_PLACED_BIT_EXT;
+        mi.memory = out.memory;
+        mi.size = VK_WHOLE_SIZE;
+        void* mapped = nullptr;
+        r = mapMemory2_(device_, &mi, &mapped);
+        if (r == VK_SUCCESS && mapped != host) r = VK_ERROR_MEMORY_MAP_FAILED;  // not expected
+    }
+    if (r != VK_SUCCESS) {
+        destroyBuffer(out);  // the application's pages are untouched
+        return r;
+    }
+    out.mapped = host;
+    out.address = h;
+    out.hostAddressed = true;
+    out.adopted = true;
+    return VK_SUCCESS;
+}
+
+void Device::releaseAdoptedHostMemory(Buffer& buf) {
+    finish();  // recorded work may still use it
+    const size_t size = size_t(buf.size);
+    // The contents go into fresh anonymous pages, which then move to the address: it is never unmapped.
+    void* copy = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (copy != MAP_FAILED) std::memcpy(copy, buf.mapped, size);
+    VkMemoryUnmapInfoKHR ui{VK_STRUCTURE_TYPE_MEMORY_UNMAP_INFO_KHR};
+    ui.flags = VK_MEMORY_UNMAP_RESERVE_BIT_EXT;
+    ui.memory = buf.memory;
+    unmapMemory2_(device_, &ui);
+    if (copy == MAP_FAILED ||
+        mremap(copy, size, size, MREMAP_MAYMOVE | MREMAP_FIXED, buf.mapped) == MAP_FAILED) {
+        // Out of memory: at least fresh (zeroed) pages, not a hole in the address space.
+        VULKANIZER_ERROR("cannot restore the contents of registered host memory at %p", buf.mapped);
+        mmap(buf.mapped, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    }
+    buf.mapped = nullptr;
+    buf.adopted = false;
+    destroyBuffer(buf);
 }
 
 VkResult Device::placeHostMemory(uint64_t h, VkDeviceSize size, bool sparse, Buffer& out) {

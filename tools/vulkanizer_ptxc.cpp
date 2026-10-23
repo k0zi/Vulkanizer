@@ -9,6 +9,7 @@
 // Target options (default: a generic subgroup-32 device):
 //   --subgroup N  --push-constants N  --fp16  --fp64  --int8  --int16  --storage8  --storage16  --int64-atomics
 
+#include "ptx/heap.h"
 #include "compiler/cfg.h"
 #include "compiler/ptx_to_spirv.h"
 #include "ptx/instr.h"
@@ -148,6 +149,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot read %s\n", input);
         return 1;
     }
+    ptx::appendDeviceHeap(source);  // malloc and free, as the driver's loader does
     ptx::Module module;
     ptx::ParseError perr;
     if (!ptx::parseModule(source, module, perr)) {

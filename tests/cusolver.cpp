@@ -477,6 +477,7 @@ int main() {
     ok &= testEig<float>(h, 7, 5, false, 1e-5);
     ok &= testEig<float>(h, 32, 3, true, 5e-5);
     ok &= testEig<float>(h, 100, 1, false, 1e-4);
+    ok &= testEig<float>(h, 300, 1, true, 1e-4);  // one larger matrix: the tridiagonal path
     ok &= testSvd<float>(h, Svd::Gesvdj, 20, 7, 1, false, 7, 1e-5);
     ok &= testSvd<float>(h, Svd::Gesvdj, 20, 7, 1, true, 7, 1e-5);
     ok &= testSvd<float>(h, Svd::Gesvdj, 6, 15, 1, true, 6, 1e-5);
@@ -502,6 +503,7 @@ int main() {
         ok &= testCholesky<double>(h, 21, 2, true, 1e-12);
         ok &= testQr<double>(h, 26, 11, 1e-12);
         ok &= testEig<double>(h, 45, 1, true, 1e-12);
+        ok &= testEig<double>(h, 128, 1, false, 1e-12);
         ok &= testEig<double>(h, 9, 4, false, 1e-12);
         ok &= testSvd<double>(h, Svd::Gesvdj, 17, 9, 1, true, 9, 1e-12);
         ok &= testSvd<double>(h, Svd::GesvdjBatched, 5, 9, 3, true, 4, 1e-12);

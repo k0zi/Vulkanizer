@@ -7,6 +7,7 @@
 #include "common/sha256.h"
 #include "driver/kernel_cache.h"
 #include "driver/printf.h"
+#include "ptx/heap.h"
 #include "vulkanizer/vulkanizer_ext.h"
 #include "ptx/fatbin.h"
 #include "ptx/texture.h"
@@ -184,6 +185,7 @@ CUresult loadModule(CUmodule* module, const void* image, std::string* errorLog) 
     }
 
     defineDeviceRuntimeBuiltins(mod->source);
+    ptx::appendDeviceHeap(mod->source);
     {
         std::string error;  // textures and surfaces: calls of the texture library (ptx/texture.h)
         if (!ptx::rewriteTextureInstructions(mod->source, error)) {
@@ -207,6 +209,19 @@ CUresult loadModule(CUmodule* module, const void* image, std::string* errorLog) 
         std::vector<uint8_t> image(mod->ptx.globalsSize, 0);
         for (const ptx::GlobalVar& g : mod->ptx.globals)
             if (!g.init.empty()) std::memcpy(image.data() + g.offset, g.init.data(), g.init.size());
+        if (const ptx::GlobalVar* g = mod->ptx.findGlobal("__vulkanizer_heap")) {
+            // device-side malloc: the device's heap, of the size cuCtxSetLimit(CU_LIMIT_MALLOC_HEAP_SIZE) set
+            if (!s.slot->heap.buffer) {
+                const size_t bytes = std::max<size_t>(contextLimit(CU_LIMIT_MALLOC_HEAP_SIZE), 1 << 20);
+                if (VkResult vr = s.dev->allocateBuffer(bytes, s.slot->heap)) return toCuResult(vr);
+                const uint64_t header[2] = {bytes, ptx::kHeapHeaderBytes};
+                std::vector<uint8_t> init(ptx::kHeapHeaderBytes, 0);
+                std::memcpy(init.data(), header, sizeof header);
+                if (VkResult vr = s.dev->write(s.slot->heap, 0, init.data(), init.size())) return toCuResult(vr);
+                VULKANIZER_DEBUG("device heap: %zu bytes at 0x%llx", bytes, (unsigned long long)s.slot->heap.address);
+            }
+            std::memcpy(image.data() + g->offset, &s.slot->heap.address, sizeof(uint64_t));
+        }
         if (VkResult vr = s.dev->write(buf, 0, image.data(), image.size())) {
             s.dev->freeBuffer(buf);
             return toCuResult(vr);
@@ -574,6 +589,8 @@ CUresult CUDAAPI vulkanizerGetFeature(VulkanizerFeature feature, int* value) {
     switch (feature) {
     case VULKANIZER_FEATURE_FLOAT16_ARITHMETIC: *value = s.slot->vk->features().shaderFloat16; return CUDA_SUCCESS;
     case VULKANIZER_FEATURE_FLOAT64: *value = s.slot->vk->features().shaderFloat64; return CUDA_SUCCESS;
+    case VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16: *value = int(s.slot->vk->features().coopMatrixSize); return CUDA_SUCCESS;
+    case VULKANIZER_FEATURE_SUBGROUP_SIZE: *value = int(s.slot->info->subgroupSize); return CUDA_SUCCESS;
     }
     return CUDA_ERROR_INVALID_VALUE;
 }

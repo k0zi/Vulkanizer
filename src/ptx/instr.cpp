@@ -91,6 +91,9 @@ private:
             return true;
         }
         if (d.text == ".pragma") return skipToSemicolon();
+        // an indirect call's prototype or target list ("prototype_0 : .callprototype (...) _ (...);"):
+        // the call matches its candidates by their own declarations
+        if (d.text == ".callprototype" || d.text == ".calltargets") return skipToSemicolon();
         return fail(d, "unsupported directive in kernel body '" + std::string(d.text) + "'");
     }
 
@@ -466,7 +469,9 @@ namespace {
 
 // Inlines every `call` of a Function. Callee registers, labels and local variables get a
 // unique prefix; formal parameters are renamed to the caller's argument variables; `ret`
-// jumps to a label after the inlined body.
+// jumps to a label after the inlined body. A function's name as an operand (mov %rd, f) is its id
+// (Module::functionId); an indirect call compares the target with the ids of the module's
+// functions of that shape and inlines each of them in its own branch.
 class Inliner {
 public:
     // New names are stored in `arena` (the top-level function's), so views into it stay valid
@@ -474,6 +479,15 @@ public:
     Inliner(const Module& m, std::deque<std::string>& arena, ParseError& err) : m_(m), arena_(arena), err_(err) {}
 
     bool run(Function& fn, int depth) {
+        for (Instruction& ins : fn.instructions) {
+            if (ins.opcode == "call" || ins.opcode == "bra") continue;
+            for (Operand& o : ins.operands)
+                if (o.kind == OperandKind::Symbol)
+                    if (const uint64_t id = m_.functionId(o.name)) {
+                        o.kind = OperandKind::Immediate;
+                        o.imm = id;
+                    }
+        }
         bool hasCalls = false;
         for (const Instruction& ins : fn.instructions) hasCalls |= ins.opcode == "call";
         if (!hasCalls) return true;
@@ -511,17 +525,26 @@ private:
     // call{.uni} {(ret, ...),} func{, (arg, ...)}
     bool expand(Function& fn, const Instruction& call, std::vector<Instruction>& out, std::vector<Label>& labels,
                 int depth) {
+        // call {(rets),} func{, (args)}  or  call {(rets),} %reg{, (args)}, prototype (or a target list)
         const Operand* rets = nullptr;
         const Operand* args = nullptr;
+        const Operand* target = nullptr;
         std::string_view callee;
         for (const Operand& o : call.operands) {
-            if (o.kind == OperandKind::Symbol && callee.empty()) callee = o.name;
-            else if (o.kind == OperandKind::Vector && callee.empty()) rets = &o;
-            else if (o.kind == OperandKind::Vector) args = &o;
-            else return fail(call.line, "indirect calls are not supported");
+            if (callee.empty() && !target) {
+                if (o.kind == OperandKind::Vector) rets = &o;
+                else if (o.kind == OperandKind::Symbol) callee = o.name;
+                else if (o.kind == OperandKind::Register) target = &o;
+                else return fail(call.line, "malformed call");
+            } else if (o.kind == OperandKind::Vector && !args) {
+                args = &o;
+            } else if (!(target && o.kind == OperandKind::Symbol)) {
+                return fail(call.line, "malformed call");
+            }
         }
-        if (callee.empty()) return fail(call.line, "indirect calls are not supported");
         if (!call.guard.empty()) return fail(call.line, "predicated calls are not supported yet");
+        if (target) return expandIndirect(fn, call, *target, rets, args, out, labels, depth);
+        if (callee.empty()) return fail(call.line, "malformed call");
 
         if (callee == "vprintf") {
             // Kept as a pseudo instruction for the compiler: vprintf [format param], [arguments param]
@@ -561,6 +584,9 @@ private:
             out.push_back(std::move(t));
             return true;
         }
+        // device-side malloc and free: the heap functions appended to the module (ptx/heap.h)
+        if ((callee == "malloc" || callee == "free") && m_.findFunction(callee == "malloc" ? "__vulkanizer_malloc" : "__vulkanizer_free"))
+            callee = callee == "malloc" ? "__vulkanizer_malloc" : "__vulkanizer_free";
         const DeviceFunction* f = m_.findFunction(callee);
         if (!f) return fail(call.line, "call to unknown function '" + std::string(callee) + "'");
         if (!f->defined) return fail(call.line, "call to external function '" + std::string(callee) + "'");
@@ -628,6 +654,91 @@ private:
         labels.insert(labels.end(), calleeLabels.begin(), calleeLabels.end());
         labels.push_back({after, out.size()});
         return true;
+    }
+
+    // An indirect call: for every defined function of the call's shape (as many parameters and
+    // results, of the sizes the call's .param variables have; not Vulkanizer's own library functions)
+    //   setp.eq.u64 %p, target, id; @%p bra L_f
+    // then trap (no such function), and per function L_f: its body inlined, bra after.
+    bool expandIndirect(Function& fn, const Instruction& call, const Operand& target, const Operand* rets,
+                        const Operand* args, std::vector<Instruction>& out, std::vector<Label>& labels, int depth) {
+        const size_t nargs = args ? args->elems.size() : 0, nrets = rets ? rets->elems.size() : 0;
+        auto sizeOf = [&](std::string_view name) -> uint64_t {  // 0: not a .param variable of the caller
+            for (const LocalVar& v : fn.locals)
+                if (v.name == name && v.space == ".param") return v.size;
+            return 0;
+        };
+        auto fits = [&](const std::vector<Param>& formal, const Operand* actual) {
+            for (size_t i = 0; i < formal.size(); ++i) {
+                const uint64_t size = sizeOf(actual->elems[i].name);
+                if (size && size != formal[i].size) return false;
+            }
+            return true;
+        };
+        std::vector<const DeviceFunction*> candidates;
+        for (const DeviceFunction& f : m_.functions)
+            if (f.defined && f.params.size() == nargs && f.returns.size() == nrets && !f.name.starts_with("__vulkanizer_") &&
+                (!nargs || fits(f.params, args)) && (!nrets || fits(f.returns, rets)) &&
+                std::none_of(candidates.begin(), candidates.end(), [&](const DeviceFunction* c) { return c->name == f.name; }))
+                candidates.push_back(&f);
+        const std::string prefix = "$vz_icall" + std::to_string(counter_++) + "_";
+        auto fresh = [&](const std::string& name) -> std::string_view {
+            arena_.push_back(prefix + name);
+            return arena_.back();
+        };
+        const std::string_view after = fresh("end");
+        arena_.push_back("%" + prefix.substr(1) + "p");
+        const std::string_view predReg = arena_.back();
+        fn.regs.push_back({std::string(predReg), ".pred"});
+        std::vector<std::string_view> targets;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            Instruction setp;
+            setp.opcode = "setp";
+            setp.mods = {".eq", ".u64"};
+            setp.line = call.line;
+            Operand p, id;
+            p.kind = OperandKind::Register;
+            p.name = predReg;
+            id.kind = OperandKind::Immediate;
+            id.imm = m_.functionId(candidates[i]->name);
+            setp.operands = {p, target, id};
+            out.push_back(std::move(setp));
+            targets.push_back(fresh("f" + std::to_string(i)));
+            out.push_back(branch(targets.back(), predReg, call.line));
+        }
+        Instruction trap;  // a pointer to none of them
+        trap.opcode = "trap";
+        trap.line = call.line;
+        out.push_back(std::move(trap));
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            labels.push_back({targets[i], out.size()});
+            Instruction direct;
+            direct.opcode = "call";
+            direct.line = call.line;
+            if (rets) direct.operands.push_back(*rets);
+            Operand f;
+            f.kind = OperandKind::Symbol;
+            f.name = candidates[i]->name;
+            direct.operands.push_back(f);
+            if (args) direct.operands.push_back(*args);
+            if (!expand(fn, direct, out, labels, depth)) return false;
+            out.push_back(branch(after, {}, call.line));
+        }
+        labels.push_back({after, out.size()});
+        return true;
+    }
+
+    // bra label, guarded by `pred` unless empty
+    static Instruction branch(std::string_view label, std::string_view pred, uint32_t line) {
+        Instruction bra;
+        bra.opcode = "bra";
+        bra.guard = pred;
+        bra.line = line;
+        Operand to;
+        to.kind = OperandKind::Symbol;
+        to.name = label;
+        bra.operands = {to};
+        return bra;
     }
 
     // st.param.b32 [name+0], value

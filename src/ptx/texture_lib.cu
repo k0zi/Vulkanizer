@@ -162,6 +162,99 @@ __device__ float4 sample(const VkTexDesc* d, float u, float v, float w, int laye
     return r;
 }
 
+// Mipmaps: the level of detail clamped to the texture's range, then one level (the nearest) or the
+// two around it blended with an 8-bit weight (VK_TEX_MIP_LINEAR). Level l's descriptor follows
+// level 0's.
+__device__ __forceinline__ float clampLod(const VkTexDesc* d, float lod) {
+    const float top = float(d->levels > 0 ? d->levels - 1 : 0);
+    return fminf(fmaxf(lod + d->lodBias, fmaxf(d->minLod, 0.0f)), fminf(d->maxLod, top));
+}
+
+// Cube maps: the face of direction (x, y, z) and the normalized coordinates on it (the usual
+// major-axis table: +x -x +y -y +z -z).
+__device__ __forceinline__ void cubeFace(float x, float y, float z, int& face, float& u, float& v) {
+    const float ax = fabsf(x), ay = fabsf(y), az = fabsf(z);
+    float ma, sc, tc;
+    if (ax >= ay && ax >= az) {
+        ma = ax, face = x >= 0.0f ? 0 : 1, sc = x >= 0.0f ? -z : z, tc = -y;
+    } else if (ay >= az) {
+        ma = ay, face = y >= 0.0f ? 2 : 3, sc = x, tc = y >= 0.0f ? z : -z;
+    } else {
+        ma = az, face = z >= 0.0f ? 4 : 5, sc = z >= 0.0f ? x : -x, tc = -y;
+    }
+    const float inv = ma > 0.0f ? 0.5f / ma : 0.0f;
+    u = sc * inv + 0.5f;
+    v = tc * inv + 0.5f;
+}
+
+// One level of a texture at (x, y, z, layer): a cube map's direction goes to its face (sampled as
+// a normalized, clamped 2D layer, without filtering across the edges); `asInt` gives the raw
+// point-sampled texel (as int bits) instead of the filtered floats. One copy of the sampling code:
+// every call site inlines it.
+__device__ float4 sampleLevel(const VkTexDesc* level, float x, float y, float z, int layer, bool asInt) {
+    VkTexDesc d = *level;
+    if (d.flags & VK_TEX_CUBE) {
+        int face;
+        cubeFace(x, y, z, face, x, y);
+        z = 0.0f;
+        d.flags |= VK_TEX_NORMALIZED_COORDS;
+        d.address[0] = d.address[1] = VK_ADDRESS_CLAMP;
+        d.dimensions = 2;
+        layer = 6 * layer + face;
+    }
+    if (!asInt) return sample(&d, x, y, z, layer);
+    const float tx = texelCoordinate(&d, x, d.width, d.address[0]);
+    const float ty = d.dimensions >= 2 ? texelCoordinate(&d, y, d.height, d.address[1]) : 0.0f;
+    const float tz = d.dimensions >= 3 ? texelCoordinate(&d, z, d.depth, d.address[2]) : 0.0f;
+    const int4 t = fetchInt(&d, int(floorf(tx)), int(floorf(ty)), int(floorf(tz)), layer);
+    return make_float4(__int_as_float(t.x), __int_as_float(t.y), __int_as_float(t.z), __int_as_float(t.w));
+}
+
+// At level of detail `lod`: the nearest level (integer results always), or the two around it
+// blended; one sampleLevel in a loop over them.
+__device__ float4 sampleLod(const VkTexDesc* d, float x, float y, float z, int layer, float lod, bool asInt) {
+    int first = 0, count = 1;
+    float w = 0.0f;
+    if (d->levels > 1) {
+        lod = clampLod(d, lod);
+        if (asInt || !(d->flags & VK_TEX_MIP_LINEAR)) {
+            first = int(floorf(lod + 0.5f));
+        } else {
+            first = int(floorf(lod));
+            w = weight(lod - floorf(lod));
+            if (w != 0.0f && first + 1 < int(d->levels)) count = 2;
+        }
+    }
+    float4 r = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll 1
+    for (int k = 0; k < count; ++k) {
+        const float4 t = sampleLevel(d + first + k, x, y, z, layer, asInt);
+        if (count == 1) return t;  // as it is (integer bits must not go through arithmetic)
+        const float wt = k ? w : 1.0f - w;
+        r.x += wt * t.x, r.y += wt * t.y, r.z += wt * t.z, r.w += wt * t.w;
+    }
+    return r;
+}
+
+// The level of detail of the coordinate derivatives (dx, dy): log2 of the longer one in level-0
+// texels (normalized coordinates scaled by the size; a cube map's by the face size over twice the
+// major axis, approximately).
+__device__ float gradientLod(const VkTexDesc* d, float x, float y, float z, float dxx, float dxy, float dxz, float dyx,
+                             float dyy, float dyz) {
+    float sx = 1.0f, sy = 1.0f, sz = 1.0f;
+    if (d->flags & VK_TEX_CUBE) {
+        const float ma = fmaxf(fmaxf(fabsf(x), fabsf(y)), fabsf(z));
+        sx = sy = sz = ma > 0.0f ? 0.5f * float(d->width) / ma : 0.0f;
+    } else if (d->flags & VK_TEX_NORMALIZED_COORDS) {
+        sx = float(d->width), sy = float(d->height), sz = float(d->depth);
+    }
+    if (d->dimensions < 2 && !(d->flags & VK_TEX_CUBE)) dxy = dyy = 0.0f;
+    if (d->dimensions < 3 && !(d->flags & VK_TEX_CUBE)) dxz = dyz = 0.0f;
+    const float lx = (dxx * sx) * (dxx * sx) + (dxy * sy) * (dxy * sy) + (dxz * sz) * (dxz * sz);
+    const float ly = (dyx * sx) * (dyx * sx) + (dyy * sy) * (dyy * sy) + (dyz * sz) * (dyz * sz);
+    return 0.5f * __log2f(fmaxf(fmaxf(lx, ly), 1e-30f));
+}
+
 // Surfaces: byte x coordinates; out of range a load gives 0 and a store does nothing (trap and
 // zero mode), or the coordinate is clamped (clamp mode, 1).
 __device__ __forceinline__ char* surfaceAddress(unsigned long long h, int bytes, int xb, int y, int z, int layer,
@@ -218,6 +311,26 @@ __device__ __noinline__ int4 __vulkanizer_fetch_i(unsigned long long h, int x, i
     return fetchInt(d, x, y, z, layer);
 }
 
+// tex.level and tex.grad (any geometry, cube maps too), and plain tex on cube maps: `grad` = 0 takes
+// the level of detail `lod`, 1 the one of the derivatives (dx*, dy*); integer results are the raw
+// texel's bits
+__device__ __noinline__ float4 __vulkanizer_tex_ex_f(unsigned long long h, float x, float y, float z, int layer,
+                                                     int grad, float lod, float dxx, float dxy, float dxz, float dyx,
+                                                     float dyy, float dyz) {
+    const VkTexDesc* d = desc(h);
+    if (grad) lod = gradientLod(d, x, y, z, dxx, dxy, dxz, dyx, dyy, dyz);
+    return sampleLod(d, x, y, z, layer, lod, false);
+}
+
+__device__ __noinline__ int4 __vulkanizer_tex_ex_i(unsigned long long h, float x, float y, float z, int layer, int grad,
+                                                   float lod, float dxx, float dxy, float dxz, float dyx, float dyy,
+                                                   float dyz) {
+    const VkTexDesc* d = desc(h);
+    if (grad) lod = gradientLod(d, x, y, z, dxx, dxy, dxz, dyx, dyy, dyz);
+    const float4 t = sampleLod(d, x, y, z, layer, lod, true);
+    return make_int4(__float_as_int(t.x), __float_as_int(t.y), __float_as_int(t.z), __float_as_int(t.w));
+}
+
 // tld4: component `comp` of the four texels bilinear filtering at (x, y) would use, in CUDA's order
 // (x: (0, 1), y: (1, 1), z: (1, 0), w: (0, 0) of the 2 x 2 footprint)
 __device__ __noinline__ float4 __vulkanizer_tld4_f(unsigned long long h, int comp, float x, float y) {
@@ -250,8 +363,12 @@ __device__ __noinline__ int4 __vulkanizer_tld4_i(unsigned long long h, int comp,
 
 // txq and suq: 0 width, 1 height, 2 depth, 3 channel data type (CUarray_format), 4 channel order
 // (channel count), 5 normalized coordinates, 6 filter mode, 7..9 address modes, 10 array size
-__device__ __noinline__ int __vulkanizer_query(unsigned long long h, int query) {
+// (cube maps: in cubes), 11 mipmap levels; of mipmap level `level` (txq.level)
+__device__ __noinline__ int __vulkanizer_query(unsigned long long h, int query, int level) {
     const VkTexDesc* d = desc(h);
+    if (query == 11) return int(d->levels > 0 ? d->levels : 1);
+    if (query == 10 && (d->flags & VK_TEX_CUBE)) return int(d->layers / 6);
+    if (level > 0 && level < int(d->levels)) d += level;
     switch (query) {
     case 0: return int(d->width);
     case 1: return int(d->height);

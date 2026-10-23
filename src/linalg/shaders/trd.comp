@@ -1,0 +1,103 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Householder tridiagonalization for the symmetric eigensolver (linalg.cpp, syevd): Q^T S Q = T with
+// S (n x n, ld n, full) in the workspace at B, followed by the vectors' rotations. The workspace after
+// S: d (n reals: T's diagonal), e (n: its subdiagonal), pv and wv (n each), tau (n). The reflector of
+// step k is v = (1, S(k+2:, k)) on rows k+1 .. n-1, tau(k) (geqrf's layout one row down, so ormqr
+// applies Q). p.nrhs selects the step:
+//   0 reflect: one workgroup: the reflector annihilating S(k+2:, k); e(k) = the new S(k+1, k)
+//   1 symv:    workgroup per column i > k: pv(i) = tau sum_{j>k} S(j, i) v(j)
+//   2 w:       one workgroup: wv = pv - (tau / 2) (pv . v) v
+//   3 update:  workgroup per column j > k: S(i, j) -= v(i) wv(j) + wv(i) v(j) for i > k
+//   4 gather:  d(i) = S(i, i)
+//   5 scatter: S(i, i) = d(i) (the eigenvalues, for eig_finish)
+//   6 rotate:  thread per row r of A: the plane rotations p.k .. p.k + p.ldc - 1 on columns
+//              (i, i + 1), i from the int array at ipiv, (c, s) pairs from the real array at c
+// One matrix at a time (z = 0).
+
+layout(local_size_x = 256) in;
+
+shared real partial[256];
+
+real reduce(real s) {
+    const int tid = int(gl_LocalInvocationID.x);
+    partial[tid] = s;
+    barrier();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (tid < w) partial[tid] += partial[tid + w];
+        barrier();
+    }
+    const real r = partial[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    const int n = p.n, k = p.k, tid = int(gl_LocalInvocationID.x), mode = p.nrhs;
+    const uint64_t A = matrixA(0), S = matrixB(0);
+    const uint64_t d = S + uint64_t(n) * uint64_t(n) * REAL_BYTES;
+    const uint64_t e = d + uint64_t(n) * REAL_BYTES, pv = e + uint64_t(n) * REAL_BYTES;
+    const uint64_t wv = pv + uint64_t(n) * REAL_BYTES, tau = wv + uint64_t(n) * REAL_BYTES;
+    // v(i) for i > k
+    #define V(i) ((i) == k + 1 ? real(1) : elem(S, (i), k, n).v)
+
+    if (mode == 0) {
+        real sigma = real(0);
+        for (int i = k + 2 + tid; i < n; i += 256) {
+            const real x = elem(S, i, k, n).v;
+            sigma += x * x;
+        }
+        sigma = reduce(sigma);
+        const real alpha = elem(S, k + 1, k, n).v;
+        real beta = alpha, t = real(0), scale = real(0);
+        if (sigma != real(0)) {
+            beta = -sign(alpha == real(0) ? real(1) : alpha) * sqrt(alpha * alpha + sigma);
+            t = (beta - alpha) / beta;
+            scale = real(1) / (alpha - beta);
+        }
+        for (int i = k + 2 + tid; i < n; i += 256) elem(S, i, k, n).v *= scale;
+        if (tid == 0) {
+            elem(e, k, 0, 1).v = beta;
+            elem(tau, k, 0, 1).v = t;
+        }
+    } else if (mode == 1) {
+        const int i = k + 1 + int(gl_WorkGroupID.x);
+        if (i >= n) return;
+        const real t = elem(tau, k, 0, 1).v;
+        if (t == real(0)) return;
+        real s = real(0);
+        for (int j = k + 1 + tid; j < n; j += 256) s += elem(S, j, i, n).v * V(j);
+        s = reduce(s);
+        if (tid == 0) elem(pv, i, 0, 1).v = t * s;
+    } else if (mode == 2) {
+        const real t = elem(tau, k, 0, 1).v;
+        if (t == real(0)) return;
+        real s = real(0);
+        for (int i = k + 1 + tid; i < n; i += 256) s += elem(pv, i, 0, 1).v * V(i);
+        const real h = real(0.5) * t * reduce(s);
+        for (int i = k + 1 + tid; i < n; i += 256) elem(wv, i, 0, 1).v = elem(pv, i, 0, 1).v - h * V(i);
+    } else if (mode == 3) {
+        const int j = k + 1 + int(gl_WorkGroupID.x);
+        if (j >= n || elem(tau, k, 0, 1).v == real(0)) return;
+        const real vj = V(j), wj = elem(wv, j, 0, 1).v;
+        for (int i = k + 1 + tid; i < n; i += 256)
+            elem(S, i, j, n).v -= V(i) * wj + elem(wv, i, 0, 1).v * vj;
+    } else if (mode == 4 || mode == 5) {
+        const int i = int(gl_WorkGroupID.x) * 256 + tid;
+        if (i >= n) return;
+        if (mode == 4) elem(d, i, 0, 1).v = elem(S, i, i, n).v;
+        else elem(S, i, i, n).v = elem(d, i, 0, 1).v;
+    } else if (mode == 6) {
+        const int r = int(gl_WorkGroupID.x) * 256 + tid;
+        if (r >= n) return;
+        for (int t = p.k; t < p.k + p.ldc; ++t) {
+            const int i = Int(canon(p.ipiv + uint64_t(t) * 4ul)).v;
+            const real c = elem(p.c, 2 * t, 0, 1).v, s = elem(p.c, 2 * t + 1, 0, 1).v;
+            const real a = elem(A, r, i, p.lda).v, b = elem(A, r, i + 1, p.lda).v;
+            elem(A, r, i + 1, p.lda).v = s * a + c * b;
+            elem(A, r, i, p.lda).v = c * a - s * b;
+        }
+    }
+}

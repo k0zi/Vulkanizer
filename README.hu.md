@@ -262,8 +262,12 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   `torch.compile(mode="reduce-overhead")`); child graph és memória-csomópont (stream-rendezett
   foglalás capture alatt) és feltételes csomópont (if, while, switch; mindegyiknél a host megvárja a GPU-t) is.
 - (Még) nem támogatott: cuDNN.
+- Device-kód: rekurzió nincs. Az indirekt hívás (virtuális függvény, függvénypointer) a célt a modul minden ilyen
+  alakú függvényével összeveti, és csak ugyanannak a modulnak a függvényeit éri el. A `malloc`/`free` egy
+  `cudaLimitMallocHeapSize` méretű (alapból 8 MiB) heapen dolgozik, ehhez 64 bites atomikus műveletek kellenek.
 - A textúrák és surface-ek (texture és surface objectek, CUDA arrayk) szoftveres mintavételezéssel mennek, a CUDA
-  címzésével és szűrésével; mipmap, cube map, textúra-referencia és formázott surface-írás nincs.
+  címzésével és szűrésével, mipmappel (LOD és gradiens) és cube mappel (egy lapon belül szűrve, a lapok szélén át nem).
+  Textúra-referencia (a CUDA 12 eltávolította) és formázott surface-írás (`sust.p`, a CUDA C nem generál ilyet) nincs.
 - A CUDA IPC (`cudaIpc*`, a PyTorch `torch.multiprocessing`-je) azonos felhasználó folyamatai között működik; egy
   folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).
 - Az NCCL (`libnccl.so.2`, a `torch.distributed` „nccl” backendje: DDP, FSDP) egy gép rangjai között működik, akár
@@ -274,15 +278,19 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   elfér a GPU-n.
 - A managed, a pinned és a regisztrált memória host-memória, amit a GPU helyben, ugyanazon a címen használ; a managed
   memória sosem migrál a GPU-ra (integrált GPU-n ez amúgy is ugyanaz a memória).
-- Amíg regisztrált host-memória (`cuMemHostRegister`) létezik, minden GPU-submit lassabb (a kernel újraellenőrzi az
-  importált lapokat, ~4 ms / 256 MB); a pinned és a managed memóriát ez nem érinti.
+- A regisztrált host-memóriát (`cuMemHostRegister`), ha saját leképezés (`mmap`), és olyan címen van, ahová a GPU
+  memóriát tud tenni (RADV: 64 KiB-ra igazítva, 2 MiB-tól 2 MiB-ra), ugyanazzal a tartalommal GPU-látható memória
+  váltja fel: a regisztrálás és a feloldás átmásolja, `fork()` után pedig a gyerekprocessz másolat helyett ugyanazokat
+  a lapokat látja. A többi regisztrált memória importálva lesz, és amíg létezik, minden GPU-submit lassabb (a kernel
+  újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát ez nem érinti.
 - A llama.cpp flash attention helyesen fut (`tools/build_llama.sh --fa`), de tensor core-ok nélkül vele lassabb a
   prompt feldolgozása, ezért alapból ki van kapcsolva.
 - PyTorch: nincsenek cuDNN- és fúzionált attention kernelek.
 - cuSOLVER: csak valós típusok (f32, f64), nincs `gesvda`, LDL^T (`sytrf`) és nem szimmetrikus sajátérték-feladat
-  (`geev`); az `eigh` és az SVD Jacobi-iterációt használ, ami nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek
-  callbackek és több GPU-s tervek; a 2048-nál (f64: 1024) hosszabb transzformációk radixonként egyszer bejárják a
-  memóriát. cuSPARSE: nincs blokkos ritka (BSR) formátum és komplex érték; az SpGEMM és a rendezések a hoston futnak.
+  (`geev`); egy mátrix `eigh`-ja tridiagonalizál (Householder) és a hoston old meg (QL); a batch-elt `eigh` és az
+  SVD Jacobi-iterációt használ, az SVD nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek callbackek és több GPU-s
+  tervek; a 2048-nál (f64: 1024) hosszabb transzformációk kétszer járják be a memóriát, ha a hosszuk felbontható két,
+  e határon belüli tényezőre, különben radixonként egyszer. cuSPARSE: nincs blokkos ritka (BSR) formátum és komplex érték; az SpGEMM és a rendezések a hoston futnak.
 - cuRAND: az XORWOW, az MRG32k3a, a Philox és a Sobol az NVIDIA sorozatait adja (a normális és lognormális eloszlás
   kerekítésnyi eltéréssel); az MTGP32-t és az MT19937-et elfogadja, de más sorozatot ad, ahogy a scrambled Sobol és a
   Poisson is; a double kimenetekhez `shaderFloat64` kell. Az eszközoldali API (`curand_kernel.h`) működik, kivéve a
@@ -323,7 +331,7 @@ src/compiler          CFG + strukturálás, SPIR-V builder, PTX -> SPIR-V fordí
 src/driver            a libcuda.so API-felülete
 src/runtime           libcudart.so.12 és .so.13 (a CUDA Runtime API a Driver API-ra építve, egy forrásból)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM GLSL-kernelekkel), include/cublas/cublas_v2.h
-src/linalg            sűrű felbontások (LU, Cholesky, QR, Jacobi eigh/SVD) GLSL-ben, közös a cuBLAS-szal és a cuSOLVER-rel
+src/linalg            sűrű felbontások (LU, Cholesky, QR, eigh, Jacobi SVD) GLSL-ben, közös a cuBLAS-szal és a cuSOLVER-rel
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham és Bluestein FFT GLSL-ben), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 GLSL-ben), include/cusparse/cusparse.h

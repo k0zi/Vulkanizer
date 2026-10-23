@@ -40,7 +40,14 @@ struct GlobalVar {
     bool isExtern = false;
     uint64_t offset = 0;        // .global/.const: offset in the module's variable buffer
     std::vector<uint8_t> init;  // initializer bytes (the rest is zero)
+    // initializer elements naming functions (vtables, function pointer tables): byte offset and
+    // name; parseModule writes the function's id (Module::functionId) there
+    std::vector<std::pair<uint64_t, std::string>> functionRefs;
 };
+
+// The value a function's address has (mov of its name, initializers): an id, not an address. The
+// inliner turns indirect calls into comparisons with the ids of the candidates.
+constexpr uint64_t kFunctionIdBase = uint64_t(0xF0) << 56;
 
 // Device function (.func). Functions are inlined at their call sites (ptx/instr.cpp).
 struct DeviceFunction {
@@ -66,6 +73,9 @@ struct Module {
     const Entry* findEntry(std::string_view name) const;
     const GlobalVar* findGlobal(std::string_view name) const;
     const DeviceFunction* findFunction(std::string_view name) const;
+    // kFunctionIdBase | (1 + the index of the name among the module's distinct function names), 0 if
+    // `name` is not a function.
+    uint64_t functionId(std::string_view name) const;
 };
 
 // Size in bytes of a PTX fundamental type directive (".u32" -> 4), 0 if `d` is not a type.

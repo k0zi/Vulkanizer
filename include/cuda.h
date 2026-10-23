@@ -1010,6 +1010,10 @@ CUresult CUDAAPI cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR* pArrayDescriptor, C
 CUresult CUDAAPI cuArray3DCreate(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* pAllocateArray);
 CUresult CUDAAPI cuArray3DGetDescriptor(CUDA_ARRAY3D_DESCRIPTOR* pArrayDescriptor, CUarray hArray);
 CUresult CUDAAPI cuArrayDestroy(CUarray hArray);
+CUresult CUDAAPI cuMipmappedArrayCreate(CUmipmappedArray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* pMipmappedArrayDesc,
+                                        unsigned int numMipmapLevels);
+CUresult CUDAAPI cuMipmappedArrayGetLevel(CUarray* pLevelArray, CUmipmappedArray hMipmappedArray, unsigned int level);
+CUresult CUDAAPI cuMipmappedArrayDestroy(CUmipmappedArray hMipmappedArray);
 CUresult CUDAAPI cuMemcpy2D(const CUDA_MEMCPY2D* pCopy);
 CUresult CUDAAPI cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* pCopy);
 CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D* pCopy, CUstream hStream);
