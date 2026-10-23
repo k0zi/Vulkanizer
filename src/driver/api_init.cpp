@@ -298,7 +298,7 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
     int major, minor;
     computeCapability(major, minor);
 
-    switch (attrib) {
+    switch (static_cast<int>(attrib)) {  // int: the texture limits below are not in the enum
         case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK:
             *pi = clampInt(std::min<uint32_t>(1024, lim.maxComputeWorkGroupInvocations)); break;
         case CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X: *pi = clampInt(std::min<uint32_t>(1024, lim.maxComputeWorkGroupSize[0])); break;
@@ -321,20 +321,20 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
         case CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE: *pi = 4 * 1024 * 1024; break;
         case CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT: *pi = 512; break;
         // Textures and surfaces (sampled in software, ptx/texture.h): the limits of 32-bit texel indexing.
-        case CUdevice_attribute(21): *pi = 1 << 17; break;          // MAXIMUM_TEXTURE1D_WIDTH
-        case CUdevice_attribute(22): case CUdevice_attribute(23):    // MAXIMUM_TEXTURE2D_WIDTH, _HEIGHT
-        case CUdevice_attribute(45): case CUdevice_attribute(46):    // MAXIMUM_TEXTURE2D_GATHER_WIDTH, _HEIGHT
-        case CUdevice_attribute(56): case CUdevice_attribute(57): *pi = 1 << 16; break;  // SURFACE2D
-        case CUdevice_attribute(24): case CUdevice_attribute(25): case CUdevice_attribute(26):  // TEXTURE3D
-        case CUdevice_attribute(58): case CUdevice_attribute(59): case CUdevice_attribute(60): *pi = 1 << 14; break;
-        case CUdevice_attribute(27): case CUdevice_attribute(28):    // MAXIMUM_TEXTURE2D_LAYERED_WIDTH, _HEIGHT
-        case CUdevice_attribute(42): *pi = 1 << 15; break;           // MAXIMUM_TEXTURE1D_LAYERED_WIDTH
-        case CUdevice_attribute(29): case CUdevice_attribute(43): *pi = 2048; break;  // ..._LAYERED_LAYERS
-        case CUdevice_attribute(55): *pi = 1 << 17; break;           // MAXIMUM_SURFACE1D_WIDTH
-        case CUdevice_attribute(69): *pi = 1 << 27; break;           // MAXIMUM_TEXTURE1D_LINEAR_WIDTH
-        case CUdevice_attribute(70): case CUdevice_attribute(71): *pi = 1 << 16; break;  // TEXTURE2D_LINEAR
-        case CUdevice_attribute(72): *pi = 1 << 20; break;           // MAXIMUM_TEXTURE2D_LINEAR_PITCH
-        case CUdevice_attribute(30): case CUdevice_attribute(51): *pi = 32; break;  // SURFACE_, TEXTURE_PITCH_ALIGNMENT
+        case 21: *pi = 1 << 17; break;          // MAXIMUM_TEXTURE1D_WIDTH
+        case 22: case 23:    // MAXIMUM_TEXTURE2D_WIDTH, _HEIGHT
+        case 45: case 46:    // MAXIMUM_TEXTURE2D_GATHER_WIDTH, _HEIGHT
+        case 56: case 57: *pi = 1 << 16; break;  // SURFACE2D
+        case 24: case 25: case 26:  // TEXTURE3D
+        case 58: case 59: case 60: *pi = 1 << 14; break;
+        case 27: case 28:    // MAXIMUM_TEXTURE2D_LAYERED_WIDTH, _HEIGHT
+        case 42: *pi = 1 << 15; break;           // MAXIMUM_TEXTURE1D_LAYERED_WIDTH
+        case 29: case 43: *pi = 2048; break;  // ..._LAYERED_LAYERS
+        case 55: *pi = 1 << 17; break;           // MAXIMUM_SURFACE1D_WIDTH
+        case 69: *pi = 1 << 27; break;           // MAXIMUM_TEXTURE1D_LINEAR_WIDTH
+        case 70: case 71: *pi = 1 << 16; break;  // TEXTURE2D_LINEAR
+        case 72: *pi = 1 << 20; break;           // MAXIMUM_TEXTURE2D_LINEAR_PITCH
+        case 30: case 51: *pi = 32; break;  // SURFACE_, TEXTURE_PITCH_ALIGNMENT
         case CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT:
             // Compute units where the driver reports them (AMD); cooperative launches are sized by it.
             if (const char* env = std::getenv("VULKANIZER_SM_COUNT"); env && std::atoi(env) > 0) *pi = std::atoi(env);

@@ -79,9 +79,9 @@ int main() {
     EXPECT(fn == reinterpret_cast<void*>(&cuMemAdvise_v2));  // CUmemLocation since 12.2
     CHECK_CU(cuGetProcAddress("cuMemAdvise", &fn, 12000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
     EXPECT(fn == reinterpret_cast<void*>(&cuMemAdvise));
-    // a variant Vulkanizer lacks is not found rather than an older signature
-    EXPECT_CU(CUDA_ERROR_NOT_FOUND,
-              cuGetProcAddress("cuGraphAddNode", &fn, 13000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+    CHECK_CU(cuGetProcAddress("cuGraphAddNode", &fn, 13000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
+    EXPECT(fn == reinterpret_cast<void*>(&cuGraphAddNode_v2));  // with edge data since 12.3
+    EXPECT_CU(CUDA_ERROR_NOT_FOUND, cuGetProcAddress("cuNoSuchFunction", &fn, 13000, CU_GET_PROC_ADDRESS_DEFAULT, &status));
 
     const char* str = nullptr;
     CHECK_CU(cuGetErrorString(CUDA_ERROR_OUT_OF_MEMORY, &str));

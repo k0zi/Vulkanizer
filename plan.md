@@ -49,17 +49,15 @@ Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben 
 
 ### Állapot (2026-10-23)
 
-Kész: a 0–4. fázis a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
+Kész: a 0–4. fázis, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
 az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`), az 5.6 (cooperative
 groups, több GPU, IPC, NCCL, UVA), valamint az 5.7 (llama tg ~31 → ~38 t/s). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
 Triton, `torch.compile`), ComfyUI (Z-Image Turbo), Numba (`numba-cuda`).
 
 Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
-2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
-3. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
-4. Nyitott részfeladatok: rögzített Vulkan command bufferek, feltételes csomópontok (5.3); külön copy queue
-   (5.4).
+2. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész; a Sobol-adatok licencszövegét is ellenőrizni az eredetivel).
+3. Nyitott részfeladat: külön copy queue (5.4) – integrált GPU-n és GPU-korlátos tg mellett kevés haszonnal.
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -201,8 +199,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 ### Fázis 4 – Könyvtárak és első AI workload
 - [x] **4.1** `libcublas.so.12` shim: saját `cublas_v2.h`, handle/stream/math mode, `Sgemm`, `GemmEx`, batched és strided batched változatok, `StrsmBatched`.
   A kernelek GLSL-ben vannak (`src/cublas/shaders`), és a `vulkanizerCreateSpirvFunction` driver-bővítésen át futnak.
-  Hiányzik: gyors GEMM (cooperative matrix, jobb tiling), `cublasLt`.
-- [ ] **4.2** `libcublasLt` (kész: matmul, batch, bias/ReLU/GELU epilógus), `libcurand`, `libcufft`, `libcusparse`, `libcusolver`.
+  Gyors GEMM: az f16 TN alak (`gemm_f16_tn.comp`) és minden más ≥ 128 × 128-as GEMM (`gemm_tiled.comp`, 5.4);
+  cooperative matrix nincs (a Renoir nem tudja).
+- [x] **4.2** `libcublasLt` (kész: matmul, batch, bias/ReLU/GELU epilógus), `libcurand`, `libcufft`, `libcusparse`, `libcusolver`.
   Majd ha a PyTorch vagy egy célalkalmazás kéri. A cuBLAS is csak a GEMM/TRSM családot tudja (4.1).
   - [x] `libcusolver.so.11` / `.so.12` (CUDA 12 / 13) – a PyTorch `torch.linalg` valós (f32, f64) része, saját GLSL
     kernelekkel (`src/linalg`, közös a cuBLAS batched faktorizációival). Egy munkacsoport oszloponként/párként, a
@@ -258,7 +257,52 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     - Tesztek: `tests/cusparse.cpp` (ctest, 43 eset, RADV és llvmpipe), `torch_sparse` (sparse.mm COO/CSR, addmm,
       mv, backward, dense@CSR, sampled_addmm, CSR+CSR, CSR@CSR, triangular_solve, bmm COO, COO→CSR; CUDA 12 és
       13 – ALL OK). A batched CSR-t a PyTorch CUDA buildje maga tiltja.
-  - [ ] `libcurand` – a PyTorch nem használja (saját Philox generátora van); csak ha egy alkalmazás kéri.
+  - [x] `libcurand.so.10` (CUDA 12: 10.3.10, a `lib/cuda13`-ban 10.4.0) – a teljes host API (`curand.h`, clean-room
+    fejléc), GLSL kernelekkel (`src/curand/shaders`), f32 és f64 változatban. A PyTorch nem használja (saját Philox
+    generátora van), de a környezetei hozzák az NVIDIA `libcurand`-ját, ami statikus cudarttal Vulkanizer alatt nem
+    működne: a `run_torch.sh` és a `vulkanizer-run` ezért ezt is előtölti.
+    - Az NVIDIA host generátora (`curandCreateGeneratorHost`) a CPU-n fut, GPU nélkül is: fekete dobozként,
+      kimenetek összevetésével derült ki a sorrend, és ugyanez a referencia a teszteknek.
+      - Minden generátornak szálai vannak a seed részsorozatain (Philox 65536, a counter magas fele; XORWOW 4096,
+        2^67 lépésenként; MRG32k3a 81920, 2^76 lépésenként). A kimenetek csoportjai (Philox: 4 kimenet, XORWOW/MRG:
+        1, normálisnál 2) körbe járnak a szálakon, és minden szál a saját folyamát folytatja hívásról hívásra.
+      - A `curandSetGeneratorOffset` (és a seed-váltás, ami az offsetet megtartja) úgy állítja a szálakat, mintha
+        offset darab 32 bites kimenet készült volna. A double kimenetek két szót (Philox: két blokkot) fogyasztanak
+        csoportonként. Philoxnál a hívás közepén véget érő csoport a következő hívásban ugyanarról a blokkról
+        folytatódik, a szál pedig utána innen lép tovább (a `philox.comp` ezt a szálankénti blokkmutatóval és egy
+        kétrekeszes „függő blokkal” követi, külön léptető dispatch-csel).
+      - Átalakítások: egyenletes float `x·2^-32 + 2^-33` (műveletenként kerekítve, `precise`), double két szóból
+        `(x ^ y << 21)·2^-53 + 2^-54`. Normálisnál Box–Muller (`sin(πv)`, `v = y·2^-31 + 2^-32`), Sobolnál inverz
+        eloszlásfüggvény. Az MRG uint32-je `(uint)(z · 1.000000048662)`, a float/double-je `z · (1/m1)`. Normális:
+        `n·σ + μ` float-ban, illetve double-ben.
+      - Ugrómátrixok a hoston, folyamatonként egyszer: XORWOW 160×160 GF(2), MRG32k3a 3×3 mod m1/m2. Az init
+        kernel szálanként alkalmazza őket.
+    - Sobol32/64: Joe–Kuo `new-joe-kuo-6.21201` irányszámok 20000 dimenzióig (`src/curand/sobol_joe_kuo.inc`,
+      generálja: `tools/gen_sobol_table.sh` a SciPy-ban szállított adatból; BSD jellegű licenc, a fájl fejében),
+      Gray-kód sorrend, dimenziófőfolytonos kimenet. A `curandGetDirectionVectors32/64` ugyanezt adja.
+    - Bitre egyezik az NVIDIA-val: XORWOW, MRG32k3a, Philox, Sobol32/64 nyers bitjei, egyenletes float/double
+      kimenetei, vegyes hívássorozatokban és offsettel is. A normális/lognormális kerekítésnyire egyezik (float
+      ~1e-6 abszolút, ennyi az NVIDIA saját eltérése is a pontos értéktől; double ~1e-12): a log/exp/sinpi/cospi és
+      az inverz eloszlásfüggvény saját (a GLSL beépítettjei pontatlanok, f64-ben nincsenek). Az inverz
+      eloszlásfüggvény a szélein Acklam, középen Giles f32 erfinv-je (Acklam középső része f32-ben 1e-4-et téved),
+      f64-ben Acklam + egy Halley-lépés erfc-vel.
+    - Eltér az NVIDIA-tól (más, de statisztikailag helyes sorozat): az MTGP32 és az MT19937 (a párhuzamos
+      felépítésük nem reprodukálható; két külön Philox-folyam), a scrambled Sobol (saját véletlen alsó háromszög
+      mátrixok + eltolás) és a Poisson (egyetlen egyenletes szám inverziója CDF-táblán, `floor(CDF·2^33)` küszöbök;
+      a tábla a λ körül ±12√λ). A rendezések (`curandSetGeneratorOrdering`) elfogadottak, mind az alapértelmezettet
+      adja.
+    - f64 nélküli eszközön a double kimenetek `CURAND_STATUS_DOUBLE_PRECISION_REQUIRED`-et adnak. Az MRG float
+      átalakítása ilyenkor f64-es köztes érték nélkül számol, ezért az utolsó bitben eltérhet.
+    - A host generátor ugyanezeket a kerneleket futtatja device memóriába, majd visszamásol; ha nincs aktuális
+      context, a 0. eszköz primary contextjét használja.
+    - Az eszközoldali API (`curand_kernel.h`, csak fejléc) a PTX-fordítón át működik: nvcc-vel fordított XORWOW,
+      Philox és MRG32k3a kernel (`curand_init` skipahead-táblákkal, uniform/normal/double/poisson) bitre az NVIDIA
+      host API sorozatát adja. A hoston készített eloszlás (`curand_discrete`) nem támogatott (a
+      `curandDiscreteDistribution_t` saját, nem az NVIDIA szerkezete).
+    - Tesztek: `tests/curand.cpp` (ctest): NVIDIA-referenciaértékek (offset, vegyes hívások), host és device
+      generátor egyezése, minden eloszlás momentumai minden generátorral, Sobol-elrendezés, hibakódok.
+      `VULKANIZER_CURAND_REFERENCE=<NVIDIA libcurand.so.10>`-zel hosszú vegyes sorozatokat is összevet (Sobol 20000
+      dimenzióval). RADV és llvmpipe, f32-only úttal is: ALL OK.
 - [x] **4.3** Célalkalmazás: a llama.cpp CUDA backendje (`tools/build_llama.sh`).
 - [x] **4.4 Mérföldkő:** a SmolLM2-135M (Q8_0 és Q4_0) szöveget generál a Renoir iGPU-n.
   - `llama-bench`: pp64 ≈ 227 t/s, tg32 ≈ 25 t/s.
@@ -447,8 +491,35 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       memória élettartama; RADV és llvmpipe); PyTorch CUDA graph `cudaMallocAsync` backenddel, `torch_graph`
       mindkét allokátorral (CUDA 12 és 13). A `torch.compile(mode="reduce-overhead")` a `cudaMallocAsync`
       backenddel a PyTorch saját korlátjába fut (`checkPoolLiveAllocations`).
-  - Hátra: rögzített Vulkan command bufferek (csak host-időt spórolna), `cudaGraphAddNode` általános
-    paraméterekkel, feltételes csomópontok.
+  - [x] Feltételes csomópontok és a gráf-API maradéka (2026-10-23, `tests/graph_api.cpp`, `tests/cuda/rt_graph.cu`).
+    - If (else ággal), while, switch, egymásba ágyazva is: a csomópont birtokolja a törzs-gráfjait (a
+      `phGraph_out` tömb is a csomóponté, mint a CUDA-ban), az instanciáláskor a törzsek csomópontlistává
+      „fagynak”. A feltétel 4 bájt device-memória (`ConditionSlot`, a handle a címe); a kernel
+      `cudaGraphSetConditional`-ja – az nvcc ezt `.extern .func`-ként hagyja – betöltéskor egyetlen
+      `st.global.b32`-t végző definíciót kap (`defineDeviceRuntimeBuiltins`). Futáskor a csomópontnál a host
+      kiolvassa az értéket (megvárja az előtte lévő munkát), while-nál minden kör után; a
+      `CU_GRAPH_COND_ASSIGN_DEFAULT` handle-ök a gráfjuk (törzsük) indulásakor stream-sorrendben kapják az
+      alapértéket. Ára: feltételes csomópont gráfja csak a GPU-val együtt halad (a `cuGraphLaunch` addig nem tér
+      vissza); GPU-oldali predikáció Vulkanban a while-t nem tudná.
+    - `cuGraphAddNode(_v2)`/`cudaGraphAddNode` általános paraméterekkel (kernel – `CUkernel` is –, memcpy, memset,
+      host, child graph clone/move, üres, event record/wait, mem alloc/free, feltételes),
+      `cuGraphNodeSetParams`/`cuGraphExecNodeSetParams`; `cuStreamBeginCaptureToGraph` (törzsek capture-rel,
+      `cudaStreamEndCapture(s, nullptr)`); memcpy csomópont (`cuGraphAddMemcpyNode`, `cudaGraphAddMemcpyNode(1D)`,
+      és a capture alatti `cuMemcpy2D/3DAsync` is ilyen lesz – eddig azonnal lefutott); event record/wait
+      csomópont; élek (`AddDependencies`, `RemoveDependencies`, `GetEdges`, `GetRootNodes`, `GetDependentNodes`,
+      `DestroyNode`), `cuGraphClone` + `NodeFindInClone`, user objectek (a gráfok és instanciáik referenciái; az
+      utolsó elengedés a sorban álló munka után hívja a destruktort).
+    - Az instanciálás most topologikusan rendez (a létrehozási sorrendben stabilan), mert a később hozzáadott él
+      visszafelé is mutathat; körre `CUDA_ERROR_INVALID_VALUE`.
+    - ABI: a `CUgraphNodeParams`/`cudaGraphNodeParams` és tagjai az NVIDIA 12.9 és 13 headeréhez mérve
+      (`cuda_abi`, `cudart_abi`); a CUDA 13 runtime-ban ezek a függvények élmetaadatot is kapnak (a 12-es `_v2`).
+    - Közben: az `api_init.cpp` textúra-limitjeinek `-Wswitch` figyelmeztetései (a switch most `int`-en megy).
+  - Rögzített Vulkan command bufferek: nem éri meg (mérve 2026-10-23, TinyLlama Q4_0 tg, `VULKANIZER_PROFILE`, a
+    tg64 és tg192 különbségéből tokenenként): ~29,7 ms GPU-kernelidő ~30,3 ms tokenidőből, a GPU ~98%-ban
+    dolgozik. A `cuGraphLaunch` hosszú host-ideje (~18 ms) a GPU bevárása (a batch-gyűrű visszanyomása), nem saját
+    költség; a tokenenkénti HtoD feltöltés ~0,5 ms. A hiányzó ~2% sem a visszajátszásból jön.
+  - Hátra: a nem alapértelmezett élek (programmatic dependent launch portjai) és a külső szemaforok / batch mem op
+    csomópontok `NOT_SUPPORTED`.
 - [x] **5.4 Teljesítmény**
   - [x] DtoH: a write-combined device-memóriából a CPU ~0,2 GB/s-mal olvas. A `Device::read` a GPU-val másol egy
     host-cached staging bufferbe (2 × 8 MiB, a GPU és a CPU másolása átfedve), 4 KiB alatt közvetlenül olvas.
@@ -460,6 +531,29 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     A felszabadítás nem vár a GPU-ra: minden későbbi device-munka a már rögzített után fut, a host-hozzáférés pedig
     megvárja azt. `cuMemAlloc`+`cuMemFree`: 4 KiB 42 → 0,9 µs, 1 MiB 31 → 3,4 µs. Kikapcsolás: `VULKANIZER_NO_SUBALLOC=1`.
     A nagyobb foglalások külön Vulkan-memóriát kapnak (16 MiB ~0,8 ms, a kernel nullázza a lapokat).
+  - [x] Csempés GEMM (2026-10-23, `src/cublas/shaders/gemm_tiled.comp`): minden ≥ 128 × 128-as cuBLAS GEMM, ami nem az
+    f16 TN gyors út (f32, NN/NT/TT, bf16, vegyes típusok, strided és pointeres batch). 128 × 128-as csempe, k-lépés 16,
+    256 szál 8 × 8 kimenettel, a csempe az LDS-ben `vec4`-ként; szálanként 8 egymás utáni elem a memóriában folytonos
+    irány mentén, 16 bájtos betöltéssel, ahol minden sorkezdet igazított és a folytonos méret 8 többszöröse; a következő
+    k-lépés betöltései a szorzások előtt indulnak.
+    - A buktató: az előtöltés csak akkor ér valamit, ha a betöltött regisztereket semmi sem olvassa az LDS-be írásig.
+      Az ACO minden ág-összevonásnál (vektoros/skalár út, típusok, a „van-e következő lépés” feltétel) átmásolja őket,
+      és ott `s_waitcnt vmcnt(0)`-val megvárja (`RADV_DEBUG=shaders`-ből). Ezért a betöltés elágazásmentes: a
+      mátrixon kívüli elem a mátrix első elemét olvassa, és az LDS-be íráskor nullázódik, az utolsó lépés utáni
+      előtöltés is ugyanígy ártalmatlan. Az elrendezés (k mentén folytonos-e, típus, vektoros-e) fordítási idejű: a
+      cuBLAS a SPIR-V `SpecId 10` specializációs konstansának alapértékét írja át (`withSpecConstant`), konfigurációnként
+      egy függvény.
+    - Mérés (torch matmul, GFLOP/s): f32 2048³ 280 → ~590 (NN/TN/NT), f16 NN/TN 280 → ~620; közepes méretek
+      1,2–2,5× (512³ 280 → 600–720, 128 × 128 × 4096 69 → 74–83, batch 64 × (128 × 128 × 64) 250 → 300). Egy
+      egyszerű FMA-benchmark ezen a gépen ~700 GFLOP/s-ot ad (az elméleti ~1,8 TFLOP/s-nál jóval kevesebbet: az iGPU
+      órajele alacsony), a GEMM tehát a mért csúcs ~85%-án van. Kipróbálva, nem segített: `vec4` LDS-olvasás a
+      skalár helyett, a belső ciklus explicit kibontása (az ACO amúgy is kibontja).
+    - Az f16 TN gyors út marad: a valódi alakokon (Z-Image lineáris rétegei, 320 × 3840 × 10240) ~10%-kal gyorsabb
+      a csempésnél. A Z-Image Turbo 256 × 256-os lépésének 94%-a GEMM, ~500 GFLOP/s-sal (n = 320 a 128-as csempéből
+      2,5-öt tölt ki); a figyelem P·V szorzásai már a csempés kernelen mennek, bitre azonos eredménnyel (azonos
+      k-sorrend). Packed f16 szorzást a CUDA 32F compute nem enged, f16-ban így nincs 2× ezen a GPU-n.
+    - Teszt: `tests/cublas.cpp` 11 új esete (minden transzponálás, vektoros és skalár betöltés, határcsempék, k nem
+      8 többszöröse, f16/bf16/vegyes, strided és pointeres batch; RADV és llvmpipe).
   - Hátra (halasztva): külön transfer queue a másolásoknak. A másolások már most sem blokkolnak (a compute queue-n,
     sorban futnak); a külön queue a kernelekkel való átfedést hozná, integrált GPU-n (közös memória-sávszélesség)
     kevés haszonnal.
@@ -496,7 +590,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     értéke megváltozna. Elvetve: biztonságosan kevés nyerhető (felső becslés ~10% a kernelen).
   - Nem készült el (llama-specifikus, ezért elvetve): kernelcsere a llama.cpp mmvq-jére (soronként több sor, újrahasznált aktiváció) – llama-specifikus;
     a KV-cache másolás (`cpy_scalar` f16, 5004 utasítás, ~1 ms/token: a 64 bites div/rem gyors útja mellett a
-    lassú út is beinline-olódik).
+    lassú út is beinline-olódik). Mérve (2026-10-23): tokenenként a teljes V-cache nézetet másolja (~65 ezer elem),
+    elemenként 6 osztással (a gyors 32 bites ágon), az idő az osztás-emulációé; a tg ~5,6%-a. A 64 bites szorzások és
+    osztások szűkítéséhez útvonalérzékeny értéktartomány-elemzés kellene (a gyors és a lassú ág összefut), nem éri meg.
 - [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
   - [x] Install és csomagok (`cmake/install.cmake`, `tools/package.sh [--check]`): CPack `.deb` (függőségek
     `dpkg-shlibdeps`-ből: libvulkan1, libstdc++; ajánlott: mesa-vulkan-drivers) és `.tar.gz`. A könyvtárak a

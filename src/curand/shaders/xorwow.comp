@@ -1,0 +1,98 @@
+#version 460
+// XORWOW (Marsaglia, "Xorshift RNGs", J. Stat. Software 8, 2003) in the order of cuRAND's host API:
+// p.threads (4096) states, thread t on subsequence t (2^67 steps apart). The generator hands out
+// groups of outputs (two for normals, one otherwise) round robin: group g goes to thread g mod
+// threads, which continues its own stream. The states persist between calls.
+//
+// kFlagInit computes the states from the seed and the offset (as many groups as if offset single
+// outputs had been generated): the xorshift part jumps with GF(2) matrices from the host (12 of
+// 2^(67 + k) steps for the subsequence, 64 of 2^k steps for the offset), the Weyl counter by addition.
+
+#include "common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint v[]; };
+
+struct State {
+    uint v[5];
+    uint d;
+};
+
+// Applies the 160 x 160 matrix at matrix (column j, the image of bit j, as 5 words at j * 5).
+void jump(inout State s, uint64_t matrix) {
+    Words m = Words(canon(matrix));
+    uint r[5] = uint[5](0u, 0u, 0u, 0u, 0u);
+    for (uint j = 0u; j < 160u; ++j) {
+        if (((s.v[j / 32u] >> (j % 32u)) & 1u) == 0u) continue;
+        for (uint k = 0u; k < 5u; ++k) r[k] ^= m.v[j * 5u + k];
+    }
+    s.v = r;
+}
+
+uint next(inout State s) {
+    uint t = s.v[0] ^ (s.v[0] >> 2);
+    s.v[0] = s.v[1];
+    s.v[1] = s.v[2];
+    s.v[2] = s.v[3];
+    s.v[3] = s.v[4];
+    s.v[4] = (s.v[4] ^ (s.v[4] << 4)) ^ (t ^ (t << 1));
+    s.d += 362437u;
+    return s.v[4] + s.d;
+}
+
+void main() {
+    const uint64_t t = invocation();
+    if (t >= p.threads) return;
+    Words states = Words(canon(p.state + t * 24ul));
+    State s;
+    if ((p.flags & kFlagInit) != 0u) {
+        uvec2 seed = unpackUint2x32(p.seed);
+        uint t0 = 1099087573u * (seed.x ^ 0xaad26b49u), t1 = 2591861531u * (seed.y ^ 0xf7dcefddu);
+        s.d = 6615241u + t1 + t0;
+        s.v = uint[5](123456789u + t0, 362436069u ^ t0, 521288629u + t1, 88675123u ^ t1, 5783321u + t0);
+        for (uint k = 0u; k < 12u; ++k)
+            if (((t >> k) & 1ul) != 0ul) jump(s, p.aux + uint64_t(k) * 3200ul);
+        const uint64_t steps = p.offset / p.threads + (t < p.offset % p.threads ? 1ul : 0ul);
+        for (uint k = 0u; k < 64u; ++k)
+            if (((steps >> k) & 1ul) != 0ul) jump(s, p.aux + uint64_t(12u + k) * 3200ul);
+        s.d += 362437u * uint(steps);
+    } else {
+        for (uint k = 0u; k < 5u; ++k) s.v[k] = states.v[k];
+        s.d = states.v[5];
+        const uint size = normalKind(p.kind) ? 2u : 1u;
+        const uint64_t groups = (p.count + size - 1ul) / size;
+        const uint64_t T = p.threads;
+        for (uint64_t g = (t + T - p.offset % T) % T; g < groups; g += T) {
+            const uint64_t i = g * size;
+            switch (p.kind) {
+            case kU32: storeU32(i, next(s)); break;
+            case kUniform: storeF32(i, uniformf(next(s))); break;
+            case kPoisson: storeU32(i, poisson(next(s))); break;
+            case kNormal:
+            case kLogNormal: {
+                uint x = next(s), y = next(s);
+                vec2 n = boxMullerf(x, y);
+                storeF32(i, scalef(n.x));
+                if (i + 1ul < p.count) storeF32(i + 1ul, scalef(n.y));
+                break;
+            }
+#ifdef DOUBLE
+            case kUniformDouble: {
+                uint x = next(s), y = next(s);
+                storeF64(i, uniformd(x, y));
+                break;
+            }
+            case kNormalDouble:
+            case kLogNormalDouble: {
+                uint x0 = next(s), x1 = next(s), x2 = next(s), x3 = next(s);
+                dvec2 n = boxMullerd(x0, x1, x2, x3);
+                storeF64(i, scaled(n.x));
+                if (i + 1ul < p.count) storeF64(i + 1ul, scaled(n.y));
+                break;
+            }
+#endif
+            }
+        }
+    }
+    for (uint k = 0u; k < 5u; ++k) states.v[k] = s.v[k];
+    states.v[5] = s.d;
+}

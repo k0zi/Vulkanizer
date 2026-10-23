@@ -268,3 +268,21 @@
     X(int(cudaAddressModeBorder)) \
     X(int(cudaResourceTypePitch2D)) \
     X(int(cudaChannelFormatKindNone))
+
+// cudaGraphAddNode's parameters (in the same list as the texture types).
+#define VULKANIZER_GRAPH_LAYOUT(X) \
+    X(sizeof(cudaGraphNodeParams)) \
+    X(offsetof(cudaGraphNodeParams, kernel.gridDim)) \
+    X(offsetof(cudaGraphNodeParams, kernel.extra)) \
+    X(sizeof(cudaKernelNodeParamsV2)) \
+    X(offsetof(cudaGraphNodeParams, memcpy.copyParams)) \
+    X(sizeof(cudaMemsetParamsV2)) \
+    X(sizeof(cudaHostNodeParamsV2)) \
+    X(offsetof(cudaGraphNodeParams, graph.ownership)) \
+    X(sizeof(cudaEventRecordNodeParams)) \
+    X(offsetof(cudaGraphNodeParams, alloc)) \
+    X(sizeof(cudaConditionalNodeParams)) \
+    X(offsetof(cudaGraphNodeParams, conditional.phGraph_out)) \
+    X(offsetof(cudaGraphNodeParams, reserved2)) \
+    X(int(cudaGraphNodeTypeConditional)) \
+    X(int(cudaGraphCondTypeSwitch))

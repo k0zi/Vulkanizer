@@ -495,8 +495,12 @@ typedef enum CUgraphNodeType_enum {
     CU_GRAPH_NODE_TYPE_EMPTY = 5,
     CU_GRAPH_NODE_TYPE_WAIT_EVENT = 6,
     CU_GRAPH_NODE_TYPE_EVENT_RECORD = 7,
+    CU_GRAPH_NODE_TYPE_EXT_SEMAS_SIGNAL = 8,
+    CU_GRAPH_NODE_TYPE_EXT_SEMAS_WAIT = 9,
     CU_GRAPH_NODE_TYPE_MEM_ALLOC = 10,
     CU_GRAPH_NODE_TYPE_MEM_FREE = 11,
+    CU_GRAPH_NODE_TYPE_BATCH_MEM_OP = 12,
+    CU_GRAPH_NODE_TYPE_CONDITIONAL = 13,
 } CUgraphNodeType;
 typedef enum CUstreamCaptureStatus_enum {
     CU_STREAM_CAPTURE_STATUS_NONE = 0,
@@ -1195,6 +1199,135 @@ CUresult CUDAAPI cuGraphAddChildGraphNode(CUgraphNode* phGraphNode, CUgraph hGra
                                           size_t numDependencies, CUgraph childGraph);
 CUresult CUDAAPI cuGraphAddEmptyNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
                                      size_t numDependencies);
+CUresult CUDAAPI cuGraphAddMemcpyNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                      size_t numDependencies, const CUDA_MEMCPY3D* copyParams, CUcontext ctx);
+CUresult CUDAAPI cuGraphMemcpyNodeGetParams(CUgraphNode hNode, CUDA_MEMCPY3D* nodeParams);
+CUresult CUDAAPI cuGraphMemcpyNodeSetParams(CUgraphNode hNode, const CUDA_MEMCPY3D* nodeParams);
+CUresult CUDAAPI cuGraphMemsetNodeGetParams(CUgraphNode hNode, CUDA_MEMSET_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphMemsetNodeSetParams(CUgraphNode hNode, const CUDA_MEMSET_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphHostNodeGetParams(CUgraphNode hNode, CUDA_HOST_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphHostNodeSetParams(CUgraphNode hNode, const CUDA_HOST_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphAddEventRecordNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                           size_t numDependencies, CUevent event);
+CUresult CUDAAPI cuGraphAddEventWaitNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                         size_t numDependencies, CUevent event);
+CUresult CUDAAPI cuGraphEventRecordNodeGetEvent(CUgraphNode hNode, CUevent* event_out);
+CUresult CUDAAPI cuGraphEventRecordNodeSetEvent(CUgraphNode hNode, CUevent event);
+CUresult CUDAAPI cuGraphEventWaitNodeGetEvent(CUgraphNode hNode, CUevent* event_out);
+CUresult CUDAAPI cuGraphEventWaitNodeSetEvent(CUgraphNode hNode, CUevent event);
+/* Edges, cloning */
+CUresult CUDAAPI cuGraphGetRootNodes(CUgraph hGraph, CUgraphNode* rootNodes, size_t* numRootNodes);
+CUresult CUDAAPI cuGraphGetEdges_v2(CUgraph hGraph, CUgraphNode* from, CUgraphNode* to, CUgraphEdgeData* edgeData,
+                                    size_t* numEdges);
+CUresult CUDAAPI cuGraphAddDependencies_v2(CUgraph hGraph, const CUgraphNode* from, const CUgraphNode* to,
+                                           const CUgraphEdgeData* edgeData, size_t numDependencies);
+CUresult CUDAAPI cuGraphRemoveDependencies_v2(CUgraph hGraph, const CUgraphNode* from, const CUgraphNode* to,
+                                              const CUgraphEdgeData* edgeData, size_t numDependencies);
+CUresult CUDAAPI cuGraphNodeGetDependentNodes_v2(CUgraphNode hNode, CUgraphNode* dependentNodes,
+                                                 CUgraphEdgeData* edgeData, size_t* numDependentNodes);
+CUresult CUDAAPI cuGraphGetEdges(CUgraph hGraph, CUgraphNode* from, CUgraphNode* to, size_t* numEdges);  /* CUDA 12 */
+CUresult CUDAAPI cuGraphAddDependencies(CUgraph hGraph, const CUgraphNode* from, const CUgraphNode* to,
+                                        size_t numDependencies);
+CUresult CUDAAPI cuGraphRemoveDependencies(CUgraph hGraph, const CUgraphNode* from, const CUgraphNode* to,
+                                           size_t numDependencies);
+CUresult CUDAAPI cuGraphNodeGetDependentNodes(CUgraphNode hNode, CUgraphNode* dependentNodes, size_t* numDependentNodes);
+CUresult CUDAAPI cuGraphDestroyNode(CUgraphNode hNode);
+CUresult CUDAAPI cuGraphClone(CUgraph* phGraphClone, CUgraph originalGraph);
+CUresult CUDAAPI cuGraphNodeFindInClone(CUgraphNode* phNode, CUgraphNode hOriginalNode, CUgraph hClonedGraph);
+/* Generic node parameters, conditional nodes */
+typedef cuuint64_t CUgraphConditionalHandle;
+typedef enum CUgraphConditionalNodeType_enum {
+    CU_GRAPH_COND_TYPE_IF = 0,
+    CU_GRAPH_COND_TYPE_WHILE = 1,
+    CU_GRAPH_COND_TYPE_SWITCH = 2,
+} CUgraphConditionalNodeType;
+#define CU_GRAPH_COND_ASSIGN_DEFAULT 0x1
+typedef enum CUgraphChildGraphNodeOwnership_enum {
+    CU_GRAPH_CHILD_GRAPH_OWNERSHIP_CLONE = 0,
+    CU_GRAPH_CHILD_GRAPH_OWNERSHIP_MOVE = 1,
+} CUgraphChildGraphNodeOwnership;
+typedef CUDA_KERNEL_NODE_PARAMS_v2 CUDA_KERNEL_NODE_PARAMS_v3;
+typedef struct CUDA_MEMCPY_NODE_PARAMS_st {
+    int flags;
+    int reserved;
+    CUcontext copyCtx;
+    CUDA_MEMCPY3D copyParams;
+} CUDA_MEMCPY_NODE_PARAMS;
+typedef struct CUDA_MEMSET_NODE_PARAMS_v2_st {
+    CUdeviceptr dst;
+    size_t pitch;
+    unsigned int value;
+    unsigned int elementSize;
+    size_t width;
+    size_t height;
+    CUcontext ctx;
+} CUDA_MEMSET_NODE_PARAMS_v2;
+typedef struct CUDA_HOST_NODE_PARAMS_v2_st {
+    CUhostFn fn;
+    void* userData;
+    unsigned int syncMode;  /* CUDA 13 */
+    CUcontext ctx;          /* CUDA 13 */
+} CUDA_HOST_NODE_PARAMS_v2;
+typedef struct CUDA_CHILD_GRAPH_NODE_PARAMS_st {
+    CUgraph graph;
+    CUgraphChildGraphNodeOwnership ownership;
+} CUDA_CHILD_GRAPH_NODE_PARAMS;
+typedef struct CUDA_EVENT_RECORD_NODE_PARAMS_st {
+    CUevent event;
+    CUcontext ctx;  /* CUDA 13 */
+} CUDA_EVENT_RECORD_NODE_PARAMS;
+typedef struct CUDA_EVENT_WAIT_NODE_PARAMS_st {
+    CUevent event;
+} CUDA_EVENT_WAIT_NODE_PARAMS;
+typedef CUDA_MEM_ALLOC_NODE_PARAMS_v1 CUDA_MEM_ALLOC_NODE_PARAMS_v2;
+typedef struct CUDA_MEM_FREE_NODE_PARAMS_st {
+    CUdeviceptr dptr;
+} CUDA_MEM_FREE_NODE_PARAMS;
+typedef struct CUDA_CONDITIONAL_NODE_PARAMS {
+    CUgraphConditionalHandle handle;
+    CUgraphConditionalNodeType type;
+    unsigned int size;
+    CUgraph* phGraph_out;
+    CUcontext ctx;
+} CUDA_CONDITIONAL_NODE_PARAMS;
+typedef struct CUgraphNodeParams_st {
+    CUgraphNodeType type;
+    int reserved0[3];
+    union {
+        long long reserved1[29];
+        CUDA_KERNEL_NODE_PARAMS_v3 kernel;
+        CUDA_MEMCPY_NODE_PARAMS memcpy;
+        CUDA_MEMSET_NODE_PARAMS_v2 memset;
+        CUDA_HOST_NODE_PARAMS_v2 host;
+        CUDA_CHILD_GRAPH_NODE_PARAMS graph;
+        CUDA_EVENT_WAIT_NODE_PARAMS eventWait;
+        CUDA_EVENT_RECORD_NODE_PARAMS eventRecord;
+        CUDA_MEM_ALLOC_NODE_PARAMS_v2 alloc;
+        CUDA_MEM_FREE_NODE_PARAMS free;
+        CUDA_CONDITIONAL_NODE_PARAMS conditional;
+    };
+    long long reserved2;
+} CUgraphNodeParams;
+CUresult CUDAAPI cuGraphAddNode_v2(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                   const CUgraphEdgeData* dependencyData, size_t numDependencies,
+                                   CUgraphNodeParams* nodeParams);
+CUresult CUDAAPI cuGraphNodeSetParams(CUgraphNode hNode, CUgraphNodeParams* nodeParams);
+CUresult CUDAAPI cuGraphExecNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode, CUgraphNodeParams* nodeParams);
+CUresult CUDAAPI cuGraphConditionalHandleCreate(CUgraphConditionalHandle* pHandle_out, CUgraph hGraph, CUcontext ctx,
+                                                unsigned int defaultLaunchValue, unsigned int flags);
+CUresult CUDAAPI cuStreamBeginCaptureToGraph(CUstream hStream, CUgraph hGraph, const CUgraphNode* dependencies,
+                                             const CUgraphEdgeData* dependencyData, size_t numDependencies,
+                                             CUstreamCaptureMode mode);
+/* User objects */
+typedef struct CUuserObject_st* CUuserObject;
+#define CU_USER_OBJECT_NO_DESTRUCTOR_SYNC 0x1
+#define CU_GRAPH_USER_OBJECT_MOVE 0x1
+CUresult CUDAAPI cuUserObjectCreate(CUuserObject* object_out, void* ptr, CUhostFn destroy, unsigned int initialRefcount,
+                                    unsigned int flags);
+CUresult CUDAAPI cuUserObjectRetain(CUuserObject object, unsigned int count);
+CUresult CUDAAPI cuUserObjectRelease(CUuserObject object, unsigned int count);
+CUresult CUDAAPI cuGraphRetainUserObject(CUgraph graph, CUuserObject object, unsigned int count, unsigned int flags);
+CUresult CUDAAPI cuGraphReleaseUserObject(CUgraph graph, CUuserObject object, unsigned int count);
 CUresult CUDAAPI cuGraphGetNodes(CUgraph hGraph, CUgraphNode* nodes, size_t* numNodes);
 CUresult CUDAAPI cuGraphNodeGetType(CUgraphNode hNode, CUgraphNodeType* type);
 CUresult CUDAAPI cuGraphNodeGetDependencies_v2(CUgraphNode hNode, CUgraphNode* dependencies, CUgraphEdgeData* edgeData,

@@ -16,12 +16,30 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <regex>
 #include <sstream>
 
 using namespace vulkanizer;
 using namespace vulkanizer::driver;
 
 namespace {
+
+// Device runtime functions the CUDA driver resolves itself (nvcc leaves them as .extern calls):
+// cudaGraphSetConditional(handle, value) stores the value at the handle, the address of its
+// condition (api_graph.cpp).
+void defineDeviceRuntimeBuiltins(std::string& source) {
+    static const std::regex decl(R"(\.extern\s+\.func\s+cudaGraphSetConditional\s*\([^)]*\)\s*;)");
+    if (source.find("cudaGraphSetConditional") == std::string::npos) return;
+    source = std::regex_replace(source, decl, R"(.func cudaGraphSetConditional(.param .b64 vz_handle, .param .b32 vz_value)
+{
+    .reg .b64 %vz_h;
+    .reg .b32 %vz_v;
+    ld.param.b64 %vz_h, [vz_handle];
+    ld.param.b32 %vz_v, [vz_value];
+    st.global.b32 [%vz_h], %vz_v;
+    ret;
+})");
+}
 
 enum class ImageKind { Ptx, Cubin, FatBinary, FatBinaryWrapper, Empty };
 
@@ -162,6 +180,7 @@ CUresult loadModule(CUmodule* module, const void* image, std::string* errorLog) 
         case ImageKind::Ptx: mod->source = static_cast<const char*>(image); break;
     }
 
+    defineDeviceRuntimeBuiltins(mod->source);
     {
         std::string error;  // textures and surfaces: calls of the texture library (ptx/texture.h)
         if (!ptx::rewriteTextureInstructions(mod->source, error)) {

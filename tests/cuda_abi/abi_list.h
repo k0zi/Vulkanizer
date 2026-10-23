@@ -36,7 +36,10 @@
     X(CU_LAUNCH_ATTRIBUTE_LAUNCH_COMPLETION_EVENT) X(CU_LAUNCH_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT) \
     X(CU_CLUSTER_SCHEDULING_POLICY_SPREAD) X(CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ)                \
     X(CU_TENSOR_MAP_SWIZZLE_128B) X(CU_TENSOR_MAP_L2_PROMOTION_L2_256B)                           \
-    X(CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA) X(CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM)
+    X(CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA) X(CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM) \
+    X(CU_GRAPH_NODE_TYPE_CONDITIONAL) X(CU_GRAPH_NODE_TYPE_MEM_FREE) X(CU_GRAPH_COND_TYPE_SWITCH)  \
+    X(CU_GRAPH_COND_ASSIGN_DEFAULT) X(CU_GRAPH_CHILD_GRAPH_OWNERSHIP_MOVE) X(CU_USER_OBJECT_NO_DESTRUCTOR_SYNC) \
+    X(CU_GRAPH_USER_OBJECT_MOVE)
 
 #define VULKANIZER_CU_LAYOUTS(X)                                                                  \
     X(sizeof(CUmemLocation)) X(sizeof(CUmemAllocationProp))                                       \
@@ -54,6 +57,14 @@
     X(offsetof(CUDA_KERNEL_NODE_PARAMS_v2, kernelParams)) X(offsetof(CUDA_KERNEL_NODE_PARAMS_v2, ctx)) \
     X(sizeof(CUDA_MEMSET_NODE_PARAMS)) X(offsetof(CUDA_MEMSET_NODE_PARAMS, value))             \
     X(offsetof(CUDA_MEMSET_NODE_PARAMS, height)) X(sizeof(CUDA_HOST_NODE_PARAMS))              \
-    X(sizeof(CUgraphExecUpdateResultInfo)) X(sizeof(CUgraphEdgeData))
+    X(sizeof(CUgraphExecUpdateResultInfo)) X(sizeof(CUgraphEdgeData))                            \
+    X(sizeof(CUgraphNodeParams)) X(offsetof(CUgraphNodeParams, kernel))                           \
+    X(offsetof(CUgraphNodeParams, kernel.ctx)) X(offsetof(CUgraphNodeParams, memcpy.copyParams))   \
+    X(offsetof(CUgraphNodeParams, memset.ctx)) X(offsetof(CUgraphNodeParams, graph.ownership))     \
+    X(offsetof(CUgraphNodeParams, alloc.dptr)) X(offsetof(CUgraphNodeParams, free.dptr))           \
+    X(offsetof(CUgraphNodeParams, conditional.size)) X(offsetof(CUgraphNodeParams, conditional.phGraph_out)) \
+    X(offsetof(CUgraphNodeParams, conditional.ctx)) X(offsetof(CUgraphNodeParams, reserved2))      \
+    X(sizeof(CUDA_MEMCPY_NODE_PARAMS)) X(sizeof(CUDA_MEMSET_NODE_PARAMS_v2))                       \
+    X(sizeof(CUDA_CHILD_GRAPH_NODE_PARAMS)) X(sizeof(CUDA_CONDITIONAL_NODE_PARAMS))
 
 

@@ -1,0 +1,138 @@
+#version 460
+// Philox4x32-10 (Salmon et al., "Parallel random numbers: as easy as 1, 2, 3", SC 2011) in the order
+// of cuRAND's host API: 65536 threads, thread t draws blocks from subsequence t (the counter's high
+// half), group g of four outputs belongs to thread g mod 65536 and takes the thread's next block (two
+// for doubles). The state is each thread's next block (p.state[t]) and the first block of the group
+// a call ended inside (p.state[65536 + parity]): the next call finishes that group from there and
+// the thread continues after it. One invocation per group; kFlagAdvance then moves the state past the
+// call (one invocation per thread), kFlagInit sets it from the offset alone. With kFlagMtgp it stands
+// in for MTGP32 and (with kFlagMt19937) MT19937: other streams of the same key.
+
+#include "common.glsl"
+
+const uint64_t kThreads = 65536ul;
+const uint kFlagAdvance = 8u, kFlagParity = 16u, kFlagMt19937 = 32u;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Blocks { uint64_t v[]; };
+
+uvec4 philox(uint64_t block, uint64_t thread) {
+    uvec2 b = unpackUint2x32(block), t = unpackUint2x32(thread);
+    uint tag = (p.flags & kFlagMtgp) == 0u ? 0u : (p.flags & kFlagMt19937) != 0u ? 0x4D543139u : 0x4D544750u;
+    uvec4 c = uvec4(b.x, b.y, t.x, t.y ^ tag);
+    uvec2 k = unpackUint2x32(p.seed);
+    for (int r = 0; r < 10; ++r) {
+        uint hi0, lo0, hi1, lo1;
+        umulExtended(0xD2511F53u, c.x, hi0, lo0);
+        umulExtended(0xCD9E8D57u, c.z, hi1, lo1);
+        c = uvec4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
+        k += uvec2(0x9E3779B9u, 0xBB67AE85u);
+    }
+    return c;
+}
+
+// The call's groups: g0 (the first, a continuation if the offset is inside it) to gEnd.
+struct Call {
+    uint64_t g0, gEnd, t0;
+    bool resume;
+    uint64_t width;  // blocks per group
+};
+
+Call call() {
+    Call c;
+    c.g0 = p.offset / 4ul;
+    c.gEnd = (p.offset + p.count - 1ul) / 4ul;
+    c.t0 = c.g0 % kThreads;
+    c.resume = p.offset % 4ul != 0ul;
+    c.width = doubleKind(p.kind) ? 2ul : 1ul;
+    return c;
+}
+
+// The block where thread t's first new group of the call starts, and that group's round.
+void firstNew(Call c, uint64_t t, Blocks state, out uint64_t block, out uint64_t round) {
+    const uint64_t pending = state.v[uint(kThreads + ((p.flags & kFlagParity) != 0u ? 1ul : 0ul))];
+    const bool own = t == c.t0 && c.resume;
+    block = own ? pending + c.width : state.v[uint(t)];
+    round = t > c.t0 || (t == c.t0 && !c.resume) ? c.g0 / kThreads : c.g0 / kThreads + 1ul;
+}
+
+uint64_t baseOf(Call c, uint64_t g, Blocks state) {
+    if (c.resume && g == c.g0) return state.v[uint(kThreads + ((p.flags & kFlagParity) != 0u ? 1ul : 0ul))];
+    uint64_t block, round;
+    firstNew(c, g % kThreads, state, block, round);
+    return block + c.width * (g / kThreads - round);
+}
+
+void main() {
+    Blocks state = Blocks(canon(p.state));
+    if ((p.flags & kFlagInit) != 0u) {
+        const uint64_t t = invocation();
+        if (t >= kThreads) return;
+        const uint64_t g0 = p.offset / 4ul, round = g0 / kThreads;
+        state.v[uint(t)] = round + (t < g0 % kThreads ? 1ul : 0ul);
+        if (t == 0ul) state.v[uint(kThreads)] = round;
+        return;
+    }
+    const Call c = call();
+    if ((p.flags & kFlagAdvance) != 0u) {
+        const uint64_t t = invocation();
+        if (t >= kThreads) return;
+        uint64_t block, round;
+        firstNew(c, t, state, block, round);
+        // the thread's new groups: rounds round .. of gEnd's
+        const uint64_t last = c.gEnd / kThreads - (t > c.gEnd % kThreads ? 1ul : 0ul);
+        const bool any = last + 1ul > round && last * kThreads + t >= c.g0;
+        const uint64_t next = any ? block + c.width * (last + 1ul - round) : block;
+        if ((p.offset + p.count) % 4ul != 0ul && t == c.gEnd % kThreads)
+            state.v[uint(kThreads + ((p.flags & kFlagParity) != 0u ? 0ul : 1ul))] = baseOf(c, c.gEnd, state);
+        state.v[uint(t)] = next;  // after baseOf above: it reads only this thread's entry and the old slot
+        return;
+    }
+    const uint64_t g = c.g0 + invocation();
+    if (g > c.gEnd) return;
+    const uint64_t t = g % kThreads;
+    const uint64_t end = p.offset + p.count;
+    const bool wide = doubleKind(p.kind);
+    const uint64_t block = baseOf(c, g, state);
+    uvec4 w0 = philox(block, t);
+    uvec4 w1 = wide ? philox(block + 1ul, t) : uvec4(0u);
+#ifndef DOUBLE
+    vec2 n0 = vec2(0.0), n1 = vec2(0.0);
+    if (normalKind(p.kind)) {
+        n0 = boxMullerf(w0.x, w0.y);
+        n1 = boxMullerf(w0.z, w0.w);
+    }
+#else
+    dvec2 d0 = dvec2(0.0LF), d1 = dvec2(0.0LF);
+    vec2 n0 = vec2(0.0), n1 = vec2(0.0);
+    if (p.kind == kNormalDouble || p.kind == kLogNormalDouble) {
+        d0 = boxMullerd(w0.x, w0.y, w0.z, w0.w);
+        d1 = boxMullerd(w1.x, w1.y, w1.z, w1.w);
+    } else if (normalKind(p.kind)) {
+        n0 = boxMullerf(w0.x, w0.y);
+        n1 = boxMullerf(w0.z, w0.w);
+    }
+#endif
+    for (uint q = 0u; q < 4u; ++q) {
+        const uint64_t j = g * 4ul + q;
+        if (j < p.offset || j >= end) continue;
+        const uint64_t i = j - p.offset;
+        const uint word = w0[q];
+        switch (p.kind) {
+        case kU32: storeU32(i, word); break;
+        case kUniform: storeF32(i, uniformf(word)); break;
+        case kNormal:
+        case kLogNormal: storeF32(i, scalef(q < 2u ? n0[q] : n1[q - 2u])); break;
+        case kPoisson: storeU32(i, poisson(word)); break;
+#ifdef DOUBLE
+        case kUniformDouble: {
+            uvec4 w = q < 2u ? w0 : w1;
+            uint k = (q & 1u) * 2u;
+            storeF64(i, uniformd(w[k], w[k + 1u]));
+            break;
+        }
+        case kNormalDouble:
+        case kLogNormalDouble: storeF64(i, scaled(q < 2u ? d0[q] : d1[q - 2u])); break;
+#endif
+        }
+    }
+}

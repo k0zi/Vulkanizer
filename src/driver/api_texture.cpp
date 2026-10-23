@@ -288,6 +288,21 @@ CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D* pCopy) {
 CUresult CUDAAPI cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D* pCopy) { return cuMemcpy2D_v2(pCopy); }
 CUresult CUDAAPI cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D* pCopy, CUstream hStream) {
     VULKANIZER_TRACE_API();
+    if (pCopy) {
+        ApiScope s;
+        if (CUresult r = enterContext(s)) return r;
+        if (CUstream cs = capturingStream(hStream)) {
+            CUDA_MEMCPY3D c{};
+            c.srcXInBytes = pCopy->srcXInBytes, c.srcY = pCopy->srcY;
+            c.srcMemoryType = pCopy->srcMemoryType, c.srcHost = pCopy->srcHost, c.srcDevice = pCopy->srcDevice;
+            c.srcArray = pCopy->srcArray, c.srcPitch = pCopy->srcPitch;
+            c.dstXInBytes = pCopy->dstXInBytes, c.dstY = pCopy->dstY;
+            c.dstMemoryType = pCopy->dstMemoryType, c.dstHost = pCopy->dstHost, c.dstDevice = pCopy->dstDevice;
+            c.dstArray = pCopy->dstArray, c.dstPitch = pCopy->dstPitch;
+            c.WidthInBytes = pCopy->WidthInBytes, c.Height = pCopy->Height, c.Depth = 1;
+            return captureCopy3D(cs, c);
+        }
+    }
     return copy2D(pCopy, true, hStream);
 }
 CUresult CUDAAPI cuMemcpy3D_v2(const CUDA_MEMCPY3D* pCopy) {
@@ -296,6 +311,11 @@ CUresult CUDAAPI cuMemcpy3D_v2(const CUDA_MEMCPY3D* pCopy) {
 }
 CUresult CUDAAPI cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* pCopy, CUstream hStream) {
     VULKANIZER_TRACE_API();
+    if (pCopy) {
+        ApiScope s;
+        if (CUresult r = enterContext(s)) return r;
+        if (CUstream cs = capturingStream(hStream)) return captureCopy3D(cs, *pCopy);
+    }
     return copy3DParams(pCopy, true, hStream);
 }
 

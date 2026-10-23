@@ -96,7 +96,28 @@ struct GraphMemory {
     std::vector<CUdeviceptr> allocations;
     ~GraphMemory();
 };
+
+// A conditional node's handle (CUgraphConditionalHandle is `device`): a 32-bit value in device
+// memory that kernels set with cudaGraphSetConditional (a store, ptx::defineDeviceRuntimeBuiltins).
+// With CU_GRAPH_COND_ASSIGN_DEFAULT it is reset to defaultValue whenever its graph starts.
+struct ConditionSlot {
+    CUcontext ctx = nullptr;
+    CUdeviceptr device = 0;
+    unsigned int defaultValue = 0;
+    bool assignDefault = false;
+    ~ConditionSlot();
+};
+using Conditions = std::vector<std::shared_ptr<ConditionSlot>>;
 }  // namespace vulkanizer::driver
+
+// A user object (cuUserObjectCreate): its destructor runs when the last reference is released.
+struct CUuserObject_st {
+    static constexpr uint32_t kMagic = 0x4a425553;  // 'SUBJ'
+    uint32_t magic = kMagic;
+    void* ptr = nullptr;
+    CUhostFn destroy = nullptr;
+    std::atomic<unsigned int> refs{0};
+};
 
 // A node of a CUDA graph. Kernel nodes keep their parameters packed as cuLaunchKernel would.
 struct CUgraphNode_st {
@@ -119,9 +140,23 @@ struct CUgraphNode_st {
     // host
     CUhostFn fn = nullptr;
     void* userData = nullptr;
-    // child graph: its nodes in order, and its memory; memory nodes: dst and bytes
+    // child graph: its nodes in order, its memory and conditional handles; memory nodes: dst and bytes
     std::vector<CUgraphNode_st> children;
     std::vector<std::shared_ptr<vulkanizer::driver::GraphMemory>> childMemory;
+    vulkanizer::driver::Conditions childConditions;
+    // memcpy given as CUDA_MEMCPY3D (cuGraphAddMemcpyNode, 2D/3D copies), instead of dst/src/bytes
+    bool copy3D = false;
+    CUDA_MEMCPY3D copy{};
+    // event record/wait
+    CUevent event = nullptr;
+    // conditional: the handle, the kind and the body graphs (owned by the node and its copies); in an
+    // executable graph also each body's nodes in order and its handles (frozen when instantiated)
+    std::shared_ptr<vulkanizer::driver::ConditionSlot> condition;
+    CUgraphConditionalNodeType condType = CU_GRAPH_COND_TYPE_IF;
+    std::vector<std::shared_ptr<CUgraph_st>> bodies;
+    std::vector<CUgraph> bodyHandles;  // the array cuGraphAddNode hands out (phGraph_out)
+    std::vector<std::vector<CUgraphNode_st>> bodyNodes;
+    std::vector<vulkanizer::driver::Conditions> bodyConditions;
 };
 
 struct CUgraph_st {
@@ -132,6 +167,10 @@ struct CUgraph_st {
     std::vector<CUstream> capturing;                       // streams capturing into this graph
     uint64_t captureId = 0;                                // cuStreamGetCaptureInfo's id
     std::shared_ptr<vulkanizer::driver::GraphMemory> memory;  // of its memory nodes (created with the first)
+    bool fromCapture = false;                                 // made by cuStreamBeginCapture
+    vulkanizer::driver::Conditions conditions;                // handles created for it
+    std::map<CUuserObject, unsigned int> userObjects;         // references it holds
+    std::unordered_map<CUgraphNode, CUgraphNode> clonedFrom;  // a clone: original node -> its copy
 };
 
 // An instantiated graph: its own copy of the nodes, run in order on the launch stream.
@@ -142,6 +181,8 @@ struct CUgraphExec_st {
     std::vector<CUgraphNode_st> nodes;
     std::unordered_map<CUgraphNode, size_t> index;  // graph node -> position in `nodes`
     std::vector<std::shared_ptr<vulkanizer::driver::GraphMemory>> memory;  // of the graphs it was made from
+    vulkanizer::driver::Conditions conditions;                              // the graph's handles
+    std::map<CUuserObject, unsigned int> userObjects;                       // references it holds
 };
 
 // A memory pool (stream-ordered allocation). Allocations come straight from the device; the pool
@@ -323,6 +364,8 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
 // a node after the stream's current dependencies (invalidated captures report the error).
 CUstream capturingStream(CUstream hStream);
 CUresult captureNode(CUstream hStream, std::unique_ptr<CUgraphNode_st> node);
+// A 2D/3D copy on a capturing stream: a memcpy node.
+CUresult captureCopy3D(CUstream hStream, const CUDA_MEMCPY3D& copy);
 // Synchronizing a capturing stream is illegal: it ends the capture as invalidated.
 CUresult refuseIfCapturing(CUstream hStream);
 // Stream-ordered allocation and free on a capturing stream (`cs`): memory nodes (graph memory).

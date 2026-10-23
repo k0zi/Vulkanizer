@@ -1,0 +1,5 @@
+/* Same symbol version as the official libcurand.so.10. */
+libcurand.so.10 {
+  global: curand*;
+  local: *;
+};

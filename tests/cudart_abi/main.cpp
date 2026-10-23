@@ -32,6 +32,7 @@ int main() {
     i = 0;
 #define TEX(e) check(#e, a.texture[i], b.texture[i]), ++i;
     VULKANIZER_TEXTURE_LAYOUT(TEX)
+    VULKANIZER_GRAPH_LAYOUT(TEX)
     std::printf(bad ? "%d mismatch(es)\n" : "OK\n", bad);
     return bad ? 1 : 0;
 }

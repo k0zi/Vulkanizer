@@ -598,6 +598,25 @@ int main() {
         {"gemv pointer batched", T, N, 100, 1, 64, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 0.0f, -6},
         {"gemv m=1 pointer batched", N, N, 1, 100, 64, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 0.0f, -4},
         {"k = 0 scales C", N, N, 10, 10, 0, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 3.0f, 1},
+        // 128 x 128 tiles (gemm_tiled.comp): every layout, 16-byte and scalar loads, edge tiles
+        {"tiled NN", N, N, 200, 300, 77, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, -0.5f, 1},
+        {"tiled TN vec", T, N, 256, 384, 64, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 0.0f, 1, CUBLAS_COMPUTE_32F,
+         true},
+        {"tiled NT vec", N, T, 136, 264, 40, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 0.5f, 1.0f, 1, CUBLAS_COMPUTE_32F,
+         true},
+        {"tiled TT", T, T, 129, 131, 300, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 0.0f, 1},
+        {"tiled NN vec A, k % 8", N, N, 200, 130, 100, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 2.0f, 1,
+         CUBLAS_COMPUTE_32F, true},
+        {"tiled f16 NN vec", N, N, 192, 200, 96, CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, 1.0f, 0.5f, 1,
+         CUBLAS_COMPUTE_32F, true},
+        {"tiled bf16 NT -> f32", N, T, 140, 150, 33, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F, 1.0f, 0.0f, 1},
+        {"tiled f16 x f32 TT vec", T, T, 256, 128, 80, CUDA_R_16F, CUDA_R_32F, CUDA_R_32F, -1.0f, 0.0f, 1,
+         CUBLAS_COMPUTE_32F, true},
+        {"tiled bf16 TN -> bf16", T, N, 160, 144, 48, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_16BF, 1.0f, 0.0f, 1,
+         CUBLAS_COMPUTE_32F, true},
+        {"tiled strided NN vec", N, N, 128, 136, 64, CUDA_R_32F, CUDA_R_32F, CUDA_R_32F, 1.0f, 0.0f, 3,
+         CUBLAS_COMPUTE_32F, true},
+        {"tiled pointers f16 NT", N, T, 130, 140, 50, CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, 1.0f, 0.0f, -3},
     };
     for (const Case& c : cases) runCase(h, c);
     testTrsm(h);

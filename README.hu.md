@@ -10,10 +10,10 @@ A példátlan káosz e korszakában a kozmosz sorsa hajszálon függ. A pusztít
 
 # Vulkanizer
 
-A `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so`, `libcufft.so` és `libcusparse.so` közvetlen
-helyettesítője: a CUDA Driver és Runtime API-t (és a cuBLAS GEMM-családját, a sűrű és ritka lineáris algebrát és az
-FFT-t) Vulkan compute-ra építve valósítja meg, így a CUDA-programok NVIDIA-kártya nélkül futnak, bármely Vulkan 1.2-es
-GPU-n (AMD, Intel, llvmpipe).
+A `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so`, `libcufft.so`, `libcusparse.so` és `libcurand.so`
+közvetlen helyettesítője: a CUDA Driver és Runtime API-t (és a cuBLAS GEMM-családját, a sűrű és ritka lineáris algebrát,
+az FFT-t és a véletlenszámokat) Vulkan compute-ra építve valósítja meg, így a CUDA-programok NVIDIA-kártya nélkül
+futnak, bármely Vulkan 1.2-es GPU-n (AMD, Intel, llvmpipe).
 Terv, architektúra és fázisok: [plan.md](plan.md).
 
 ## Követelmények
@@ -48,10 +48,10 @@ build/bin/vulkanizer-info                       # milyen Vulkan eszközöket lá
 ```
 
 A lefordított könyvtárak a `build/lib/`-ben vannak: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`,
-`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`, `libnccl.so.2`. A `build/lib/cuda13/`
-a runtime és a könyvtárak CUDA 13-as változatait tartalmazza (`libcudart.so.13`, `libcublas.so.13`,
-`libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`) a CUDA 13-mal fordított programokhoz;
-ezek ugyanazt a `libcuda.so.1`-et használják.
+`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`, `libcurand.so.10`, `libnccl.so.2`. A
+`build/lib/cuda13/` a runtime és a könyvtárak CUDA 13-as változatait tartalmazza (`libcudart.so.13`, `libcublas.so.13`,
+`libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`, `libcurand.so.10`) a CUDA 13-mal
+fordított programokhoz; ezek ugyanazt a `libcuda.so.1`-et használják.
 
 #### Telepítés (csomag)
 
@@ -159,11 +159,11 @@ néven a `.work/torch-cf13` ellen. Olyan környezetben, ahol `libcudart.so.13` v
 A hivatalos PyTorch wheelekben csak natív NVIDIA gépi kód (SASS) van, PTX nincs, így a Vulkanizer nem tudja futtatni a
 kerneleiket. A conda-forge CUDA-buildjei PTX-et is tartalmaznak (`compute_120`): a `tools/setup_torch.sh` ezeket
 telepíti micromambával, rendszerszintű telepítés nélkül. A `run_torch.sh` az NVIDIA-é helyett a Vulkanizer `libcuda`,
-`libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft` és `libcusparse` könyvtárait tölti be, és kikapcsol
-mindent, ami NVIDIA hardvert vagy könyvtárat igényel: a cuDNN-t, a fúzionált attention kerneleket (a
+`libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft`, `libcusparse` és `libcurand` könyvtárait tölti be,
+és kikapcsol mindent, ami NVIDIA hardvert vagy könyvtárat igényel: a cuDNN-t, a fúzionált attention kerneleket (a
 `scaled_dot_product_attention` a math úton fut) és a `torch._native` DSL-kerneleit (`TORCH_DISABLE_NATIVE_JIT=1`): a
-Triton-kernelei működnek, a CuTe DSL kernelei viszont SASS-ra fordulnak, és ugyanaz az egy kapcsoló mindkettőt tiltja.
-A `VULKANIZER_TORCH_DEFAULTS=0` mindezt kihagyja. Maga a Triton (`torch.compile`, `@triton.jit`) működik: a
+Triton-kernelei működnek, a CuTe DSL kernelei viszont SASS-ra fordulnak, és ugyanaz az egy kapcsoló mindkettőt tiltja. A
+`VULKANIZER_TORCH_DEFAULTS=0` mindezt kihagyja. Maga a Triton (`torch.compile`, `@triton.jit`) működik: a
 `tools/triton/ptxas` továbbadja a Triton PTX-ét ahelyett, hogy lefordítaná, a Triton launchere pedig a Vulkanizer
 `include/cuda.h`-ja ellen fordul (C-fordító kell hozzá). A `torch.linalg` (LU, Cholesky, QR, legkisebb négyzetek,
 `eigh`, SVD, `pinv`, ...) a Vulkanizer cuSOLVER-én, a `torch.fft` (a `stft` is) a cuFFT-jén, a `torch.sparse` a
@@ -259,7 +259,7 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   runtime az NVIDIA-driver nem dokumentált belső részeit igényli.
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph és memória-csomópont (stream-rendezett
-  foglalás capture alatt) is; feltételes csomópont nincs.
+  foglalás capture alatt) és feltételes csomópont (if, while, switch; mindegyiknél a host megvárja a GPU-t) is.
 - (Még) nem támogatott: cuDNN.
 - A textúrák és surface-ek (texture és surface objectek, CUDA arrayk) szoftveres mintavételezéssel mennek, a CUDA
   címzésével és szűrésével; mipmap, cube map, textúra-referencia és formázott surface-írás nincs.
@@ -283,6 +283,10 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   (`geev`); az `eigh` és az SVD Jacobi-iterációt használ, ami nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek
   callbackek és több GPU-s tervek; a 2048-nál (f64: 1024) hosszabb transzformációk radixonként egyszer bejárják a
   memóriát. cuSPARSE: nincs blokkos ritka (BSR) formátum és komplex érték; az SpGEMM és a rendezések a hoston futnak.
+- cuRAND: az XORWOW, az MRG32k3a, a Philox és a Sobol az NVIDIA sorozatait adja (a normális és lognormális eloszlás
+  kerekítésnyi eltéréssel); az MTGP32-t és az MT19937-et elfogadja, de más sorozatot ad, ahogy a scrambled Sobol és a
+  Poisson is; a double kimenetekhez `shaderFloat64` kell. Az eszközoldali API (`curand_kernel.h`) működik, kivéve a
+  hoston készített eloszlásokat (`curand_discrete`).
 - ComfyUI: nincsenek a CUDA 13-ra (cu130) optimalizált utak.
 
 ## Szkriptek
@@ -323,6 +327,7 @@ src/linalg            sűrű felbontások (LU, Cholesky, QR, Jacobi eigh/SVD) GL
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham és Bluestein FFT GLSL-ben), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 GLSL-ben), include/cusparse/cusparse.h
+src/curand            libcurand.so.10 (XORWOW/MRG32k3a/Philox/Sobol GLSL-ben; Sobol-adatok: tools/gen_sobol_table.sh), include/curand/curand.h
 src/nccl              libnccl.so.2 (kollektívák egy gép rangjai között), include/nccl/nccl.h
 src/nvrtc             LD_AUDIT könyvtár: az NVRTC cubin helyett PTX-et ad (a PyTorch jiteratorához), az nvJitLink cuLink*-kal linkel (Numba)
 tests/                Driver API tesztek + belső Vulkan teszt

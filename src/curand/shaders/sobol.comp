@@ -1,0 +1,47 @@
+#version 460
+// Sobol sequences (32 or 64 bits, kFlagSobol64) in Gray code order, one invocation per output. The
+// output is dimension-major as in cuRAND: p.count points of dimension 0, then of dimension 1, ...;
+// point i of the call is point p.offset + i of the sequence. Scrambled sequences come with their own
+// direction vectors and XOR a constant per dimension (p.aux).
+
+#include "common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer V32 { uint v; };
+
+void main() {
+    const uint64_t o = invocation();
+    if (o >= p.count * uint64_t(p.dims)) return;
+    const uint64_t d = o / p.count, i = o - d * p.count;
+    const uint64_t point = p.offset + i, gray = point ^ (point >> 1);
+    const bool wide = (p.flags & kFlagSobol64) != 0u;
+    uint64_t x = 0ul;
+    for (uint k = 0u; k < (wide ? 64u : 32u); ++k) {
+        if (((gray >> k) & 1ul) == 0ul) continue;
+        x ^= wide ? U64(canon(p.state + (d * 64ul + k) * 8ul)).v : uint64_t(V32(canon(p.state + (d * 32ul + k) * 4ul)).v);
+    }
+    if (p.aux != 0ul) x ^= wide ? U64(canon(p.aux + d * 8ul)).v : uint64_t(V32(canon(p.aux + d * 4ul)).v);
+    const uint high = wide ? uint(x >> 32) : uint(x);
+    switch (p.kind) {
+    case kU32: storeU32(o, uint(x)); break;
+    case kU64: storeU64(o, x); break;
+    case kUniform: storeF32(o, uniformf(high)); break;
+    case kNormal:
+    case kLogNormal: storeF32(o, scalef(normcdfinvf_(uniformf(high)))); break;
+    case kPoisson: storeU32(o, poisson(high)); break;
+#ifdef DOUBLE
+    case kUniformDouble: {
+        precise double u = wide ? double(x >> 11) * 1.1102230246251565e-16LF + 5.5511151231257827e-17LF
+                                : double(x) * 2.3283064365386963e-10LF + 2.3283064365386963e-10LF;
+        storeF64(o, u);
+        break;
+    }
+    case kNormalDouble:
+    case kLogNormalDouble: {
+        precise double u = wide ? double(x >> 11) * 1.1102230246251565e-16LF + 5.5511151231257827e-17LF
+                                : double(x) * 2.3283064365386963e-10LF + 1.1641532182693481e-10LF;
+        storeF64(o, scaled(normcdfinvd_(u)));
+        break;
+    }
+#endif
+    }
+}

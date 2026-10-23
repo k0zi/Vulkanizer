@@ -14,12 +14,17 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <vector>
 
 namespace {
 
 const uint32_t kGemmSpirv[] = {
 #include "gemm.comp.inc"
+};
+const uint32_t kGemmTiledSpirv[] = {
+#include "gemm_tiled.comp.inc"
 };
 const uint32_t kGemmF16TnSpirv[] = {
 #include "gemm_f16_tn.comp.inc"
@@ -115,6 +120,7 @@ struct cublasContext {
     cublasPointerMode_t pointerMode = CUBLAS_POINTER_MODE_HOST;
     cublasAtomicsMode_t atomics = CUBLAS_ATOMICS_NOT_ALLOWED;
     CUfunction gemm = nullptr;
+    std::map<uint32_t, CUfunction> gemmTiled;  // gemm_tiled.comp per operand layout (its kConfig)
     CUfunction gemv = nullptr;
     // gemm_f16_tn.comp variants, indexed by bit 0 = f16 C, bit 1 = f16 math
     CUfunction gemmF16Tn[4] = {};
@@ -123,6 +129,18 @@ struct cublasContext {
 };
 
 namespace {
+
+// The SPIR-V with specialization constant `id`'s default changed to `value` (for constants the
+// pipeline creation does not set: they then fold like literals).
+std::vector<uint32_t> withSpecConstant(const uint32_t* code, size_t words, uint32_t id, uint32_t value) {
+    std::vector<uint32_t> out(code, code + words);
+    uint32_t target = 0;
+    for (size_t i = 5; i < out.size(); i += out[i] >> 16)  // OpDecorate <target> SpecId <id>
+        if ((out[i] & 0xFFFF) == 71 && (out[i] >> 16) == 4 && out[i + 2] == 1 && out[i + 3] == id) target = out[i + 1];
+    for (size_t i = 5; target && i < out.size(); i += out[i] >> 16)  // OpSpecConstant <type> <target> <value>
+        if ((out[i] & 0xFFFF) == 50 && out[i + 2] == target) out[i + 3] = value;
+    return out;
+}
 
 // alpha/beta as float: host or device pointer, of the compute type's scalar type.
 bool scalar(cublasHandle_t h, const void* p, cublasComputeType_t compute, float& out) {
@@ -297,19 +315,38 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
                          !std::getenv("VULKANIZER_GEMM_F32");
     VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d types %u/%u/%u compute %d batch %d%s -> %s", g.transa ? 'T' : 'N',
                 g.transb ? 'T' : 'N', g.m, g.n, g.k, ta, tb, tc, int(g.compute), g.batch, g.pointerArrays ? " (arrays)" : "",
-                !fast ? "generic" : f16Math ? "f16 tn, f16 math" : "f16 tn");
+                !fast ? (g.m >= int(kFastTile) && g.n >= int(kFastTile) ? "tiled" : "generic")
+                      : f16Math ? "f16 tn, f16 math" : "f16 tn");
     const int variant = (tc == 1 ? 1 : 0) | (f16Math ? 2 : 0);
-    CUfunction* fn = fast ? &h->gemmF16Tn[variant] : &h->gemm;
+    // The rest: 128 x 128 tiles once both dimensions fill one, compiled for the operands' layout:
+    // contiguous along k or not, the types, and 16-byte loads where every row start is 16-byte
+    // aligned (not knowable for pointer arrays) and the contiguous dimension a multiple of 8.
+    const bool tiled = !fast && g.m >= int(kFastTile) && g.n >= int(kFastTile);
+    uint32_t config = 0;
+    if (tiled) {
+        const bool alongKA = g.transa != CUBLAS_OP_N, alongKB = g.transb == CUBLAS_OP_N;
+        const auto vec = [&](const void* ptr, long long stride, int ld, uint32_t type, int contiguous) {
+            const long long size = type == 0 ? 4 : 2;
+            return !g.pointerArrays && (reinterpret_cast<uintptr_t>(ptr) & 15) == 0 && (stride * size) % 16 == 0 &&
+                   (ld * size) % 16 == 0 && contiguous % 8 == 0;
+        };
+        config = (alongKA ? 1u : 0u) | (alongKB ? 2u : 0u) | ta << 2 | tb << 4 |
+                 (vec(g.a, g.strideA, g.lda, ta, alongKA ? g.k : g.m) ? 64u : 0u) |
+                 (vec(g.b, g.strideB, g.ldb, tb, alongKB ? g.k : g.n) ? 128u : 0u);
+    }
+    CUfunction* fn = fast ? &h->gemmF16Tn[variant] : tiled ? &h->gemmTiled[config] : &h->gemm;
     if (!*fn) {
         static const uint32_t* const kCode[] = {kGemmF16TnSpirv, kGemmF16TnHSpirv, kGemmF16TnMSpirv, kGemmF16TnMHSpirv};
         static const size_t kWords[] = {sizeof kGemmF16TnSpirv / 4, sizeof kGemmF16TnHSpirv / 4,
                                         sizeof kGemmF16TnMSpirv / 4, sizeof kGemmF16TnMHSpirv / 4};
-        const uint32_t* code = fast ? kCode[variant] : kGemmSpirv;
-        const size_t words = fast ? kWords[variant] : sizeof kGemmSpirv / 4;
+        std::vector<uint32_t> specialized;
+        if (tiled) specialized = withSpecConstant(kGemmTiledSpirv, sizeof kGemmTiledSpirv / 4, 10, config);
+        const uint32_t* code = fast ? kCode[variant] : tiled ? specialized.data() : kGemmSpirv;
+        const size_t words = fast ? kWords[variant] : tiled ? specialized.size() : sizeof kGemmSpirv / 4;
         if (vulkanizerCreateSpirvFunction(fn, code, words, "main", sizeof(GemmParams)) != CUDA_SUCCESS)
             return CUBLAS_STATUS_INTERNAL_ERROR;
     }
-    const unsigned tile = fast ? kFastTile : kTile;
+    const unsigned tile = fast || tiled ? kFastTile : kTile;
     const unsigned gx = (unsigned(g.m) + tile - 1) / tile, gy = (unsigned(g.n) + tile - 1) / tile;
     for (int first = 0; first < g.batch; first += int(kMaxGridZ)) {
         p.batchOffset = first;

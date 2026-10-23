@@ -10,10 +10,10 @@ En cette ère de chaos sans précédent, le destin du cosmos ne tient qu’à un
 
 # Vulkanizer
 
-Remplacement direct de `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so`, `libcufft.so` et
-`libcusparse.so` : implémente les API CUDA Driver et Runtime (ainsi que la famille GEMM de cuBLAS, l’algèbre linéaire
-dense et creuse et les FFT) sur Vulkan Compute, pour que les programmes CUDA tournent sans carte NVIDIA, sur n’importe
-quel GPU Vulkan 1.2 (AMD, Intel, llvmpipe).
+Remplacement direct de `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so`, `libcufft.so`, `libcusparse.so`
+et `libcurand.so` : implémente les API CUDA Driver et Runtime (ainsi que la famille GEMM de cuBLAS, l’algèbre linéaire
+dense et creuse, les FFT et les nombres aléatoires) sur Vulkan Compute, pour que les programmes CUDA tournent sans carte
+NVIDIA, sur n’importe quel GPU Vulkan 1.2 (AMD, Intel, llvmpipe).
 Plan, architecture et phases : [plan.md](plan.md) (en hongrois).
 
 ## Prérequis
@@ -48,10 +48,10 @@ build/bin/vulkanizer-info                       # les périphériques Vulkan que
 ```
 
 Les bibliothèques compilées se trouvent dans `build/lib/` : `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`,
-`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`, `libnccl.so.2`. `build/lib/cuda13/`
-contient les versions CUDA 13 du runtime et des bibliothèques (`libcudart.so.13`, `libcublas.so.13`,
-`libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`), pour les programmes compilés avec
-CUDA 13 ; elles utilisent la même `libcuda.so.1`.
+`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`, `libcurand.so.10`, `libnccl.so.2`.
+`build/lib/cuda13/` contient les versions CUDA 13 du runtime et des bibliothèques (`libcudart.so.13`, `libcublas.so.13`,
+`libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`, `libcurand.so.10`), pour les programmes
+compilés avec CUDA 13 ; elles utilisent la même `libcuda.so.1`.
 
 #### Installation (paquet)
 
@@ -161,14 +161,14 @@ tools/setup_torch.sh --cuda13              # la version CUDA 13.4 dans .work/tor
 Les wheels officiels de PyTorch ne contiennent que du code machine NVIDIA natif (SASS), sans PTX : Vulkanizer ne peut
 donc pas exécuter leurs kernels. Les versions CUDA de conda-forge contiennent aussi du PTX (`compute_120`) :
 `tools/setup_torch.sh` les installe avec micromamba, sans installation à l’échelle du système. `run_torch.sh` charge
-`libcuda`, `libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft` et `libcusparse` de Vulkanizer à la
-place de celles de NVIDIA, et désactive tout ce qui exige du matériel ou des bibliothèques NVIDIA : cuDNN, les kernels
-d’attention fusionnés (`scaled_dot_product_attention` passe par le chemin mathématique) et les kernels DSL de
-`torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`) : ses kernels Triton fonctionnent, mais ses kernels CuTe DSL se
-compilent en SASS, et le même interrupteur désactive les deux. `VULKANIZER_TORCH_DEFAULTS=0` désactive ces réglages.
-Triton lui-même (`torch.compile`, `@triton.jit`) fonctionne : `tools/triton/ptxas` transmet le PTX de Triton au lieu
-de l’assembler, et le lanceur de Triton est compilé avec `include/cuda.h` de Vulkanizer (il faut un compilateur C).
-`torch.linalg` (LU, Cholesky, QR, moindres carrés, `eigh`, SVD, `pinv`, ...) tourne sur le cuSOLVER de Vulkanizer et
+`libcuda`, `libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft`, `libcusparse` et `libcurand` de
+Vulkanizer à la place de celles de NVIDIA, et désactive tout ce qui exige du matériel ou des bibliothèques NVIDIA :
+cuDNN, les kernels d’attention fusionnés (`scaled_dot_product_attention` passe par le chemin mathématique) et les
+kernels DSL de `torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`) : ses kernels Triton fonctionnent, mais ses kernels CuTe
+DSL se compilent en SASS, et le même interrupteur désactive les deux. `VULKANIZER_TORCH_DEFAULTS=0` désactive ces
+réglages. Triton lui-même (`torch.compile`, `@triton.jit`) fonctionne : `tools/triton/ptxas` transmet le PTX de Triton
+au lieu de l’assembler, et le lanceur de Triton est compilé avec `include/cuda.h` de Vulkanizer (il faut un compilateur
+C). `torch.linalg` (LU, Cholesky, QR, moindres carrés, `eigh`, SVD, `pinv`, ...) tourne sur le cuSOLVER de Vulkanizer et
 `torch.fft` (y compris `stft`) sur son cuFFT, `torch.sparse` sur son cuSPARSE ; `run_torch.sh` définit
 `TORCH_LINALG_PREFER_CUSOLVER=1`, car les kernels propres à MAGMA ne tournent pas. Le jiterator de PyTorch compile ses
 kernels à l’exécution avec NVRTC en code natif ; une bibliothèque `LD_AUDIT` (`libvulkanizer_nvrtc.so`) lui fait
@@ -264,7 +264,8 @@ Liste complète : [plan.md, section 4](plan.md).
   pas : ce runtime a besoin d’éléments internes non documentés du pilote NVIDIA.
 - CUDA Graphs : la capture de stream et la relecture fonctionnent (les graphes de llama.cpp, `CUDAGraph` de PyTorch,
   `torch.compile(mode="reduce-overhead")`) ; aussi les graphes enfants et les nœuds
-  mémoire (allocation ordonnée par flux pendant la capture) ; pas de nœuds conditionnels.
+  mémoire (allocation ordonnée par flux pendant la capture) et les nœuds conditionnels (if, while, switch ; à chacun,
+  l’hôte attend le GPU).
 - Pas (encore) pris en charge : cuDNN.
 - Les textures et surfaces (objets texture et surface, tableaux CUDA) sont échantillonnées en logiciel, avec
   l’adressage et le filtrage de CUDA ; pas de mipmaps, de cubemaps, de références de texture ni d’écritures de surface
@@ -290,6 +291,10 @@ Liste complète : [plan.md, section 4](plan.md).
   matrices (n ≳ 1000). cuFFT : pas de callbacks ni de plans multi-GPU ; les transformées de plus de 2048 points (f64 :
   1024) font un passage en mémoire par radix. cuSPARSE : pas de matrices creuses par blocs (BSR) ni de valeurs
   complexes ; SpGEMM et les routines de tri tournent sur l’hôte.
+- cuRAND : XORWOW, MRG32k3a, Philox et Sobol donnent les suites de NVIDIA (lois normale et log-normale à l’arrondi
+  près) ; MTGP32 et MT19937 sont acceptés mais donnent d’autres suites, de même que Sobol brouillé et Poisson ; les
+  sorties en double exigent `shaderFloat64`. L’API device (`curand_kernel.h`) fonctionne, sauf les distributions
+  créées sur l’hôte (`curand_discrete`).
 - ComfyUI : pas de chemins optimisés pour CUDA 13 (cu130).
 
 ## Scripts
@@ -330,6 +335,7 @@ src/linalg            factorisations denses (LU, Cholesky, QR, eigh/SVD de Jacob
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (FFT de Stockham et de Bluestein en GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 en GLSL), include/cusparse/cusparse.h
+src/curand            libcurand.so.10 (XORWOW/MRG32k3a/Philox/Sobol en GLSL ; données Sobol : tools/gen_sobol_table.sh), include/curand/curand.h
 src/nccl              libnccl.so.2 (collectives entre les rangs d’une machine), include/nccl/nccl.h
 src/nvrtc             bibliothèque LD_AUDIT : NVRTC transmet le PTX au lieu d’un cubin (jiterator de PyTorch), nvJitLink lie via cuLink* (Numba)
 tests/                tests de l’API Driver + test Vulkan interne

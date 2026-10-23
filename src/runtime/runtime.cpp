@@ -980,6 +980,8 @@ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, v
 
 namespace {
 
+cudaError_t toDriverCopy(const cudaMemcpy3DParms* p, CUDA_MEMCPY3D& c);  // with the copies below
+
 cudaError_t toDriverKernelParams(const cudaKernelNodeParams* p, CUDA_KERNEL_NODE_PARAMS_v2& out) {
     if (!p || !p->func) return cudaErrorInvalidValue;
     Kernel* k = findKernel(p->func);
@@ -988,6 +990,57 @@ cudaError_t toDriverKernelParams(const cudaKernelNodeParams* p, CUDA_KERNEL_NODE
     if (cudaError_t e = resolve(k, f)) return e;
     out = {f, p->gridDim.x, p->gridDim.y, p->gridDim.z, p->blockDim.x, p->blockDim.y, p->blockDim.z,
            p->sharedMemBytes, p->kernelParams, p->extra, nullptr, nullptr};
+    return cudaSuccess;
+}
+
+// cudaGraphNodeParams as the driver's CUgraphNodeParams (the outputs are copied back by addNode).
+cudaError_t toDriverNodeParams(const cudaGraphNodeParams* p, CUgraphNodeParams& out) {
+    if (!p) return cudaErrorInvalidValue;
+    out = CUgraphNodeParams{};
+    out.type = static_cast<CUgraphNodeType>(p->type);
+    switch (p->type) {
+        case cudaGraphNodeTypeKernel: {
+            const cudaKernelNodeParamsV2& k = p->kernel;
+#if VULKANIZER_CUDART_MAJOR >= 13
+            if (k.functionType == cudaKernelFunctionTypeKernel || k.functionType == cudaKernelFunctionTypeFunction) {
+                out.kernel = {static_cast<CUfunction>(k.func), k.gridDim.x, k.gridDim.y, k.gridDim.z, k.blockDim.x,
+                              k.blockDim.y, k.blockDim.z, k.sharedMemBytes, k.kernelParams, k.extra, nullptr, nullptr};
+                return cudaSuccess;
+            }
+#endif
+            const cudaKernelNodeParams v1{k.func, k.gridDim, k.blockDim, k.sharedMemBytes, k.kernelParams, k.extra};
+            return toDriverKernelParams(&v1, out.kernel);
+        }
+        case cudaGraphNodeTypeMemcpy: return toDriverCopy(&p->memcpy.copyParams, out.memcpy.copyParams);
+        case cudaGraphNodeTypeMemset:
+            out.memset = {reinterpret_cast<CUdeviceptr>(p->memset.dst), p->memset.pitch, p->memset.value,
+                          p->memset.elementSize, p->memset.width, p->memset.height, nullptr};
+            return cudaSuccess;
+        case cudaGraphNodeTypeHost: out.host = {p->host.fn, p->host.userData, 0, nullptr}; return cudaSuccess;
+        case cudaGraphNodeTypeGraph:
+            out.graph = {p->graph.graph, static_cast<CUgraphChildGraphNodeOwnership>(p->graph.ownership)};
+            return cudaSuccess;
+        case cudaGraphNodeTypeEmpty: return cudaSuccess;
+        case cudaGraphNodeTypeWaitEvent: out.eventWait.event = p->eventWait.event; return cudaSuccess;
+        case cudaGraphNodeTypeEventRecord: out.eventRecord.event = p->eventRecord.event; return cudaSuccess;
+        case cudaGraphNodeTypeMemAlloc: out.alloc = p->alloc; return cudaSuccess;
+        case cudaGraphNodeTypeMemFree: out.free.dptr = reinterpret_cast<CUdeviceptr>(p->free.dptr); return cudaSuccess;
+        case cudaGraphNodeTypeConditional:
+            out.conditional = {p->conditional.handle, static_cast<CUgraphConditionalNodeType>(p->conditional.type),
+                               p->conditional.size, p->conditional.phGraph_out, nullptr};
+            return cudaSuccess;
+        default: return cudaErrorNotSupported;
+    }
+}
+
+cudaError_t addNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps, const void* edgeData,
+                    size_t numDeps, cudaGraphNodeParams* params) {
+    CUgraphNodeParams p;
+    if (cudaError_t e = toDriverNodeParams(params, p)) return e;
+    if (CUresult r = cuGraphAddNode_v2(node, graph, deps, static_cast<const CUgraphEdgeData*>(edgeData), numDeps, &p))
+        return toCudaError(r);
+    if (params->type == cudaGraphNodeTypeMemAlloc) params->alloc.dptr = p.alloc.dptr;  // out
+    if (params->type == cudaGraphNodeTypeConditional) params->conditional.phGraph_out = p.conditional.phGraph_out;
     return cudaSuccess;
 }
 
@@ -1195,7 +1248,13 @@ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGra
                                                     const cudaGraphNode_t* deps, const void* edgeData,
                                                     size_t numDeps, int mode) {
     ENTER();
-    return record(cudaErrorStreamCaptureUnsupported);
+    return record(cuStreamBeginCaptureToGraph(stream, graph, deps, static_cast<const CUgraphEdgeData*>(edgeData), numDeps,
+                                              static_cast<CUstreamCaptureMode>(mode)));
+}
+cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph_ptsz(cudaStream_t stream, cudaGraph_t graph,
+                                                         const cudaGraphNode_t* deps, const void* edgeData,
+                                                         size_t numDeps, int mode) {
+    return cudaStreamBeginCaptureToGraph(stream, graph, deps, edgeData, numDeps, mode);
 }
 
 // CUDA 12's _v2 forms are CUDA 13's plain names.
@@ -1213,31 +1272,217 @@ cudaError_t CUDARTAPI VULKANIZER_V2(cudaStreamUpdateCaptureDependencies)(cudaStr
                                                        numDeps, flags));
 }
 
-cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphAddNode)(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
-                                          const void* edgeData, size_t numDeps, void* params) {
+#if VULKANIZER_CUDART_MAJOR < 13
+cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies(cudaStream_t stream, cudaGraphNode_t* deps, size_t numDeps,
+                                                          unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);  // generic node parameters: not yet
+    return record(cuStreamUpdateCaptureDependencies_v2(stream, deps, nullptr, numDeps, flags));
+}
+#endif
+
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphAddNode)(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                                      const void* edgeData, size_t numDeps, cudaGraphNodeParams* params) {
+    ENTER();
+    return record(addNode(node, graph, deps, edgeData, numDeps, params));
+}
+#if VULKANIZER_CUDART_MAJOR < 13
+cudaError_t CUDARTAPI cudaGraphAddNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                       size_t numDeps, cudaGraphNodeParams* params) {
+    ENTER();
+    return record(addNode(node, graph, deps, nullptr, numDeps, params));
+}
+#endif
+
+cudaError_t CUDARTAPI cudaGraphNodeSetParams(cudaGraphNode_t node, cudaGraphNodeParams* params) {
+    ENTER();
+    CUgraphNodeParams p;
+    if (cudaError_t e = toDriverNodeParams(params, p)) return record(e);
+    return record(cuGraphNodeSetParams(node, &p));
 }
 
-cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(void* handle, cudaGraph_t graph, unsigned int defaultValue,
-                                                       unsigned int flags) {
+cudaError_t CUDARTAPI cudaGraphExecNodeSetParams(cudaGraphExec_t exec, cudaGraphNode_t node, cudaGraphNodeParams* params) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    CUgraphNodeParams p;
+    if (cudaError_t e = toDriverNodeParams(params, p)) return record(e);
+    return record(cuGraphExecNodeSetParams(exec, node, &p));
+}
+
+cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(cudaGraphConditionalHandle* handle, cudaGraph_t graph,
+                                                       unsigned int defaultValue, unsigned int flags) {
+    ENTER();
+    return record(cuGraphConditionalHandleCreate(reinterpret_cast<CUgraphConditionalHandle*>(handle), graph, nullptr, defaultValue, flags));
+}
+#if VULKANIZER_CUDART_MAJOR >= 13
+cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate_v2(cudaGraphConditionalHandle* handle, cudaGraph_t graph,
+                                                          void* ctx, unsigned int defaultValue, unsigned int flags) {
+    return cudaGraphConditionalHandleCreate(handle, graph, defaultValue, flags);
+}
+#endif
+
+// Memcpy, event nodes; memset and host nodes' parameters have the driver's layouts.
+cudaError_t CUDARTAPI cudaGraphAddMemcpyNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                             size_t numDeps, const cudaMemcpy3DParms* params) {
+    ENTER();
+    CUDA_MEMCPY3D c;
+    if (cudaError_t e = toDriverCopy(params, c)) return record(e);
+    return record(cuGraphAddMemcpyNode(node, graph, deps, numDeps, &c, nullptr));
+}
+static CUDA_MEMCPY3D linearCopy(void* dst, const void* src, size_t count) {
+    CUDA_MEMCPY3D c{};
+    c.srcMemoryType = c.dstMemoryType = CU_MEMORYTYPE_UNIFIED;
+    c.srcDevice = reinterpret_cast<CUdeviceptr>(src);
+    c.dstDevice = reinterpret_cast<CUdeviceptr>(dst);
+    c.WidthInBytes = count;
+    c.Height = c.Depth = 1;
+    return c;
+}
+cudaError_t CUDARTAPI cudaGraphAddMemcpyNode1D(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                               size_t numDeps, void* dst, const void* src, size_t count, int) {
+    ENTER();
+    const CUDA_MEMCPY3D c = linearCopy(dst, src, count);
+    return record(cuGraphAddMemcpyNode(node, graph, deps, numDeps, &c, nullptr));
+}
+cudaError_t CUDARTAPI cudaGraphMemcpyNodeSetParams(cudaGraphNode_t node, const cudaMemcpy3DParms* params) {
+    ENTER();
+    CUDA_MEMCPY3D c;
+    if (cudaError_t e = toDriverCopy(params, c)) return record(e);
+    return record(cuGraphMemcpyNodeSetParams(node, &c));
+}
+cudaError_t CUDARTAPI cudaGraphMemcpyNodeSetParams1D(cudaGraphNode_t node, void* dst, const void* src, size_t count,
+                                                     int) {
+    ENTER();
+    const CUDA_MEMCPY3D c = linearCopy(dst, src, count);
+    return record(cuGraphMemcpyNodeSetParams(node, &c));
+}
+cudaError_t CUDARTAPI cudaGraphMemsetNodeGetParams(cudaGraphNode_t node, void* params) {
+    ENTER();
+    return record(cuGraphMemsetNodeGetParams(node, static_cast<CUDA_MEMSET_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphMemsetNodeSetParams(cudaGraphNode_t node, const void* params) {
+    ENTER();
+    return record(cuGraphMemsetNodeSetParams(node, static_cast<const CUDA_MEMSET_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphHostNodeGetParams(cudaGraphNode_t node, void* params) {
+    ENTER();
+    return record(cuGraphHostNodeGetParams(node, static_cast<CUDA_HOST_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphHostNodeSetParams(cudaGraphNode_t node, const void* params) {
+    ENTER();
+    return record(cuGraphHostNodeSetParams(node, static_cast<const CUDA_HOST_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphAddEventRecordNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                                  size_t numDeps, cudaEvent_t event) {
+    ENTER();
+    return record(cuGraphAddEventRecordNode(node, graph, deps, numDeps, event));
+}
+cudaError_t CUDARTAPI cudaGraphAddEventWaitNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                                size_t numDeps, cudaEvent_t event) {
+    ENTER();
+    return record(cuGraphAddEventWaitNode(node, graph, deps, numDeps, event));
+}
+cudaError_t CUDARTAPI cudaGraphEventRecordNodeGetEvent(cudaGraphNode_t node, cudaEvent_t* event) {
+    ENTER();
+    return record(cuGraphEventRecordNodeGetEvent(node, event));
+}
+cudaError_t CUDARTAPI cudaGraphEventRecordNodeSetEvent(cudaGraphNode_t node, cudaEvent_t event) {
+    ENTER();
+    return record(cuGraphEventRecordNodeSetEvent(node, event));
+}
+cudaError_t CUDARTAPI cudaGraphEventWaitNodeGetEvent(cudaGraphNode_t node, cudaEvent_t* event) {
+    ENTER();
+    return record(cuGraphEventWaitNodeGetEvent(node, event));
+}
+cudaError_t CUDARTAPI cudaGraphEventWaitNodeSetEvent(cudaGraphNode_t node, cudaEvent_t event) {
+    ENTER();
+    return record(cuGraphEventWaitNodeSetEvent(node, event));
+}
+cudaError_t CUDARTAPI cudaGraphNodeGetType(cudaGraphNode_t node, int* type) {
+    ENTER();
+    return record(cuGraphNodeGetType(node, reinterpret_cast<CUgraphNodeType*>(type)));
+}
+
+// Edges and cloning. CUDA 13's forms take edge data (CUDA 12's _v2).
+cudaError_t CUDARTAPI cudaGraphGetRootNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, size_t* numNodes) {
+    ENTER();
+    return record(cuGraphGetRootNodes(graph, nodes, numNodes));
+}
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphGetEdges)(cudaGraph_t graph, cudaGraphNode_t* from, cudaGraphNode_t* to,
+                                                       void* edgeData, size_t* numEdges) {
+    ENTER();
+    return record(cuGraphGetEdges_v2(graph, from, to, static_cast<CUgraphEdgeData*>(edgeData), numEdges));
+}
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphAddDependencies)(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                              const cudaGraphNode_t* to, const void* edgeData,
+                                                              size_t numDeps) {
+    ENTER();
+    return record(cuGraphAddDependencies_v2(graph, from, to, static_cast<const CUgraphEdgeData*>(edgeData), numDeps));
+}
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphRemoveDependencies)(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                                 const cudaGraphNode_t* to, const void* edgeData,
+                                                                 size_t numDeps) {
+    ENTER();
+    return record(cuGraphRemoveDependencies_v2(graph, from, to, static_cast<const CUgraphEdgeData*>(edgeData), numDeps));
+}
+cudaError_t CUDARTAPI VULKANIZER_V2(cudaGraphNodeGetDependentNodes)(cudaGraphNode_t node, cudaGraphNode_t* nodes,
+                                                                    void* edgeData, size_t* numNodes) {
+    ENTER();
+    return record(cuGraphNodeGetDependentNodes_v2(node, nodes, static_cast<CUgraphEdgeData*>(edgeData), numNodes));
+}
+#if VULKANIZER_CUDART_MAJOR < 13
+cudaError_t CUDARTAPI cudaGraphGetEdges(cudaGraph_t graph, cudaGraphNode_t* from, cudaGraphNode_t* to, size_t* numEdges) {
+    return cudaGraphGetEdges_v2(graph, from, to, nullptr, numEdges);
+}
+cudaError_t CUDARTAPI cudaGraphAddDependencies(cudaGraph_t graph, const cudaGraphNode_t* from, const cudaGraphNode_t* to,
+                                               size_t numDeps) {
+    return cudaGraphAddDependencies_v2(graph, from, to, nullptr, numDeps);
+}
+cudaError_t CUDARTAPI cudaGraphRemoveDependencies(cudaGraph_t graph, const cudaGraphNode_t* from,
+                                                  const cudaGraphNode_t* to, size_t numDeps) {
+    return cudaGraphRemoveDependencies_v2(graph, from, to, nullptr, numDeps);
+}
+cudaError_t CUDARTAPI cudaGraphNodeGetDependentNodes(cudaGraphNode_t node, cudaGraphNode_t* nodes, size_t* numNodes) {
+    return cudaGraphNodeGetDependentNodes_v2(node, nodes, nullptr, numNodes);
+}
+cudaError_t CUDARTAPI cudaGraphNodeGetDependencies_v2(cudaGraphNode_t node, cudaGraphNode_t* deps, void* edgeData,
+                                                      size_t* numDeps) {
+    ENTER();
+    return record(cuGraphNodeGetDependencies_v2(node, deps, static_cast<CUgraphEdgeData*>(edgeData), numDeps));
+}
+#endif
+cudaError_t CUDARTAPI cudaGraphDestroyNode(cudaGraphNode_t node) {
+    ENTER();
+    return record(cuGraphDestroyNode(node));
+}
+cudaError_t CUDARTAPI cudaGraphClone(cudaGraph_t* clone, cudaGraph_t original) {
+    ENTER();
+    return record(cuGraphClone(clone, original));
+}
+cudaError_t CUDARTAPI cudaGraphNodeFindInClone(cudaGraphNode_t* node, cudaGraphNode_t original, cudaGraph_t clone) {
+    ENTER();
+    return record(cuGraphNodeFindInClone(node, original, clone));
 }
 
 cudaError_t CUDARTAPI cudaUserObjectCreate(cudaUserObject_t* object, void* ptr, cudaHostFn_t destroy,
                                            unsigned int initialRefcount, unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    return record(cuUserObjectCreate(object, ptr, destroy, initialRefcount, flags));
+}
+cudaError_t CUDARTAPI cudaUserObjectRetain(cudaUserObject_t object, unsigned int count) {
+    ENTER();
+    return record(cuUserObjectRetain(object, count));
 }
 cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t object, unsigned int count) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    return record(cuUserObjectRelease(object, count));
 }
 cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t graph, cudaUserObject_t object, unsigned int count,
                                                 unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    return record(cuGraphRetainUserObject(graph, object, count, flags));
+}
+cudaError_t CUDARTAPI cudaGraphReleaseUserObject(cudaGraph_t graph, cudaUserObject_t object, unsigned int count) {
+    ENTER();
+    return record(cuGraphReleaseUserObject(graph, object, count));
 }
 
 // Graphs allocate no memory of their own: every attribute (usage, high-water marks) is 0.
@@ -1565,13 +1810,16 @@ cudaError_t CUDARTAPI cudaMemcpyFromArray(void* dst, cudaArray_const_t src, size
                                hOffset * d.Width * texel + wOffset, count));
 }
 
-cudaError_t CUDARTAPI cudaMemcpy3DAsync(const cudaMemcpy3DParms* p, cudaStream_t stream) {
-    ENTER();
-    if (!p) return record(cudaErrorInvalidValue);
-    CUDA_MEMCPY3D c{};
+}  // extern "C"
+
+namespace {
+
+cudaError_t toDriverCopy(const cudaMemcpy3DParms* p, CUDA_MEMCPY3D& c) {
+    if (!p) return cudaErrorInvalidValue;
+    c = CUDA_MEMCPY3D{};
     // extents are in elements for arrays, in bytes otherwise
     const size_t texel = p->srcArray ? arrayTexelBytes(p->srcArray) : p->dstArray ? arrayTexelBytes(p->dstArray) : 1;
-    if (!texel) return record(cudaErrorInvalidValue);
+    if (!texel) return cudaErrorInvalidValue;
     if (p->srcArray) {
         c.srcMemoryType = CU_MEMORYTYPE_ARRAY, c.srcArray = p->srcArray;
         c.srcXInBytes = p->srcPos.x * texel;
@@ -1593,6 +1841,17 @@ cudaError_t CUDARTAPI cudaMemcpy3DAsync(const cudaMemcpy3DParms* p, cudaStream_t
     c.WidthInBytes = (p->srcArray || p->dstArray) ? p->extent.width * texel : p->extent.width;
     c.Height = std::max<size_t>(p->extent.height, 1);
     c.Depth = std::max<size_t>(p->extent.depth, 1);
+    return cudaSuccess;
+}
+
+}  // namespace
+
+extern "C" {
+
+cudaError_t CUDARTAPI cudaMemcpy3DAsync(const cudaMemcpy3DParms* p, cudaStream_t stream) {
+    ENTER();
+    CUDA_MEMCPY3D c;
+    if (cudaError_t e = toDriverCopy(p, c)) return record(e);
     return record(stream ? cuMemcpy3DAsync(&c, stream) : cuMemcpy3D(&c));
 }
 cudaError_t CUDARTAPI cudaMemcpy3D(const cudaMemcpy3DParms* p) {

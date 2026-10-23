@@ -1,0 +1,129 @@
+#version 460
+// MRG32k3a (L'Ecuyer, "Good parameters and implementations for combined multiple recursive random
+// number generators", Operations Research 47, 1999) in the order of cuRAND's host API: p.threads
+// (81920) states, thread t on subsequence t (2^76 steps apart), groups of outputs handed out round
+// robin as in xorwow.comp. kFlagInit computes the states: jumps by 3 x 3 matrices modulo m1 and m2
+// from the host (17 of 2^(76 + k) steps for the subsequence, 64 of 2^k steps for the offset).
+//
+// The f32 build (devices without shaderFloat64) converts to uint32 and float without the f64
+// intermediate cuRAND rounds through, so an output can differ in its last bit.
+
+#include "common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint v[]; };
+
+const uint64_t m1 = 4294967087ul, m2 = 4294944443ul;
+
+struct State {
+    uint64_t s1[3], s2[3];
+};
+
+// a b mod m for a, b < 2^32.
+uint64_t mulMod(uint64_t a, uint64_t b, uint64_t m) { return (a * b) % m; }
+
+void apply(inout uint64_t v[3], Words a, uint base, uint64_t m) {
+    uint64_t r[3];
+    for (uint i = 0u; i < 3u; ++i) {
+        uint64_t sum = 0ul;
+        for (uint k = 0u; k < 3u; ++k) sum += mulMod(uint64_t(a.v[base + i * 3u + k]), v[k], m);
+        r[i] = sum % m;
+    }
+    v = r;
+}
+
+void jump(inout State s, uint64_t matrices) {
+    Words a = Words(canon(matrices));
+    apply(s.s1, a, 0u, m1);
+    apply(s.s2, a, 9u, m2);
+}
+
+// x mod m of a signed x.
+uint64_t mod(int64_t x, uint64_t m) {
+    uint64_t r = uint64_t(x < 0l ? -x : x) % m;
+    return x < 0l && r != 0ul ? m - r : r;
+}
+
+uint next(inout State s) {
+    uint64_t a = mod(int64_t(1403580ul * s.s1[1]) - int64_t(810728ul * s.s1[0]), m1);
+    s.s1[0] = s.s1[1];
+    s.s1[1] = s.s1[2];
+    s.s1[2] = a;
+    uint64_t b = mod(int64_t(527612ul * s.s2[2]) - int64_t(1370589ul * s.s2[0]), m2);
+    s.s2[0] = s.s2[1];
+    s.s2[1] = s.s2[2];
+    s.s2[2] = b;
+    return a > b ? uint(a - b) : uint(a + m1 - b);
+}
+
+#ifdef DOUBLE
+const double kNorm = 2.3283065498378290e-10LF;  // 1 / m1
+uint toU32(uint z) { return uint(double(z) * 1.000000048662LF); }
+float toFloat(uint z) { return float(double(z) * kNorm); }
+#else
+uint toU32(uint z) { return z + uint((uint64_t(z) * 48662ul) / 1000000000000ul); }
+float toFloat(uint z) {
+    precise float v = float(z) * 2.3283065e-10;
+    return v;
+}
+#endif
+
+void main() {
+    const uint64_t t = invocation();
+    if (t >= p.threads) return;
+    Words states = Words(canon(p.state + t * 24ul));
+    State s;
+    if ((p.flags & kFlagInit) != 0u) {
+        uvec2 seed = unpackUint2x32(p.seed);
+        uint64_t x1 = uint64_t(seed.x ^ 0x55555555u), x2 = uint64_t(seed.y ^ 0xAAAAAAAAu);
+        s.s1 = uint64_t[3](mulMod(x1, 12345ul, m1), mulMod(x2, 12345ul, m1), mulMod(x1, 12345ul, m1));
+        s.s2 = uint64_t[3](mulMod(x2, 12345ul, m2), mulMod(x1, 12345ul, m2), mulMod(x2, 12345ul, m2));
+        for (uint k = 0u; k < 17u; ++k)
+            if (((t >> k) & 1ul) != 0ul) jump(s, p.aux + uint64_t(k) * 72ul);
+        const uint64_t steps = p.offset / p.threads + (t < p.offset % p.threads ? 1ul : 0ul);
+        for (uint k = 0u; k < 64u; ++k)
+            if (((steps >> k) & 1ul) != 0ul) jump(s, p.aux + uint64_t(17u + k) * 72ul);
+    } else {
+        for (uint k = 0u; k < 3u; ++k) {
+            s.s1[k] = uint64_t(states.v[k]);
+            s.s2[k] = uint64_t(states.v[3u + k]);
+        }
+        const uint size = normalKind(p.kind) ? 2u : 1u;
+        const uint64_t groups = (p.count + size - 1ul) / size;
+        const uint64_t T = p.threads;
+        for (uint64_t g = (t + T - p.offset % T) % T; g < groups; g += T) {
+            const uint64_t i = g * size;
+            switch (p.kind) {
+            case kU32: storeU32(i, toU32(next(s))); break;
+            case kUniform: storeF32(i, toFloat(next(s))); break;
+            case kPoisson: storeU32(i, poisson(toU32(next(s)))); break;
+            case kNormal:
+            case kLogNormal: {
+                float u = toFloat(next(s)), v = toFloat(next(s));
+                float r = sqrt(-2.0 * logf_(u)), sn, cs;
+                sincospif_(2.0 * v, sn, cs);
+                precise float a = sn * r, b = cs * r;
+                storeF32(i, scalef(a));
+                if (i + 1ul < p.count) storeF32(i + 1ul, scalef(b));
+                break;
+            }
+#ifdef DOUBLE
+            case kUniformDouble: storeF64(i, double(next(s)) * kNorm); break;
+            case kNormalDouble:
+            case kLogNormalDouble: {
+                double u = double(next(s)) * kNorm, v = double(next(s)) * kNorm;
+                double r = sqrt(-2.0LF * logd_(u)), sn, cs;
+                sincospid_(2.0LF * v, sn, cs);
+                precise double a = sn * r, b = cs * r;
+                storeF64(i, scaled(a));
+                if (i + 1ul < p.count) storeF64(i + 1ul, scaled(b));
+                break;
+            }
+#endif
+            }
+        }
+    }
+    for (uint k = 0u; k < 3u; ++k) {
+        states.v[k] = uint(s.s1[k]);
+        states.v[3u + k] = uint(s.s2[k]);
+    }
+}

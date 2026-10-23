@@ -10,8 +10,8 @@
 
 # Vulkanizer
 
-`libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so`、`libcusparse.so` のドロップイン
-置き換えです。CUDA Driver API と Runtime API（および cuBLAS の GEMM 系、密行列・疎行列の線形代数、FFT）を Vulkan コンピュート上に実装しており、CUDA プログラムを NVIDIA カードなしで、
+`libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so`、`libcusparse.so`、`libcurand.so` のドロップイン
+置き換えです。CUDA Driver API と Runtime API（および cuBLAS の GEMM 系、密行列・疎行列の線形代数、FFT、乱数生成）を Vulkan コンピュート上に実装しており、CUDA プログラムを NVIDIA カードなしで、
 Vulkan 1.2 対応の任意の GPU（AMD、Intel、llvmpipe）で実行できます。
 計画・アーキテクチャ・フェーズ：[plan.md](plan.md)（ハンガリー語）。
 
@@ -47,9 +47,9 @@ build/bin/vulkanizer-info                       # Vulkanizer から見える Vul
 ```
 
 ビルドされたライブラリは `build/lib/` にあります：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、
-`libcublasLt.so.12`、`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`、`libnccl.so.2`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム
+`libcublasLt.so.12`、`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`、`libcurand.so.10`、`libnccl.so.2`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム
 向けのランタイムとライブラリの CUDA 13 版（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`、
-`libcusolver.so.12`、`libcufft.so.12`、`libcusparse.so.12`）があり、同じ `libcuda.so.1` を使います。
+`libcusolver.so.12`、`libcufft.so.12`、`libcusparse.so.12`、`libcurand.so.10`）があり、同じ `libcuda.so.1` を使います。
 
 #### インストール（パッケージ）
 
@@ -157,7 +157,7 @@ tools/setup_torch.sh --cuda13              # CUDA 13.4 版を .work/torch-cf13 �
 PyTorch の公式 wheel には NVIDIA のネイティブ機械語（SASS）しか含まれず PTX がないため、Vulkanizer はそのカーネルを
 実行できません。conda-forge の CUDA ビルドは PTX（`compute_120`）も同梱しています。`tools/setup_torch.sh` はそれを
 micromamba で、システム全体へのインストールなしで導入します。`run_torch.sh` は NVIDIA のものの代わりに Vulkanizer の
-`libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver`、`libcufft`、`libcusparse` を読み込み、NVIDIA のハードウェアやライブラリを必要とする機能を
+`libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver`、`libcufft`、`libcusparse`、`libcurand` を読み込み、NVIDIA のハードウェアやライブラリを必要とする機能を
 すべて無効にします：cuDNN、融合 attention カーネル（`scaled_dot_product_attention` は math パスで実行）、そして
 `torch._native` の DSL カーネル（`TORCH_DISABLE_NATIVE_JIT=1`）です。その Triton カーネルは動作しますが、CuTe DSL
 カーネルは SASS にコンパイルされ、同じ 1 つのスイッチで両方が無効になります。`VULKANIZER_TORCH_DEFAULTS=0` で
@@ -257,7 +257,7 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
   NVIDIA ドライバの非公開の内部機能を必要とします。
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフとメモリノード（キャプチャ中のストリーム順序付き割り当て）にも対応しています。
-  条件ノードは未対応です。
+  条件ノード（if、while、switch）にも対応していますが、各条件ノードでホストが GPU を待ちます。
 - （まだ）未対応：cuDNN。
 - テクスチャとサーフェス（テクスチャ／サーフェスオブジェクト、CUDA 配列）はソフトウェアでサンプリングされ、CUDA と同じ
   アドレッシングとフィルタリングを行います。ミップマップ、キューブマップ、テクスチャ参照、フォーマット付きサーフェス書き込みは
@@ -281,6 +281,9 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
   SVD は Jacobi 反復を使うため、大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランは
   ありません。長さが 2048（f64：1024）を超える変換は基数ごとにメモリを 1 回走査します。cuSPARSE：ブロック疎行列（BSR）
   と複素数値はありません。SpGEMM とソートルーチンはホストで実行されます。
+- cuRAND：XORWOW、MRG32k3a、Philox、Sobol は NVIDIA と同じ系列を返します（正規分布・対数正規分布は丸め誤差の範囲で一致）。
+  MTGP32 と MT19937 は受け付けますが別の系列になり、スクランブル Sobol と Poisson も同様です。double 出力には
+  `shaderFloat64` が必要です。デバイス API（`curand_kernel.h`）は動作しますが、ホストで作成した分布（`curand_discrete`）は未対応です。
 - ComfyUI：CUDA 13（cu130）向けに最適化されたパスはありません。
 
 ## スクリプト
@@ -321,6 +324,7 @@ src/linalg            GLSL による密行列分解（LU、Cholesky、QR、Jacob
 src/cusolver          libcusolver.so.11/.12、include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL による Stockham と Bluestein の FFT）、include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL による SpMV/SpMM/SDDMM/SpSV/csrgeam2）、include/cusparse/cusparse.h
+src/curand            libcurand.so.10（GLSL による XORWOW/MRG32k3a/Philox/Sobol。Sobol データ：tools/gen_sobol_table.sh）、include/curand/curand.h
 src/nccl              libnccl.so.2（1 台のマシンのランク間の集合通信）、include/nccl/nccl.h
 src/nvrtc             LD_AUDIT ライブラリ：NVRTC に cubin ではなく PTX を渡させる（PyTorch の jiterator）、nvJitLink は cuLink* でリンク（Numba）
 tests/                Driver API のテストと内部 Vulkan テスト

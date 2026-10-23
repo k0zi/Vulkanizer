@@ -21,5 +21,6 @@ Layout vulkanizerLayout() {
     VULKANIZER_ERROR_VALUES(ERR)
 #define TEX(e) l.texture.push_back(size_t(e));
     VULKANIZER_TEXTURE_LAYOUT(TEX)
+    VULKANIZER_GRAPH_LAYOUT(TEX)
     return l;
 }

@@ -102,7 +102,7 @@ set_target_properties(vulkanizer_cudart13 PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${
 set(cublas_gen ${CMAKE_CURRENT_BINARY_DIR}/cublas)
 set(cublas_shaders)
 # name:source[:define] -- variants of one source compiled with different defines.
-foreach(entry gemm:gemm trsm:trsm gemv:gemv epilogue:epilogue gemm_f16_tn:gemm_f16_tn gemm_f16_tn_h:gemm_f16_tn:C_F16
+foreach(entry gemm:gemm gemm_tiled:gemm_tiled trsm:trsm gemv:gemv epilogue:epilogue gemm_f16_tn:gemm_f16_tn gemm_f16_tn_h:gemm_f16_tn:C_F16
     gemm_f16_tn_m:gemm_f16_tn:F16_MATH gemm_f16_tn_mh:gemm_f16_tn:F16_MATH,C_F16)
   string(REPLACE ":" ";" parts ${entry})
   list(GET parts 0 shader)
@@ -283,6 +283,46 @@ function(vulkanizer_cusparse suffix version outdir)
 endfunction()
 vulkanizer_cusparse("" 12.5.10 ${CMAKE_BINARY_DIR}/lib)
 vulkanizer_cusparse(13 12.8.6 ${CMAKE_BINARY_DIR}/lib/cuda13)
+
+# cuRAND: libcurand.so.10 for CUDA 12 and CUDA 13 (in lib/cuda13, with that release's version);
+# GLSL kernels in f32 and f64 (-DDOUBLE).
+set(curand_gen ${CMAKE_CURRENT_BINARY_DIR}/curand)
+set(curand_shaders)
+foreach(shader philox xorwow mrg32k3a sobol)
+  foreach(variant "" _f64)
+    set(defines)
+    if(variant)
+      set(defines -DDOUBLE)
+    endif()
+    add_custom_command(
+      OUTPUT ${curand_gen}/${shader}${variant}.comp.inc
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${curand_gen}
+      COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num ${defines} -I ${CMAKE_CURRENT_SOURCE_DIR}/curand/shaders
+              -o ${curand_gen}/${shader}${variant}.comp.inc ${CMAKE_CURRENT_SOURCE_DIR}/curand/shaders/${shader}.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/curand/shaders/${shader}.comp ${CMAKE_CURRENT_SOURCE_DIR}/curand/shaders/common.glsl
+      COMMENT "glslc ${shader}${variant}.comp"
+    )
+    list(APPEND curand_shaders ${curand_gen}/${shader}${variant}.comp.inc)
+  endforeach()
+endforeach()
+function(vulkanizer_curand suffix version outdir)
+  set(map ${CMAKE_CURRENT_SOURCE_DIR}/curand/libcurand.map)
+  add_library(vulkanizer_curand${suffix} SHARED curand/curand.cpp ${curand_shaders})
+  target_link_libraries(vulkanizer_curand${suffix} PRIVATE vulkanizer_common vulkanizer_cuda)
+  target_include_directories(vulkanizer_curand${suffix} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/curand
+    ${curand_gen} PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
+  string(REPLACE "." ";" parts ${version})  # curandGetVersion: major * 1000 + minor * 100 + patch
+  list(GET parts 0 v0)
+  list(GET parts 1 v1)
+  list(GET parts 2 v2)
+  math(EXPR version_number "${v0} * 1000 + ${v1} * 100 + ${v2}")
+  target_compile_definitions(vulkanizer_curand${suffix} PRIVATE VULKANIZER_CURAND_VERSION=${version_number})
+  set_target_properties(vulkanizer_curand${suffix} PROPERTIES OUTPUT_NAME curand VERSION ${version}
+    SOVERSION 10 LINK_DEPENDS ${map} LIBRARY_OUTPUT_DIRECTORY ${outdir})
+  target_link_options(vulkanizer_curand${suffix} PRIVATE -Wl,--version-script=${map} -Wl,--no-undefined)
+endfunction()
+vulkanizer_curand("" 10.3.10 ${CMAKE_BINARY_DIR}/lib)
+vulkanizer_curand(13 10.4.0 ${CMAKE_BINARY_DIR}/lib/cuda13)
 
 # NCCL: libnccl.so.2, one for CUDA 12 and 13 (it uses only the driver API).
 add_library(vulkanizer_nccl SHARED nccl/nccl.cpp nccl/nccl_stubs.cpp)

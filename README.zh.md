@@ -10,8 +10,8 @@
 
 # Vulkanizer
 
-可直接替换 `libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so` 和 `libcusparse.so`：在 Vulkan
-计算之上实现 CUDA Driver API 与 Runtime API（以及 cuBLAS 的 GEMM 系列、稠密与稀疏线性代数和 FFT），让 CUDA 程序无需 NVIDIA 显卡即可在任何支持 Vulkan 1.2 的 GPU（AMD、Intel、llvmpipe）上运行。
+可直接替换 `libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so`、`libcusparse.so` 和 `libcurand.so`：在 Vulkan
+计算之上实现 CUDA Driver API 与 Runtime API（以及 cuBLAS 的 GEMM 系列、稠密与稀疏线性代数、FFT 和随机数），让 CUDA 程序无需 NVIDIA 显卡即可在任何支持 Vulkan 1.2 的 GPU（AMD、Intel、llvmpipe）上运行。
 计划、架构与阶段：[plan.md](plan.md)（匈牙利语）。
 
 ## 环境要求
@@ -46,8 +46,8 @@ build/bin/vulkanizer-info                       # Vulkanizer 能看到哪些 Vul
 ```
 
 构建出的库位于 `build/lib/`：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、`libcublasLt.so.12`、
-`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`、`libnccl.so.2`。`build/lib/cuda13/` 中是运行时和这些库的 CUDA 13 版本（`libcudart.so.13`、
-`libcublas.so.13`、`libcublasLt.so.13`、`libcusolver.so.12`、`libcufft.so.12`、`libcusparse.so.12`），
+`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`、`libcurand.so.10`、`libnccl.so.2`。`build/lib/cuda13/` 中是运行时和这些库的 CUDA 13 版本（`libcudart.so.13`、
+`libcublas.so.13`、`libcublasLt.so.13`、`libcusolver.so.12`、`libcufft.so.12`、`libcusparse.so.12`、`libcurand.so.10`），
 供用 CUDA 13 构建的程序使用；它们使用同一个 `libcuda.so.1`。
 
 #### 安装（软件包）
@@ -153,7 +153,7 @@ tools/setup_torch.sh --cuda13              # CUDA 13.4 版本，位于 .work/tor
 PyTorch 官方 wheel 只包含 NVIDIA 原生机器码（SASS），没有 PTX，因此 Vulkanizer 无法运行其中的内核。
 conda-forge 的 CUDA 构建同时附带 PTX（`compute_120`）：`tools/setup_torch.sh` 用 micromamba 安装它们，无需系统级安装。
 `run_torch.sh` 加载 Vulkanizer 的 `libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver`、`libcufft` 和
-`libcusparse` 来代替 NVIDIA 的库，
+`libcusparse`、`libcurand` 来代替 NVIDIA 的库，
 并关闭所有需要 NVIDIA 硬件或库的功能：cuDNN、融合的 attention 内核（`scaled_dot_product_attention` 走数学路径），
 以及 `torch._native` 的 DSL 内核（`TORCH_DISABLE_NATIVE_JIT=1`）：其中的 Triton 内核可以工作，但 CuTe DSL 内核会编译成
 SASS，而同一个开关会同时关闭两者。`VULKANIZER_TORCH_DEFAULTS=0` 可跳过这些设置。
@@ -248,7 +248,7 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 - 不执行 SASS：只有包含 PTX 的二进制文件才能运行。
 - 静态链接 CUDA 运行时的程序和库（CuPy、NVIDIA 的 NCCL）无法运行：该运行时依赖 NVIDIA 驱动未公开的内部接口。
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
-  也支持子图和内存节点（捕获期间的流序分配）；不支持条件节点。
+  也支持子图、内存节点（捕获期间的流序分配）和条件节点（if、while、switch；每个条件节点处主机都会等待 GPU）。
 - （尚）不支持：cuDNN。
 - 纹理和表面（纹理对象、表面对象、CUDA 数组）以软件方式采样，采用 CUDA 的寻址与过滤方式；不支持 mipmap、立方体贴图、
   纹理引用和格式化的表面写入。
@@ -267,6 +267,9 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 - cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；`eigh` 和 SVD
   使用 Jacobi 迭代，对大矩阵（n ≳ 1000）较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换每个基数
   遍历一次内存。cuSPARSE：没有块稀疏（BSR）格式和复数值；SpGEMM 和排序例程在主机上运行。
+- cuRAND：XORWOW、MRG32k3a、Philox 和 Sobol 给出与 NVIDIA 相同的序列（正态与对数正态分布在舍入误差内一致）；
+  MTGP32 和 MT19937 可以创建，但给出不同的序列，加扰 Sobol 和 Poisson 也是如此；double 输出需要 `shaderFloat64`。
+  设备 API（`curand_kernel.h`）可用，但不支持在主机上创建的分布（`curand_discrete`）。
 - ComfyUI：没有针对 CUDA 13（cu130）优化的路径。
 
 ## 脚本
@@ -307,6 +310,7 @@ src/linalg            GLSL 编写的稠密分解（LU、Cholesky、QR、Jacobi e
 src/cusolver          libcusolver.so.11/.12，include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL 编写的 Stockham 与 Bluestein FFT），include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL 编写的 SpMV/SpMM/SDDMM/SpSV/csrgeam2），include/cusparse/cusparse.h
+src/curand            libcurand.so.10（GLSL 编写的 XORWOW/MRG32k3a/Philox/Sobol；Sobol 数据：tools/gen_sobol_table.sh），include/curand/curand.h
 src/nccl              libnccl.so.2（同一台机器各 rank 之间的集合通信），include/nccl/nccl.h
 src/nvrtc             LD_AUDIT 库：让 NVRTC 交出 PTX 而不是 cubin（PyTorch 的 jiterator），nvJitLink 改用 cuLink* 链接（Numba）
 tests/                Driver API 测试 + 内部 Vulkan 测试

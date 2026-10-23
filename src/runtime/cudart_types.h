@@ -441,6 +441,99 @@ struct cudaKernelNodeParams {
     void** extra;
 };
 
+// cudaGraphAddNode's parameters. CUDA 13 adds a context (and, for kernels, how to read `func`).
+typedef unsigned long long cudaGraphConditionalHandle;
+enum cudaGraphConditionalNodeType { cudaGraphCondTypeIf = 0, cudaGraphCondTypeWhile = 1, cudaGraphCondTypeSwitch = 2 };
+enum cudaGraphNodeType {
+    cudaGraphNodeTypeKernel = 0, cudaGraphNodeTypeMemcpy = 1, cudaGraphNodeTypeMemset = 2, cudaGraphNodeTypeHost = 3,
+    cudaGraphNodeTypeGraph = 4, cudaGraphNodeTypeEmpty = 5, cudaGraphNodeTypeWaitEvent = 6,
+    cudaGraphNodeTypeEventRecord = 7, cudaGraphNodeTypeExtSemaphoreSignal = 8, cudaGraphNodeTypeExtSemaphoreWait = 9,
+    cudaGraphNodeTypeMemAlloc = 10, cudaGraphNodeTypeMemFree = 11, cudaGraphNodeTypeConditional = 13,
+};
+enum cudaKernelFunctionType {
+    cudaKernelFunctionTypeUnspecified = 0, cudaKernelFunctionTypeDeviceEntry = 1, cudaKernelFunctionTypeKernel = 2,
+    cudaKernelFunctionTypeFunction = 3,
+};
+struct cudaKernelNodeParamsV2 {
+    void* func;  // CUDA 13: or a cudaKernel_t / cudaFunction_t, by functionType
+    dim3 gridDim;
+    dim3 blockDim;
+    unsigned int sharedMemBytes;
+    void** kernelParams;
+    void** extra;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    void* ctx;
+    enum cudaKernelFunctionType functionType;
+#endif
+};
+struct cudaMemcpyNodeParams {
+    int flags;
+    int reserved[3];  // CUDA 13: int reserved, then a context
+    struct cudaMemcpy3DParms copyParams;
+};
+struct cudaMemsetParamsV2 {
+    void* dst;
+    size_t pitch;
+    unsigned int value;
+    unsigned int elementSize;
+    size_t width;
+    size_t height;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    void* ctx;
+#endif
+};
+struct cudaHostNodeParamsV2 {
+    cudaHostFn_t fn;
+    void* userData;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    unsigned int syncMode;
+    void* ctx;
+#endif
+};
+struct cudaChildGraphNodeParams {
+    cudaGraph_t graph;
+    int ownership;  // cudaGraphChildGraphOwnershipClone (0) or Move (1)
+};
+struct cudaEventRecordNodeParams {
+    cudaEvent_t event;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    void* ctx;
+#endif
+};
+struct cudaEventWaitNodeParams {
+    cudaEvent_t event;
+};
+struct cudaMemFreeNodeParams {
+    void* dptr;
+};
+struct cudaConditionalNodeParams {
+    cudaGraphConditionalHandle handle;
+    enum cudaGraphConditionalNodeType type;
+    unsigned int size;
+    cudaGraph_t* phGraph_out;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    void* ctx;
+#endif
+};
+struct cudaGraphNodeParams {
+    enum cudaGraphNodeType type;
+    int reserved0[3];
+    union {
+        long long reserved1[29];
+        struct cudaKernelNodeParamsV2 kernel;
+        struct cudaMemcpyNodeParams memcpy;
+        struct cudaMemsetParamsV2 memset;
+        struct cudaHostNodeParamsV2 host;
+        struct cudaChildGraphNodeParams graph;
+        struct cudaEventWaitNodeParams eventWait;
+        struct cudaEventRecordNodeParams eventRecord;
+        CUDA_MEM_ALLOC_NODE_PARAMS alloc;  // cudaMemAllocNodeParamsV2 has the driver struct's layout
+        struct cudaMemFreeNodeParams free;
+        struct cudaConditionalNodeParams conditional;
+    };
+    long long reserved2;
+};
+
 struct cudaFuncAttributes {
     size_t sharedSizeBytes;
     size_t constSizeBytes;
