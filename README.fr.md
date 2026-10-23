@@ -242,9 +242,10 @@ Liste complète : [plan.md, section 4](plan.md).
   événement interprocessus est terminé dès son enregistrement (l’enregistrement attend le périphérique).
 - NCCL (`libnccl.so.2`, le backend « nccl » de `torch.distributed` : DDP, FSDP) fonctionne entre les rangs d’une
   machine, qui peuvent partager un GPU ; avec plus d’un rang, les données passent par la mémoire de l’hôte.
-- Plusieurs GPU sont des périphériques distincts : `cudaMemcpyPeer` copie entre eux via la mémoire hôte, mais un kernel
-  n’accède jamais à la mémoire d’un autre GPU (pas d’accès pair). Les lancements coopératifs (`grid.sync()`) fonctionnent
-  jusqu’au nombre de blocs qui tiennent simultanément sur le GPU.
+- Plusieurs GPU sont des périphériques distincts : `cudaMemcpyPeer` et les copies ordinaires entre pointeurs de deux
+  périphériques (adressage unifié, p. ex. `tensor.to("cuda:1")` de PyTorch) passent par la mémoire hôte, mais un
+  kernel n’accède jamais à la mémoire d’un autre GPU (pas d’accès pair). Les lancements coopératifs (`grid.sync()`)
+  fonctionnent jusqu’au nombre de blocs qui tiennent simultanément sur le GPU.
 - La mémoire managed, épinglée et enregistrée est de la mémoire hôte que le GPU utilise sur place, à la même adresse ;
   la mémoire managed ne migre jamais vers le GPU (sur un GPU intégré, c’est de toute façon la même mémoire).
 - Tant que de la mémoire hôte enregistrée (`cuMemHostRegister`) existe, chaque soumission au GPU est plus lente (le noyau

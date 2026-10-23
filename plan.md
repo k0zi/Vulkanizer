@@ -50,17 +50,16 @@ Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben 
 ### Állapot (2026-10-23)
 
 Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
-az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`), az 5.6-ból a cooperative
-groups és a több GPU alapjai, valamint az 5.7 (llama tg ~31 → ~38 t/s). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
+az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`), az 5.6 (cooperative
+groups, több GPU, IPC, NCCL, UVA), valamint az 5.7 (llama tg ~31 → ~38 t/s). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
 Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
 
 Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
 2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
 3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
-4. **5.6** maradéka: eszközök közti UVA (az IPC és az NCCL kész).
-5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
-6. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
+4. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
+5. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
    queue (5.4).
 
 ### Fázis 0 – Váz ✅
@@ -473,7 +472,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     `.deb`-ből: nvcc-programok (CUDA 12 és 13), llama.cpp, PyTorch CUDA 12 és 13, Triton.
   - [x] Dokumentáció: README „Telepítés (csomag)” szakasz mind a 8 nyelven.
   - [ ] Jogi átnézés publikálás előtt (nem fejlesztési feladat).
-- [ ] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
+- [x] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
   - [x] Cooperative groups (`grid.sync()`, `rt_kernels cooperative`, CUDA 12 és 13): `cuLaunchCooperativeKernel`
     (`_ptsz`), `cuLaunchKernelEx`/`cudaLaunchKernelEx` cooperative attribútuma, `cudaLaunchCooperativeKernel`,
     graph-csomópontként is. A toolkit fejléce a grid workspace címét a `%envreg1`/`%envreg2` regiszterekből olvassa: a
@@ -498,8 +497,11 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       (`Device::hostAddressBits()`), és minden pipeline az 5-ös specializációs konstansként kapja meg. Emulált warpokon
       (subgroup < 32) a predikált `redux`/`shfl` stb. minden szálon fut (a barrierek nem lehetnek divergens ágban), a
       predikátum csak a célregisztert választja.
-    - Hátra: eszközök közti UVA (`cudaMemcpyDefault` két eszköz pointerével: a keresés a current context eszközén
-      belül történik).
+    - [x] Eszközök közti UVA: a sima másolások (`cuMemcpy*`, `cudaMemcpy(Async)` `Default`/`DeviceToDevice`) és a
+      pointer-attribútumok a current context eszköze után a többi eszköz foglalásai közt is keresnek
+      (`findPiecesOnAnyDevice`); két eszköz között a hoston át másol, mint a `cuMemcpyPeer`. A PyTorch
+      `tensor.to("cuda:1")` és `copy_` így működik (eddig `invalid argument`). Korlát: két külön Vulkan device
+      címtartománya átfedhet (két egyforma GPU); ilyenkor a current context eszköze nyer.
     - llama.cpp két eszközön (RADV + llvmpipe) eljut a rétegek szétosztásáig és a peer másolásig, de az llvmpipe-on a
       `rope_norm` kernel (blockDim.x = 1) összeomlik: az llvmpipe a `set_rows_stride != 0` feltétel mögötti
       `row_indices[i]` loadot a feltétel elé emeli (Volatile-lal is), és a null pointerből olvas. A Vulkanizer a loadot a

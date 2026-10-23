@@ -991,6 +991,25 @@ static bool testMultiGpu() {
     CHECK(cudaMemcpy(got.data(), d0, n * sizeof(float), cudaMemcpyDeviceToHost));
     ok = expectEqual("peer copy back", got, want) && ok;
 
+    // unified addressing: plain copies between two devices' pointers, from either current device
+    // (cudaMemcpyDefault and DeviceToDevice, as PyTorch's tensor.to("cuda:1") does), and the
+    // pointer attributes of the other device's memory
+    std::vector<float> ones(n, 1.0f);
+    CHECK(cudaMemcpy(d0, ones.data(), n * sizeof(float), cudaMemcpyDefault));
+    CHECK(cudaSetDevice(1));
+    CHECK(cudaMemcpyAsync(d1, d0, n * sizeof(float), cudaMemcpyDeviceToDevice, s1));  // device 0 -> 1, from 1
+    CHECK(cudaStreamSynchronize(s1));
+    CHECK(cudaMemcpy(got.data(), d1, n * sizeof(float), cudaMemcpyDefault));
+    ok = expectEqual("unified copy 0 -> 1", got, ones) && ok;
+    CHECK(cudaSetDevice(0));
+    squarePlusOne<<<(n + 255) / 256, 256>>>(d0, n);  // 2 everywhere
+    CHECK(cudaMemcpy(d1, d0, n * sizeof(float), cudaMemcpyDefault));  // device 0 -> 1, from 0
+    CHECK(cudaMemcpy(got.data(), d1, n * sizeof(float), cudaMemcpyDefault));  // device 1's memory, from 0
+    ok = expectEqual("unified copy 0 -> 1 from device 0", got, std::vector<float>(n, 2.0f)) && ok;
+    cudaPointerAttributes attr{};
+    CHECK(cudaPointerGetAttributes(&attr, d1));
+    ok = ok && attr.type == cudaMemoryTypeDevice && attr.device == 1;
+
     int access = 1;
     CHECK(cudaDeviceCanAccessPeer(&access, 0, 1));
     ok = ok && access == 0 && cudaDeviceEnablePeerAccess(1, 0) == cudaErrorPeerAccessUnsupported;

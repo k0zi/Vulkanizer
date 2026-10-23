@@ -1378,8 +1378,12 @@ cudaError_t CUDARTAPI cudaPointerGetAttributes(struct cudaPointerAttributes* att
         attributes->type = managed ? cudaMemoryTypeManaged
                            : memoryType == CU_MEMORYTYPE_HOST ? cudaMemoryTypeHost
                                                               : cudaMemoryTypeDevice;
-        CUdevice dev = 0;
-        cuCtxGetDevice(&dev);
+        int dev = 0;  // the memory's device (unified addressing: maybe not the current one)
+        if (cuPointerGetAttribute(&dev, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, p) != CUDA_SUCCESS) {
+            CUdevice current = 0;
+            cuCtxGetDevice(&current);
+            dev = current;
+        }
         attributes->device = dev;
         CUdeviceptr d = 0;  // pinned memory the device cannot use has no device pointer
         if (cuPointerGetAttribute(&d, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, p) == CUDA_SUCCESS)

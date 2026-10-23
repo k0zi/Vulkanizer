@@ -237,7 +237,8 @@ Lista completa: [plan.md, seção 4](plan.md).
   entre processos está concluído assim que é registrado (registrá-lo espera pelo dispositivo).
 - NCCL (`libnccl.so.2`, o backend "nccl" do `torch.distributed`: DDP, FSDP) funciona entre os ranks de uma máquina,
   que podem compartilhar uma GPU; com mais de um rank os dados passam pela memória do host.
-- Várias GPUs são dispositivos separados: `cudaMemcpyPeer` copia entre elas pela memória do host, mas um kernel nunca
+- Várias GPUs são dispositivos separados: `cudaMemcpyPeer` e as cópias comuns entre ponteiros de dois dispositivos
+  (endereçamento unificado, p. ex. `tensor.to("cuda:1")` do PyTorch) passam pela memória do host, mas um kernel nunca
   acessa a memória de outra GPU (sem acesso entre pares). Lançamentos cooperativos (`grid.sync()`) funcionam até o
   número de blocos que cabem ao mesmo tempo na GPU.
 - A memória managed, fixada (pinned) e registrada é memória do host que a GPU usa no lugar, no mesmo endereço;

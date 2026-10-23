@@ -280,6 +280,9 @@ struct AllocPiece {
     size_t at = 0, size = 0;
 };
 bool findPieces(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, std::vector<AllocPiece>& out);
+// Unified addressing over the devices: the device whose memory holds [ptr, ptr + bytes) (`preferred`
+// first, as separate Vulkan devices' address ranges may overlap), or nullptr. Caller holds the driver lock.
+DeviceSlot* findPiecesOnAnyDevice(DeviceSlot& preferred, CUdeviceptr ptr, size_t bytes, std::vector<AllocPiece>& out);
 
 // The reservation containing ptr, or nullptr.
 VmReservation* findReservation(DeviceSlot& slot, CUdeviceptr ptr);

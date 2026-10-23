@@ -235,9 +235,10 @@ Full list: [plan.md, section 4](plan.md).
   event is complete once recorded (recording it waits for the device).
 - NCCL (`libnccl.so.2`, PyTorch's `torch.distributed` "nccl" backend: DDP, FSDP) works between the ranks of one
   machine, which may share a GPU; with more than one rank the data goes through host memory.
-- Several GPUs are separate devices: `cudaMemcpyPeer` copies between them through host memory, but a kernel never
-  reaches another GPU's memory (no peer access). Cooperative launches (`grid.sync()`) work up to the number of blocks
-  that fit on the GPU at once.
+- Several GPUs are separate devices: `cudaMemcpyPeer` and plain copies between two devices' pointers (unified
+  addressing, e.g. PyTorch's `tensor.to("cuda:1")`) go through host memory, but a kernel never reaches another GPU's
+  memory (no peer access). Cooperative launches (`grid.sync()`) work up to the number of blocks that fit on the GPU at
+  once.
 - Managed, pinned and registered memory are host memory the GPU uses in place at the same address; managed memory
   never migrates to the GPU (on an integrated GPU it is the same memory anyway).
 - While registered host memory (`cuMemHostRegister`) exists, every GPU submission is slower (the kernel revalidates

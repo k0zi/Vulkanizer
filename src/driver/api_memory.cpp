@@ -92,17 +92,25 @@ static CUresult copyPieces(vk::Device& dev, const std::vector<AllocPiece>& src, 
 }
 
 // Unified addressing: each side is device memory if it falls inside an allocation (device memory,
-// or host memory the device accesses), other host memory otherwise. `dstDevice` and `srcDevice`
-// require that side to be device memory (cuMemcpyHtoD and the like).
+// or host memory the device accesses) of the current context's device or of another one, other host
+// memory otherwise. `dstDevice` and `srcDevice` require that side to be device memory (cuMemcpyHtoD
+// and the like). Between two devices the data goes through the host, as in cuMemcpyPeer.
 static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_t bytes, bool sync,
                             bool dstDevice = false, bool srcDevice = false) {
     if (bytes == 0) return CUDA_SUCCESS;
     if (!dst || !src) return CUDA_ERROR_INVALID_VALUE;
     std::vector<AllocPiece> d, sr;
-    const bool dstDev = findPieces(*s.slot, dst, bytes, d);
-    const bool srcDev = findPieces(*s.slot, src, bytes, sr);
+    DeviceSlot* dstSlot = findPiecesOnAnyDevice(*s.slot, dst, bytes, d);
+    DeviceSlot* srcSlot = findPiecesOnAnyDevice(*s.slot, src, bytes, sr);
+    const bool dstDev = dstSlot != nullptr, srcDev = srcSlot != nullptr;
     if ((dstDevice && !dstDev) || (srcDevice && !srcDev)) return CUDA_ERROR_INVALID_VALUE;
+    if (dstDev && srcDev && dstSlot != srcSlot) {
+        std::vector<char> staging(bytes);
+        if (CUresult r = readPieces(*srcSlot->vk, sr, staging.data())) return r;
+        return writePieces(*dstSlot->vk, d, staging.data());
+    }
     if (dstDev && srcDev) {
+        vk::Device& dev = *dstSlot->vk;
         // From pinned or managed memory into device memory while the device is idle (inputs uploaded
         // between two steps, e.g. per LLM token): a host copy, like from any host memory, instead of
         // a GPU copy that the synchronous call or the next synchronize has to wait a round trip for.
@@ -112,12 +120,11 @@ static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_
         auto deviceMemory = [](const std::vector<AllocPiece>& p) {
             return std::none_of(p.begin(), p.end(), [](const AllocPiece& x) { return x.ref.buffer->hostAddressed; });
         };
-        if (hostMemory(sr) && deviceMemory(d) && s.dev->idle())
-            return writePieces(*s.dev, d, reinterpret_cast<const void*>(src));
-        return copyPieces(*s.dev, sr, d, sync);
+        if (hostMemory(sr) && deviceMemory(d) && dev.idle()) return writePieces(dev, d, reinterpret_cast<const void*>(src));
+        return copyPieces(dev, sr, d, sync);
     }
-    if (dstDev) return writePieces(*s.dev, d, reinterpret_cast<const void*>(src));
-    if (srcDev) return readPieces(*s.dev, sr, reinterpret_cast<void*>(dst));
+    if (dstDev) return writePieces(*dstSlot->vk, d, reinterpret_cast<const void*>(src));
+    if (srcDev) return readPieces(*srcSlot->vk, sr, reinterpret_cast<void*>(dst));
     std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
     return CUDA_SUCCESS;
 }
@@ -358,13 +365,31 @@ namespace {
 
 struct PointerInfo {
     bool device = false, host = false, managed = false;
+    DeviceSlot* slot = nullptr;  // the device memory's device
     CUdeviceptr base = 0;  // of the allocation or mapping
     size_t size = 0;
     CUmemoryPool pool = nullptr;
 };
 
-PointerInfo pointerInfo(DeviceSlot& slot, CUdeviceptr ptr) {
+PointerInfo pointerInfoOn(DeviceSlot& slot, CUdeviceptr ptr);
+
+// The current context's device first, then the other ones (unified addressing).
+PointerInfo pointerInfo(DeviceSlot& current, CUdeviceptr ptr) {
+    PointerInfo info = pointerInfoOn(current, ptr);
+    if (info.device || info.host) return info;
+    Driver& d = Driver::get();
+    for (int i = 0; i < d.deviceCount(); ++i) {
+        DeviceSlot* slot = d.slot(i);
+        if (slot == &current || !slot->vk) continue;
+        info = pointerInfoOn(*slot, ptr);
+        if (info.device) return info;
+    }
+    return PointerInfo{};
+}
+
+PointerInfo pointerInfoOn(DeviceSlot& slot, CUdeviceptr ptr) {
     PointerInfo info;
+    info.slot = &slot;
     HostMemoryInfo host;
     if (findHostMemory(ptr, host)) {  // pinned, registered or managed: one pointer for both sides
         info.host = true;
@@ -397,7 +422,9 @@ bool pointerAttribute(const ApiScope& s, const PointerInfo& info, CUdeviceptr pt
                       void* data) {
     auto put = [&](auto v) { std::memcpy(data, &v, sizeof v); };
     switch (attribute) {
-        case CU_POINTER_ATTRIBUTE_CONTEXT: put(s.ctx); return true;
+        case CU_POINTER_ATTRIBUTE_CONTEXT:  // another device's memory: that device's primary context
+            put(info.slot && info.slot != s.slot ? &info.slot->primary : s.ctx);
+            return true;
         case CU_POINTER_ATTRIBUTE_MEMORY_TYPE:
             // managed memory reports the device, as on CUDA (IS_MANAGED tells it apart)
             put(unsigned(info.host && !info.managed ? CU_MEMORYTYPE_HOST : CU_MEMORYTYPE_DEVICE));
@@ -417,7 +444,7 @@ bool pointerAttribute(const ApiScope& s, const PointerInfo& info, CUdeviceptr pt
         case CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE:
         case CU_POINTER_ATTRIBUTE_IS_GPU_DIRECT_RDMA_CAPABLE: put(false); return true;
         case CU_POINTER_ATTRIBUTE_MAPPED: put(true); return true;
-        case CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL: put(int(s.slot->ordinal)); return true;
+        case CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL: put(int((info.slot ? info.slot : s.slot)->ordinal)); return true;
         case CU_POINTER_ATTRIBUTE_RANGE_START_ADDR:
         case CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR: put(info.base); return true;
         case CU_POINTER_ATTRIBUTE_RANGE_SIZE:

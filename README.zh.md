@@ -228,7 +228,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - CUDA IPC（`cudaIpc*`、PyTorch 的 `torch.multiprocessing`）可在同一用户的进程之间使用；跨进程事件在记录时即完成（记录会等待设备）。
 - NCCL（`libnccl.so.2`，`torch.distributed` 的 "nccl" 后端：DDP、FSDP）可在同一台机器的各 rank 之间使用，它们也可以共用一块 GPU；
   多于一个 rank 时数据经由主机内存传输。
-- 多个 GPU 是彼此独立的设备：`cudaMemcpyPeer` 通过主机内存在它们之间复制，但内核永远无法访问另一个 GPU 的内存
+- 多个 GPU 是彼此独立的设备：`cudaMemcpyPeer` 以及两个设备指针之间的普通复制（统一寻址，例如 PyTorch 的 `tensor.to("cuda:1")`）都经由主机内存，但内核永远无法访问另一个 GPU 的内存
   （没有对等访问）。协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU
   （在集成 GPU 上本来就是同一块内存）。

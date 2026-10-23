@@ -147,6 +147,16 @@ bool findPieces(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, std::vector<All
     return true;
 }
 
+DeviceSlot* findPiecesOnAnyDevice(DeviceSlot& preferred, CUdeviceptr ptr, size_t bytes, std::vector<AllocPiece>& out) {
+    if (findPieces(preferred, ptr, bytes, out)) return &preferred;
+    Driver& d = Driver::get();
+    for (int i = 0; i < d.deviceCount(); ++i) {
+        DeviceSlot* slot = d.slot(i);
+        if (slot != &preferred && slot->vk && findPieces(*slot, ptr, bytes, out)) return slot;
+    }
+    return nullptr;
+}
+
 CUresult toCuResult(VkResult r) {
     switch (r) {
         case VK_SUCCESS: return CUDA_SUCCESS;

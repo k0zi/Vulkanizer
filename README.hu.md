@@ -238,9 +238,10 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).
 - Az NCCL (`libnccl.so.2`, a `torch.distributed` „nccl” backendje: DDP, FSDP) egy gép rangjai között működik, akár
   egy GPU-n osztozva; egynél több ranggal az adat a host-memórián megy át.
-- Több GPU külön eszközként működik: a `cudaMemcpyPeer` host-memórián át másol köztük, de egy kernel sosem éri el egy
-  másik GPU memóriáját (nincs peer access). A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi
-  egyszerre elfér a GPU-n.
+- Több GPU külön eszközként működik: a `cudaMemcpyPeer` és a két eszköz pointerei közti sima másolások (egységes
+  címzés, pl. a PyTorch `tensor.to("cuda:1")`-e) host-memórián át mennek, de egy kernel sosem éri el egy másik GPU
+  memóriáját (nincs peer access). A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi egyszerre
+  elfér a GPU-n.
 - A managed, a pinned és a regisztrált memória host-memória, amit a GPU helyben, ugyanazon a címen használ; a managed
   memória sosem migrál a GPU-ra (integrált GPU-n ez amúgy is ugyanaz a memória).
 - Amíg regisztrált host-memória (`cuMemHostRegister`) létezik, minden GPU-submit lassabb (a kernel újraellenőrzi az
