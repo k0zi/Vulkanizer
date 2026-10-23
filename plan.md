@@ -574,6 +574,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       `__nvJitLinkX_12_N` nevek) a driver `cuLink*`-jára köti (a libcuda szimbólumtáblájából, mert az audit-könyvtár
       külön névtérben fut), az `nvJitLinkVersion` pedig hibát ad: a Numba ebből dönti el az LTO-t, így LTO-IR helyett
       PTX-et ad.
+  - whisper.cpp (`tools/build_whisper.sh`, a llama.cpp-vel azonos ggml CUDA backend, base.en): elsőre helyes átirat
+    (jfk.wav). Az encoder ~3× gyorsabb a CPU-nál (275–340 vs. 800–1050 ms), a dekódolás lépésenként lassabb (30–60
+    vs. ~9 ms: sok apró kernel, mint a llama tg-nél).
   - Teszt: `tests/library.cpp` (kontextus nélküli betöltés, enumerálás, CUkernel-indítás, globális, két PTX modul
     linkelése `.extern` hívással, a cubin elutasítása; RADV és llvmpipe). Numba (`numba1.py` jellegű próba): saxpy,
     shared memória + atomics, komplex/while, `cuda.reduce`, device-függvény + libdevice, stream/event – mind helyes.

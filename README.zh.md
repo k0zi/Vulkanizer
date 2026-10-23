@@ -109,6 +109,14 @@ tools/build_llama.sh                  # 克隆 .work/llama.cpp 并以 CUDA 后�
 但对以 fast math（`-ftz`）编译的代码（例如 llama.cpp 的 CUDA 后端）使用驱动的快速 `fma`。
 `VULKANIZER_FAST_FMA=1` 处处使用快速版本，`VULKANIZER_EXACT_FMA=1` 处处使用模拟。
 
+whisper.cpp（语音识别，同样的 ggml CUDA 后端）以同样的方式构建和运行：
+
+```sh
+tools/build_whisper.sh   # into .work/whisper-build, with the base.en model
+LD_LIBRARY_PATH=build/lib .work/whisper-build/bin/whisper-cli \
+    -m .work/whisper.cpp/models/ggml-base.en.bin -f .work/whisper.cpp/samples/jfk.wav
+```
+
 ### 4. bitnet.c
 
 bitnet.c 的 CUDA 后端（`--cuda`）通过 `run_bitnet.sh` 在 Vulkan 上运行：
@@ -304,4 +312,5 @@ tests/cudart_abi      clean-room 运行时类型与官方头文件的 ABI 一致
 tests/data            测试用 PTX 文件，旁边是对应的 .cu 源码；gen_ptx.sh 会重新生成它们（clang）
 tools/                vulkanizer-info（设备列表）、vulkanizer-ptxc（离线编译器）、setup_cuda.sh、
                       build_llama.sh（针对 Vulkanizer 的 llama.cpp CUDA 构建）
+                      build_whisper.sh (whisper.cpp)
 ```

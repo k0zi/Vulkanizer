@@ -114,6 +114,14 @@ Azokon a GPU-kon, ahol a Vulkan `fma` nem fúzionált (pl. AMD GFX9), a Vulkaniz
 kerekítő `fma`-ját, a fast mathtal (`-ftz`) fordított kódban viszont – mint a llama.cpp CUDA backendje – a driver gyors
 `fma`-ját használja. A `VULKANIZER_FAST_FMA=1` mindenhol a gyorsat, a `VULKANIZER_EXACT_FMA=1` mindenhol az emulációt adja.
 
+A whisper.cpp (beszédfelismerés, ugyanaz a ggml CUDA backend) ugyanígy fordul és fut:
+
+```sh
+tools/build_whisper.sh   # into .work/whisper-build, with the base.en model
+LD_LIBRARY_PATH=build/lib .work/whisper-build/bin/whisper-cli \
+    -m .work/whisper.cpp/models/ggml-base.en.bin -f .work/whisper.cpp/samples/jfk.wav
+```
+
 ### 4. bitnet.c
 
 A bitnet.c CUDA backendje (`--cuda`) a `run_bitnet.sh`-val fut Vulkanon:
@@ -320,4 +328,5 @@ tests/cudart_abi      a clean-room runtime típusok ABI-egyezése a hivatalos he
 tests/data            teszt-PTX fájlok, mellettük a .cu forrásaik; a gen_ptx.sh újragenerálja őket (clang)
 tools/                vulkanizer-info (eszközlista), vulkanizer-ptxc (offline fordító), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (a llama.cpp CUDA-buildje a Vulkanizer ellen)
+                      build_whisper.sh (whisper.cpp)
 ```

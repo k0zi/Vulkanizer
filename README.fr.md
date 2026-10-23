@@ -115,6 +115,14 @@ Sur les GPU dont le `fma` Vulkan n’est pas fusionné (p. ex. AMD GFX9), Vulkan
 CUDA pour le code IEEE, mais utilise le `fma` rapide du pilote pour le code compilé en fast math (`-ftz`, comme le
 backend CUDA de llama.cpp). `VULKANIZER_FAST_FMA=1` utilise partout le rapide, `VULKANIZER_EXACT_FMA=1` émule partout.
 
+whisper.cpp (reconnaissance vocale, le même backend CUDA de ggml) se compile et s’exécute de la même façon :
+
+```sh
+tools/build_whisper.sh   # into .work/whisper-build, with the base.en model
+LD_LIBRARY_PATH=build/lib .work/whisper-build/bin/whisper-cli \
+    -m .work/whisper.cpp/models/ggml-base.en.bin -f .work/whisper.cpp/samples/jfk.wav
+```
+
 ### 4. bitnet.c
 
 Le backend CUDA de bitnet.c (`--cuda`) fonctionne sur Vulkan via `run_bitnet.sh` :
@@ -326,4 +334,5 @@ tests/cudart_abi      conformité ABI des types clean-room du runtime avec les e
 tests/data            fichiers PTX de test avec leurs sources .cu ; gen_ptx.sh les régénère (clang)
 tools/                vulkanizer-info (liste des périphériques), vulkanizer-ptxc (compilateur hors ligne), vulkanizer-bandwidth, setup_cuda.sh,
                       build_llama.sh (compilation CUDA de llama.cpp avec Vulkanizer)
+                      build_whisper.sh (whisper.cpp)
 ```

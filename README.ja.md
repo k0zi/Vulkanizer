@@ -112,6 +112,14 @@ Vulkan の `fma` が融合演算でない GPU（例：AMD GFX9）では、Vulkan
 `fma` をエミュレートしますが、fast math（`-ftz`）でビルドされたコード（llama.cpp の CUDA バックエンドなど）にはドライバの
 高速な `fma` を使います。`VULKANIZER_FAST_FMA=1` は常に高速版、`VULKANIZER_EXACT_FMA=1` は常にエミュレーションを使います。
 
+whisper.cpp（音声認識、同じ ggml CUDA バックエンド）も同じ方法でビルド・実行できます：
+
+```sh
+tools/build_whisper.sh   # into .work/whisper-build, with the base.en model
+LD_LIBRARY_PATH=build/lib .work/whisper-build/bin/whisper-cli \
+    -m .work/whisper.cpp/models/ggml-base.en.bin -f .work/whisper.cpp/samples/jfk.wav
+```
+
 ### 4. bitnet.c
 
 bitnet.c の CUDA バックエンド（`--cuda`）は `run_bitnet.sh` を通じて Vulkan 上で動作します：
@@ -317,4 +325,5 @@ tests/cudart_abi      クリーンルームのランタイム型と公式ヘッ�
 tests/data            テスト用 PTX ファイルと、その隣に .cu ソース。gen_ptx.sh で再生成（clang）
 tools/                vulkanizer-info（デバイス一覧）、vulkanizer-ptxc（オフラインコンパイラ）、setup_cuda.sh、
                       build_llama.sh（Vulkanizer 向けの llama.cpp CUDA ビルド）
+                      build_whisper.sh (whisper.cpp)
 ```
