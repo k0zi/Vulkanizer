@@ -242,3 +242,29 @@
     X(stream) \
     X(attrs) \
     X(numAttrs)
+
+// Arrays, pitched memory and texture objects: sizes and the offsets of their key fields.
+#define VULKANIZER_TEXTURE_LAYOUT(X) \
+    X(sizeof(cudaChannelFormatDesc)) \
+    X(offsetof(cudaChannelFormatDesc, f)) \
+    X(sizeof(cudaExtent)) \
+    X(sizeof(cudaPos)) \
+    X(sizeof(cudaPitchedPtr)) \
+    X(sizeof(cudaMemcpy3DParms)) \
+    X(offsetof(cudaMemcpy3DParms, dstArray)) \
+    X(offsetof(cudaMemcpy3DParms, extent)) \
+    X(offsetof(cudaMemcpy3DParms, kind)) \
+    X(sizeof(cudaResourceDesc)) \
+    X(offsetof(cudaResourceDesc, res.linear.sizeInBytes)) \
+    X(offsetof(cudaResourceDesc, res.pitch2D.pitchInBytes)) \
+    VULKANIZER_PROP_13(X, offsetof(cudaResourceDesc, flags)) \
+    X(sizeof(cudaTextureDesc)) \
+    X(offsetof(cudaTextureDesc, readMode)) \
+    X(offsetof(cudaTextureDesc, borderColor)) \
+    X(offsetof(cudaTextureDesc, normalizedCoords)) \
+    X(offsetof(cudaTextureDesc, maxMipmapLevelClamp)) \
+    X(offsetof(cudaTextureDesc, seamlessCubemap)) \
+    X(int(cudaReadModeNormalizedFloat)) \
+    X(int(cudaAddressModeBorder)) \
+    X(int(cudaResourceTypePitch2D)) \
+    X(int(cudaChannelFormatKindNone))

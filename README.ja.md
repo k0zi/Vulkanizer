@@ -258,7 +258,10 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフとメモリノード（キャプチャ中のストリーム順序付き割り当て）にも対応しています。
   条件ノードは未対応です。
-- （まだ）未対応：テクスチャ、cuDNN。
+- （まだ）未対応：cuDNN。
+- テクスチャとサーフェス（テクスチャ／サーフェスオブジェクト、CUDA 配列）はソフトウェアでサンプリングされ、CUDA と同じ
+  アドレッシングとフィルタリングを行います。ミップマップ、キューブマップ、テクスチャ参照、フォーマット付きサーフェス書き込みは
+  未対応です。
 - CUDA IPC（`cudaIpc*`、PyTorch の `torch.multiprocessing`）は同じユーザーのプロセス間で動作します。プロセス間イベントは
   記録した時点で完了します（記録はデバイスを待ちます）。
 - NCCL（`libnccl.so.2`、`torch.distributed` の "nccl" バックエンド：DDP、FSDP）は 1 台のマシンのランク間で動作し、
@@ -309,6 +312,7 @@ include/cuda.h        クリーンルームで書いた CUDA Driver API ヘッ�
 src/common            ログ
 src/vk                Vulkan インスタンス/デバイス、バッファ、パイプライン
 src/ptx               PTX の字句解析器、モジュール・命令パーサ
+src/ptx/texture_lib.cu  テクスチャとサーフェスのソフトウェアサンプリング（PTX として埋め込み、tools/gen_texture_lib.sh）
 src/compiler          CFG と構造化、SPIR-V ビルダ、PTX -> SPIR-V コンパイラ
 src/driver            libcuda.so の API 面
 src/runtime           libcudart.so.12 と .so.13（Driver API 上に構築した CUDA Runtime API、同一ソース）

@@ -49,7 +49,7 @@ Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben 
 
 ### Állapot (2026-10-23)
 
-Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
+Kész: a 0–4. fázis a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
 az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`), az 5.6 (cooperative
 groups, több GPU, IPC, NCCL, UVA), valamint az 5.7 (llama tg ~31 → ~38 t/s). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
 Triton, `torch.compile`), ComfyUI (Z-Image Turbo), Numba (`numba-cuda`).
@@ -57,9 +57,8 @@ Triton, `torch.compile`), ComfyUI (Z-Image Turbo), Numba (`numba-cuda`).
 Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
 2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
-3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
-4. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
-5. Nyitott részfeladatok: rögzített Vulkan command bufferek, feltételes csomópontok (5.3); külön copy queue
+3. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
+4. Nyitott részfeladatok: rögzített Vulkan command bufferek, feltételes csomópontok (5.3); külön copy queue
    (5.4).
 
 ### Fázis 0 – Váz ✅
@@ -151,7 +150,32 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - f16/bf16 konverzió és aritmetika (f32-ben, pontos RNE).
   - Minden float művelet `NoContraction` (a Mesa különben átrendezi, ami elrontotta az `expf`-et).
   - Az f32 `fma` f64-ben számol (sem a RADV, sem az llvmpipe nem fused, ami elrontotta a `sinf`-et).
-- [ ] **3.6** Textúrák / surface-ek. Alacsony prioritás, csak ha egy célalkalmazás igényli.
+- [x] **3.6** Textúrák / surface-ek (2026-10-23) – szoftveres mintavételezéssel, descriptorok nélkül (a Vulkanizer csak
+  BDA-t és push constantot használ).
+  - CUDA array: sima device-memória, sűrű sorokkal (`api_texture.cpp`: `cuArrayCreate`, `cuArray3DCreate` rétegzett
+    és 3D változattal, `cuArrayDestroy`, leírók; `cuMemcpy2D`/`2DUnaligned`/`3D` és Async – eddig a driverből teljesen
+    hiányoztak –, `cuMemcpyHtoA`/`AtoH`/`DtoA`/`AtoD`/`AtoA`).
+  - Texture/surface object: a handle egy device-memóriába írt leíró címe (`common/texture_desc.h`: adat, pitch,
+    méretek, formátum, csatornák, flag-ek, címzés, border-szín). Erőforrás: array, linear, pitch2D.
+  - A kernelek `tex`, `tld4`, `txq`, `suld.b`, `sust.b`, `suq` utasításai betöltéskor (`ptx/texture.cpp`) egy hatókörös
+    `call`-blokkra íródnak át (ugyanazon a soron: a sorszámok maradnak), a modul végére pedig a textúra-könyvtár kerül
+    (`ptx/texture_lib.cu` → `texture_lib.ptx`, `tools/gen_texture_lib.sh`, beágyazva). A könyvtár CUDA C-ben van, így a
+    PTX-inliner kezeli; a szűrő sarkai és a csatornák ciklusok (nem kigörgetve), mert minden hívási hely inline-olja:
+    a könyvtár ~3300 PTX-sor (kigörgetve 15 ezer volt).
+  - Viselkedés: normalizált/nem normalizált koordináták, wrap/clamp/mirror/border (a wrap és a mirror csak normalizált
+    koordinátákkal, egyébként clamp, mint a CUDA-ban), pont- és bilineáris/trilineáris szűrés 8 bites súlyokkal,
+    8/16 bites egészek [0, 1] / [-1, 1]-re vagy nyersen (`READ_AS_INTEGER`), half, sRGB, gather, lekérdezések,
+    surface-ek bájt-koordinátákkal és trap/clamp/zero határkezeléssel.
+  - Runtime: `cudaMallocArray`/`Malloc3DArray`/`FreeArray`/`ArrayGetInfo`/`GetChannelDesc`/`CreateChannelDesc`,
+    `cudaMallocPitch`/`Malloc3D`, `cudaMemset2D`/`3D`, `cudaMemcpy2DToArray`/`FromArray`/`ArrayToArray`, `cudaMemcpy3D`,
+    `cudaMemcpyToArray`/`FromArray`, `cudaCreate`/`DestroyTextureObject`, `cudaCreate`/`DestroySurfaceObject`; a
+    `cudaDeviceProp` textúra-korlátai. A `cudaResourceDesc` CUDA 13-ban `reserved`/`flags` mezőt kapott: az ABI-teszt
+    most a textúra-struktúrákat is összeveti a hivatalos headerekkel.
+  - Nincs: mipmapek, cube mapek, textúra-referenciák (CUDA 12 óta eltávolítva), formázott `sust.p`, resource view-k.
+  - Teszt: `tests/cuda/rt_texture.cu` (nvcc, CUDA 12 és 13, RADV és llvmpipe): 2D float pont/lineáris, minden címzés,
+    normalizált wrap és mirror, uchar4 egészként és normalizált floatként, `tex1Dfetch` linear memórián, pitch2D,
+    3D trilineáris `cudaMemcpy3D`-vel, rétegzett 2D, `tex2Dgather`, `surf2Dread`/`surf2Dwrite` határon kívüli esettel,
+    `cudaArrayGetInfo` – mind a CPU-referenciával egyezik.
 - [x] **3.7 Aszinkron végrehajtás**: a kernelek batch-ekben futnak (command buffer ring, köztük barrier). A host-oldali műveletek előtte kiürítik a sort. Az eventek GPU timestamp-et használnak, a streamek egy queue-n osztoznak.
   Eredmény: 66 → 7 µs/launch a Renoir iGPU-n.
   Hiányzik: valódi párhuzamos streamek, host callbackek (`cuLaunchHostFunc`), aszinkron memcpy.

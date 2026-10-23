@@ -39,6 +39,10 @@ typedef struct CUstream_st* CUstream;
 typedef struct CUevent_st* CUevent;
 typedef struct CUmemPoolHandle_st* CUmemoryPool;
 typedef struct CUkern_st* CUkernel;
+typedef struct CUarray_st* CUarray;
+typedef struct CUmipmappedArray_st* CUmipmappedArray;
+typedef unsigned long long CUtexObject;
+typedef unsigned long long CUsurfObject;
 typedef unsigned long long CUmemGenericAllocationHandle_v1;
 typedef CUmemGenericAllocationHandle_v1 CUmemGenericAllocationHandle;
 
@@ -852,6 +856,179 @@ CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type, const cha
                                CUjit_option* options, void** optionValues);
 CUresult CUDAAPI cuLinkComplete(CUlinkState state, void** cubinOut, size_t* sizeOut);
 CUresult CUDAAPI cuLinkDestroy(CUlinkState state);
+
+/* ---- CUDA arrays, 2D/3D copies, texture and surface objects (sampled in software) ---- */
+typedef enum CUarray_format_enum {
+    CU_AD_FORMAT_UNSIGNED_INT8 = 0x01,
+    CU_AD_FORMAT_UNSIGNED_INT16 = 0x02,
+    CU_AD_FORMAT_UNSIGNED_INT32 = 0x03,
+    CU_AD_FORMAT_SIGNED_INT8 = 0x08,
+    CU_AD_FORMAT_SIGNED_INT16 = 0x09,
+    CU_AD_FORMAT_SIGNED_INT32 = 0x0a,
+    CU_AD_FORMAT_HALF = 0x10,
+    CU_AD_FORMAT_FLOAT = 0x20
+} CUarray_format;
+typedef struct CUDA_ARRAY_DESCRIPTOR_st {
+    size_t Width;
+    size_t Height;
+    CUarray_format Format;
+    unsigned int NumChannels;
+} CUDA_ARRAY_DESCRIPTOR;
+#define CUDA_ARRAY3D_LAYERED 0x01
+#define CUDA_ARRAY3D_SURFACE_LDST 0x02
+#define CUDA_ARRAY3D_CUBEMAP 0x04
+#define CUDA_ARRAY3D_TEXTURE_GATHER 0x08
+typedef struct CUDA_ARRAY3D_DESCRIPTOR_st {
+    size_t Width;
+    size_t Height;
+    size_t Depth;
+    CUarray_format Format;
+    unsigned int NumChannels;
+    unsigned int Flags;
+} CUDA_ARRAY3D_DESCRIPTOR;
+typedef struct CUDA_MEMCPY2D_st {
+    size_t srcXInBytes, srcY;
+    CUmemorytype srcMemoryType;
+    const void* srcHost;
+    CUdeviceptr srcDevice;
+    CUarray srcArray;
+    size_t srcPitch;
+    size_t dstXInBytes, dstY;
+    CUmemorytype dstMemoryType;
+    void* dstHost;
+    CUdeviceptr dstDevice;
+    CUarray dstArray;
+    size_t dstPitch;
+    size_t WidthInBytes;
+    size_t Height;
+} CUDA_MEMCPY2D;
+typedef struct CUDA_MEMCPY3D_st {
+    size_t srcXInBytes, srcY, srcZ, srcLOD;
+    CUmemorytype srcMemoryType;
+    const void* srcHost;
+    CUdeviceptr srcDevice;
+    CUarray srcArray;
+    void* reserved0;
+    size_t srcPitch, srcHeight;
+    size_t dstXInBytes, dstY, dstZ, dstLOD;
+    CUmemorytype dstMemoryType;
+    void* dstHost;
+    CUdeviceptr dstDevice;
+    CUarray dstArray;
+    void* reserved1;
+    size_t dstPitch, dstHeight;
+    size_t WidthInBytes, Height, Depth;
+} CUDA_MEMCPY3D;
+typedef enum CUresourcetype_enum {
+    CU_RESOURCE_TYPE_ARRAY = 0x00,
+    CU_RESOURCE_TYPE_MIPMAPPED_ARRAY = 0x01,
+    CU_RESOURCE_TYPE_LINEAR = 0x02,
+    CU_RESOURCE_TYPE_PITCH2D = 0x03
+} CUresourcetype;
+typedef struct CUDA_RESOURCE_DESC_st {
+    CUresourcetype resType;
+    union {
+        struct {
+            CUarray hArray;
+        } array;
+        struct {
+            CUmipmappedArray hMipmappedArray;
+        } mipmap;
+        struct {
+            CUdeviceptr devPtr;
+            CUarray_format format;
+            unsigned int numChannels;
+            size_t sizeInBytes;
+        } linear;
+        struct {
+            CUdeviceptr devPtr;
+            CUarray_format format;
+            unsigned int numChannels;
+            size_t width;
+            size_t height;
+            size_t pitchInBytes;
+        } pitch2D;
+        struct {
+            int reserved[32];
+        } reserved;
+    } res;
+    unsigned int flags;
+} CUDA_RESOURCE_DESC;
+typedef enum CUaddress_mode_enum {
+    CU_TR_ADDRESS_MODE_WRAP = 0,
+    CU_TR_ADDRESS_MODE_CLAMP = 1,
+    CU_TR_ADDRESS_MODE_MIRROR = 2,
+    CU_TR_ADDRESS_MODE_BORDER = 3
+} CUaddress_mode;
+typedef enum CUfilter_mode_enum { CU_TR_FILTER_MODE_POINT = 0, CU_TR_FILTER_MODE_LINEAR = 1 } CUfilter_mode;
+#define CU_TRSF_READ_AS_INTEGER 0x01
+#define CU_TRSF_NORMALIZED_COORDINATES 0x02
+#define CU_TRSF_SRGB 0x10
+#define CU_TRSF_DISABLE_TRILINEAR_OPTIMIZATION 0x20
+#define CU_TRSF_SEAMLESS_CUBEMAP 0x40
+typedef struct CUDA_TEXTURE_DESC_st {
+    CUaddress_mode addressMode[3];
+    CUfilter_mode filterMode;
+    unsigned int flags;
+    unsigned int maxAnisotropy;
+    CUfilter_mode mipmapFilterMode;
+    float mipmapLevelBias;
+    float minMipmapLevelClamp;
+    float maxMipmapLevelClamp;
+    float borderColor[4];
+    int reserved[12];
+} CUDA_TEXTURE_DESC;
+typedef struct CUDA_RESOURCE_VIEW_DESC_st {
+    int format; /* CUresourceViewFormat */
+    size_t width, height, depth;
+    unsigned int firstMipmapLevel, lastMipmapLevel, firstLayer, lastLayer;
+    unsigned int reserved[16];
+} CUDA_RESOURCE_VIEW_DESC;
+
+#define cuArrayCreate cuArrayCreate_v2
+#define cuArrayGetDescriptor cuArrayGetDescriptor_v2
+#define cuArray3DCreate cuArray3DCreate_v2
+#define cuArray3DGetDescriptor cuArray3DGetDescriptor_v2
+#define cuMemcpy2D cuMemcpy2D_v2
+#define cuMemcpy2DUnaligned cuMemcpy2DUnaligned_v2
+#define cuMemcpy2DAsync cuMemcpy2DAsync_v2
+#define cuMemcpy3D cuMemcpy3D_v2
+#define cuMemcpy3DAsync cuMemcpy3DAsync_v2
+#define cuMemcpyHtoA cuMemcpyHtoA_v2
+#define cuMemcpyAtoH cuMemcpyAtoH_v2
+#define cuMemcpyDtoA cuMemcpyDtoA_v2
+#define cuMemcpyAtoD cuMemcpyAtoD_v2
+#define cuMemcpyAtoA cuMemcpyAtoA_v2
+#define cuMemcpyHtoAAsync cuMemcpyHtoAAsync_v2
+#define cuMemcpyAtoHAsync cuMemcpyAtoHAsync_v2
+CUresult CUDAAPI cuArrayCreate(CUarray* pHandle, const CUDA_ARRAY_DESCRIPTOR* pAllocateArray);
+CUresult CUDAAPI cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR* pArrayDescriptor, CUarray hArray);
+CUresult CUDAAPI cuArray3DCreate(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* pAllocateArray);
+CUresult CUDAAPI cuArray3DGetDescriptor(CUDA_ARRAY3D_DESCRIPTOR* pArrayDescriptor, CUarray hArray);
+CUresult CUDAAPI cuArrayDestroy(CUarray hArray);
+CUresult CUDAAPI cuMemcpy2D(const CUDA_MEMCPY2D* pCopy);
+CUresult CUDAAPI cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* pCopy);
+CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D* pCopy, CUstream hStream);
+CUresult CUDAAPI cuMemcpy3D(const CUDA_MEMCPY3D* pCopy);
+CUresult CUDAAPI cuMemcpy3DAsync(const CUDA_MEMCPY3D* pCopy, CUstream hStream);
+CUresult CUDAAPI cuMemcpyHtoA(CUarray dstArray, size_t dstOffset, const void* srcHost, size_t ByteCount);
+CUresult CUDAAPI cuMemcpyAtoH(void* dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount);
+CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset, CUdeviceptr srcDevice, size_t ByteCount);
+CUresult CUDAAPI cuMemcpyAtoD(CUdeviceptr dstDevice, CUarray srcArray, size_t srcOffset, size_t ByteCount);
+CUresult CUDAAPI cuMemcpyAtoA(CUarray dstArray, size_t dstOffset, CUarray srcArray, size_t srcOffset, size_t ByteCount);
+CUresult CUDAAPI cuMemcpyHtoAAsync(CUarray dstArray, size_t dstOffset, const void* srcHost, size_t ByteCount,
+                                   CUstream hStream);
+CUresult CUDAAPI cuMemcpyAtoHAsync(void* dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount,
+                                   CUstream hStream);
+CUresult CUDAAPI cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOURCE_DESC* pResDesc,
+                                   const CUDA_TEXTURE_DESC* pTexDesc, const CUDA_RESOURCE_VIEW_DESC* pResViewDesc);
+CUresult CUDAAPI cuTexObjectDestroy(CUtexObject texObject);
+CUresult CUDAAPI cuTexObjectGetResourceDesc(CUDA_RESOURCE_DESC* pResDesc, CUtexObject texObject);
+CUresult CUDAAPI cuTexObjectGetTextureDesc(CUDA_TEXTURE_DESC* pTexDesc, CUtexObject texObject);
+CUresult CUDAAPI cuTexObjectGetResourceViewDesc(CUDA_RESOURCE_VIEW_DESC* pResViewDesc, CUtexObject texObject);
+CUresult CUDAAPI cuSurfObjectCreate(CUsurfObject* pSurfObject, const CUDA_RESOURCE_DESC* pResDesc);
+CUresult CUDAAPI cuSurfObjectDestroy(CUsurfObject surfObject);
+CUresult CUDAAPI cuSurfObjectGetResourceDesc(CUDA_RESOURCE_DESC* pResDesc, CUsurfObject surfObject);
 
 CUresult CUDAAPI cuModuleGetFunctionCount(unsigned int* count, CUmodule mod);
 CUresult CUDAAPI cuModuleEnumerateFunctions(CUfunction* functions, unsigned int numFunctions, CUmodule mod);

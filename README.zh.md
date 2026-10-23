@@ -249,7 +249,9 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 - 静态链接 CUDA 运行时的程序和库（CuPy、NVIDIA 的 NCCL）无法运行：该运行时依赖 NVIDIA 驱动未公开的内部接口。
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
   也支持子图和内存节点（捕获期间的流序分配）；不支持条件节点。
-- （尚）不支持：纹理、cuDNN。
+- （尚）不支持：cuDNN。
+- 纹理和表面（纹理对象、表面对象、CUDA 数组）以软件方式采样，采用 CUDA 的寻址与过滤方式；不支持 mipmap、立方体贴图、
+  纹理引用和格式化的表面写入。
 - CUDA IPC（`cudaIpc*`、PyTorch 的 `torch.multiprocessing`）可在同一用户的进程之间使用；跨进程事件在记录时即完成（记录会等待设备）。
 - NCCL（`libnccl.so.2`，`torch.distributed` 的 "nccl" 后端：DDP、FSDP）可在同一台机器的各 rank 之间使用，它们也可以共用一块 GPU；
   多于一个 rank 时数据经由主机内存传输。
@@ -296,6 +298,7 @@ include/cuda.h        clean-room 方式编写的 CUDA Driver API 头文件（子
 src/common            日志
 src/vk                Vulkan 实例/设备、缓冲区、管线
 src/ptx               PTX 词法分析器、模块和指令解析器
+src/ptx/texture_lib.cu  纹理与表面的软件采样（以 PTX 形式嵌入，tools/gen_texture_lib.sh）
 src/compiler          CFG + 结构化、SPIR-V 生成器、PTX -> SPIR-V 编译器
 src/driver            libcuda.so 的 API 接口
 src/runtime           libcudart.so.12 和 .so.13（基于 Driver API 的 CUDA Runtime API，同一份源码）

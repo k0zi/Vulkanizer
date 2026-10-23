@@ -260,7 +260,9 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph és memória-csomópont (stream-rendezett
   foglalás capture alatt) is; feltételes csomópont nincs.
-- (Még) nem támogatott: textúrák, cuDNN.
+- (Még) nem támogatott: cuDNN.
+- A textúrák és surface-ek (texture és surface objectek, CUDA arrayk) szoftveres mintavételezéssel mennek, a CUDA
+  címzésével és szűrésével; mipmap, cube map, textúra-referencia és formázott surface-írás nincs.
 - A CUDA IPC (`cudaIpc*`, a PyTorch `torch.multiprocessing`-je) azonos felhasználó folyamatai között működik; egy
   folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).
 - Az NCCL (`libnccl.so.2`, a `torch.distributed` „nccl” backendje: DDP, FSDP) egy gép rangjai között működik, akár
@@ -312,6 +314,7 @@ include/cuda.h        clean-room CUDA Driver API header (részhalmaz)
 src/common            naplózás
 src/vk                Vulkan instance/eszköz, bufferek, pipeline-ok
 src/ptx               PTX lexer, modul- és utasításparser
+src/ptx/texture_lib.cu  textúrák és surface-ek szoftveres mintavételezése (PTX-ként beágyazva, tools/gen_texture_lib.sh)
 src/compiler          CFG + strukturálás, SPIR-V builder, PTX -> SPIR-V fordító
 src/driver            a libcuda.so API-felülete
 src/runtime           libcudart.so.12 és .so.13 (a CUDA Runtime API a Driver API-ra építve, egy forrásból)

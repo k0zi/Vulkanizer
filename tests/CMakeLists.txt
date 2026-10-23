@@ -70,7 +70,7 @@ add_test(NAME ptx_parse COMMAND ptx_parse)
 function(vulkanizer_nvcc_tests toolkit major suffix libdir)
   find_program(VULKANIZER_NVCC_HOST_CXX NAMES g++-13 g++-12 g++-14 g++ REQUIRED)
   set(nvcc_out ${CMAKE_CURRENT_BINARY_DIR}/cuda${suffix})
-  foreach(name rt_vector_add rt_features rt_kernels rt_printf rt_math_f64)
+  foreach(name rt_vector_add rt_features rt_kernels rt_printf rt_math_f64 rt_texture)
     set(src ${CMAKE_CURRENT_SOURCE_DIR}/cuda/${name}.cu)
     add_custom_command(
       OUTPUT ${nvcc_out}/${name}

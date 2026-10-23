@@ -1,5 +1,6 @@
 // Layout of the CUDA Runtime types as seen through the official CUDA headers.
 #include <driver_types.h>
+#include <texture_types.h>
 
 #include "abi_list.h"
 #include "layout.h"
@@ -19,5 +20,7 @@ Layout nvidiaLayout() {
     VULKANIZER_DEVICE_PROP_FIELDS(PROP)
     VULKANIZER_FUNC_ATTR_FIELDS(FATTR)
     VULKANIZER_ERROR_VALUES(ERR)
+#define TEX(e) l.texture.push_back(size_t(e));
+    VULKANIZER_TEXTURE_LAYOUT(TEX)
     return l;
 }

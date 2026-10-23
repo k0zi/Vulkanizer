@@ -260,7 +260,10 @@ Lista completa: [plan.md, seção 4](plan.md).
 - CUDA Graphs: a captura de streams e a reprodução funcionam (os grafos do llama.cpp, `CUDAGraph` do PyTorch,
   `torch.compile(mode="reduce-overhead")`); também grafos filhos e nós de memória (alocação
   ordenada por stream durante a captura); sem nós condicionais.
-- (Ainda) não suportado: texturas, cuDNN.
+- (Ainda) não suportado: cuDNN.
+- Texturas e superfícies (objetos de textura e de superfície, arrays CUDA) são amostradas em software, com o
+  endereçamento e a filtragem do CUDA; sem mipmaps, cubemaps, referências de textura nem escritas formatadas em
+  superfície.
 - O IPC do CUDA (`cudaIpc*`, `torch.multiprocessing` do PyTorch) funciona entre processos do mesmo usuário; um evento
   entre processos está concluído assim que é registrado (registrá-lo espera pelo dispositivo).
 - NCCL (`libnccl.so.2`, o backend "nccl" do `torch.distributed`: DDP, FSDP) funciona entre os ranks de uma máquina,
@@ -313,6 +316,7 @@ include/cuda.h        cabeçalho clean-room da API CUDA Driver (subconjunto)
 src/common            log
 src/vk                instância/dispositivo Vulkan, buffers, pipelines
 src/ptx               lexer de PTX, analisador de módulos e instruções
+src/ptx/texture_lib.cu  amostragem em software de texturas e superfícies (embutida como PTX, tools/gen_texture_lib.sh)
 src/compiler          CFG + estruturação, gerador de SPIR-V, compilador PTX -> SPIR-V
 src/driver            a superfície de API da libcuda.so
 src/runtime           libcudart.so.12 e .so.13 (API CUDA Runtime sobre a API Driver, um só fonte)

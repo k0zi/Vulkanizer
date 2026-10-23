@@ -526,6 +526,20 @@ cudaError_t CUDARTAPI cudaGetDeviceProperties(cudaDeviceProp* prop, int device) 
     p.minor = attr(76, d);
     p.textureAlignment = size_t(attr(14, d));
     p.texturePitchAlignment = size_t(attr(51, d));
+    p.maxTexture1D = attr(21, d);
+#if VULKANIZER_CUDART_MAJOR < 13
+    p.maxTexture1DLinear = attr(69, d);
+#endif
+    p.maxTexture2D[0] = attr(22, d), p.maxTexture2D[1] = attr(23, d);
+    p.maxTexture3D[0] = attr(24, d), p.maxTexture3D[1] = attr(25, d), p.maxTexture3D[2] = attr(26, d);
+    p.maxTexture2DLayered[0] = attr(27, d), p.maxTexture2DLayered[1] = attr(28, d), p.maxTexture2DLayered[2] = attr(29, d);
+    p.maxTexture1DLayered[0] = attr(42, d), p.maxTexture1DLayered[1] = attr(43, d);
+    p.maxTexture2DGather[0] = attr(45, d), p.maxTexture2DGather[1] = attr(46, d);
+    p.maxTexture2DLinear[0] = attr(70, d), p.maxTexture2DLinear[1] = attr(71, d), p.maxTexture2DLinear[2] = attr(72, d);
+    p.maxSurface1D = attr(55, d);
+    p.maxSurface2D[0] = attr(56, d), p.maxSurface2D[1] = attr(57, d);
+    p.maxSurface3D[0] = attr(58, d), p.maxSurface3D[1] = attr(59, d), p.maxSurface3D[2] = attr(60, d);
+    p.surfaceAlignment = size_t(attr(30, d));
     p.multiProcessorCount = attr(16, d);
     p.integrated = attr(18, d);
     p.canMapHostMemory = attr(19, d);
@@ -1302,6 +1316,320 @@ cudaError_t CUDARTAPI cudaLibraryUnload(cudaLibrary_t library) {
 cudaError_t CUDARTAPI cudaKernelSetAttributeForDevice(cudaKernel_t kernel, int attr, int value, int device) {
     ENTER();
     return kernel ? cudaSuccess : record(cudaErrorInvalidValue);  // as cudaFuncSetAttribute: hints only
+}
+
+// ---- arrays, pitched memory, 2D/3D copies, textures and surfaces (the driver's) ----------------
+
+}  // extern "C"
+
+namespace {
+
+// A channel format as the driver's array format and channel count (formats of 3 channels and
+// the packed/normalized kinds are not supported).
+bool driverFormat(const cudaChannelFormatDesc& d, CUarray_format& format, unsigned& channels) {
+    channels = (d.x > 0) + (d.y > 0) + (d.z > 0) + (d.w > 0);
+    if (channels != 1 && channels != 2 && channels != 4) return false;
+    const int bits = d.x;
+    switch (d.f) {
+    case cudaChannelFormatKindSigned:
+        format = bits == 8 ? CU_AD_FORMAT_SIGNED_INT8 : bits == 16 ? CU_AD_FORMAT_SIGNED_INT16 : CU_AD_FORMAT_SIGNED_INT32;
+        return bits == 8 || bits == 16 || bits == 32;
+    case cudaChannelFormatKindUnsigned:
+        format = bits == 8 ? CU_AD_FORMAT_UNSIGNED_INT8 : bits == 16 ? CU_AD_FORMAT_UNSIGNED_INT16 : CU_AD_FORMAT_UNSIGNED_INT32;
+        return bits == 8 || bits == 16 || bits == 32;
+    case cudaChannelFormatKindFloat:
+        format = bits == 16 ? CU_AD_FORMAT_HALF : CU_AD_FORMAT_FLOAT;
+        return bits == 16 || bits == 32;
+    default: return false;
+    }
+}
+
+cudaChannelFormatDesc channelDesc(CUarray_format f, unsigned channels) {
+    cudaChannelFormatDesc d{};
+    int bits = 32;
+    switch (f) {
+    case CU_AD_FORMAT_UNSIGNED_INT8: d.f = cudaChannelFormatKindUnsigned, bits = 8; break;
+    case CU_AD_FORMAT_UNSIGNED_INT16: d.f = cudaChannelFormatKindUnsigned, bits = 16; break;
+    case CU_AD_FORMAT_UNSIGNED_INT32: d.f = cudaChannelFormatKindUnsigned; break;
+    case CU_AD_FORMAT_SIGNED_INT8: d.f = cudaChannelFormatKindSigned, bits = 8; break;
+    case CU_AD_FORMAT_SIGNED_INT16: d.f = cudaChannelFormatKindSigned, bits = 16; break;
+    case CU_AD_FORMAT_SIGNED_INT32: d.f = cudaChannelFormatKindSigned; break;
+    case CU_AD_FORMAT_HALF: d.f = cudaChannelFormatKindFloat, bits = 16; break;
+    default: d.f = cudaChannelFormatKindFloat; break;
+    }
+    d.x = bits;
+    d.y = channels > 1 ? bits : 0;
+    d.z = channels > 2 ? bits : 0;
+    d.w = channels > 3 ? bits : 0;
+    return d;
+}
+
+// cudaResourceDesc -> CUDA_RESOURCE_DESC
+cudaError_t driverResource(const cudaResourceDesc* r, CUDA_RESOURCE_DESC& out) {
+    if (!r) return cudaErrorInvalidValue;
+    out = {};
+    unsigned channels = 0;
+    CUarray_format format{};
+    switch (r->resType) {
+    case cudaResourceTypeArray:
+        out.resType = CU_RESOURCE_TYPE_ARRAY;
+        out.res.array.hArray = r->res.array.array;
+        return cudaSuccess;
+    case cudaResourceTypeLinear:
+        if (!driverFormat(r->res.linear.desc, format, channels)) return cudaErrorInvalidChannelDescriptor;
+        out.resType = CU_RESOURCE_TYPE_LINEAR;
+        out.res.linear = {reinterpret_cast<CUdeviceptr>(r->res.linear.devPtr), format, channels, r->res.linear.sizeInBytes};
+        return cudaSuccess;
+    case cudaResourceTypePitch2D:
+        if (!driverFormat(r->res.pitch2D.desc, format, channels)) return cudaErrorInvalidChannelDescriptor;
+        out.resType = CU_RESOURCE_TYPE_PITCH2D;
+        out.res.pitch2D = {reinterpret_cast<CUdeviceptr>(r->res.pitch2D.devPtr), format, channels, r->res.pitch2D.width,
+                           r->res.pitch2D.height, r->res.pitch2D.pitchInBytes};
+        return cudaSuccess;
+    default: return cudaErrorNotSupported;  // mipmapped arrays
+    }
+}
+
+// The two sides of an array copy: an array at (x bytes, y), or unified memory with a pitch.
+cudaError_t copy2DArray(CUarray dstArray, size_t dstX, size_t dstY, void* dst, size_t dpitch, CUarray srcArray,
+                        size_t srcX, size_t srcY, const void* src, size_t spitch, size_t width, size_t height,
+                        cudaStream_t stream, bool async) {
+    CUDA_MEMCPY2D p{};
+    p.srcXInBytes = srcX, p.srcY = srcY;
+    if (srcArray) p.srcMemoryType = CU_MEMORYTYPE_ARRAY, p.srcArray = srcArray;
+    else p.srcMemoryType = CU_MEMORYTYPE_UNIFIED, p.srcDevice = reinterpret_cast<CUdeviceptr>(src), p.srcPitch = spitch;
+    p.dstXInBytes = dstX, p.dstY = dstY;
+    if (dstArray) p.dstMemoryType = CU_MEMORYTYPE_ARRAY, p.dstArray = dstArray;
+    else p.dstMemoryType = CU_MEMORYTYPE_UNIFIED, p.dstDevice = reinterpret_cast<CUdeviceptr>(dst), p.dstPitch = dpitch;
+    p.WidthInBytes = width;
+    p.Height = height;
+    const CUresult r = async ? cuMemcpy2DAsync(&p, stream) : cuMemcpy2D(&p);
+    return r ? toCudaError(r) : cudaSuccess;
+}
+
+size_t arrayTexelBytes(CUarray a) {
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (cuArray3DGetDescriptor(&d, a)) return 0;
+    const cudaChannelFormatDesc c = channelDesc(d.Format, d.NumChannels);
+    return size_t(c.x / 8) * d.NumChannels;
+}
+
+}  // namespace
+
+extern "C" {
+
+cudaChannelFormatDesc CUDARTAPI cudaCreateChannelDesc(int x, int y, int z, int w, cudaChannelFormatKind f) {
+    return cudaChannelFormatDesc{x, y, z, w, f};
+}
+
+cudaError_t CUDARTAPI cudaMalloc3DArray(cudaArray_t* array, const cudaChannelFormatDesc* desc, cudaExtent extent,
+                                        unsigned int flags) {
+    ENTER();
+    if (!array || !desc) return record(cudaErrorInvalidValue);
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (!driverFormat(*desc, d.Format, d.NumChannels)) return record(cudaErrorInvalidChannelDescriptor);
+    d.Width = extent.width, d.Height = extent.height, d.Depth = extent.depth;
+    d.Flags = flags;  // cudaArrayLayered, SurfaceLoadStore, Cubemap, TextureGather: the driver's values
+    return record(cuArray3DCreate(array, &d));
+}
+
+cudaError_t CUDARTAPI cudaMallocArray(cudaArray_t* array, const cudaChannelFormatDesc* desc, size_t width,
+                                      size_t height, unsigned int flags) {
+    return cudaMalloc3DArray(array, desc, cudaExtent{width, height, 0}, flags);
+}
+
+cudaError_t CUDARTAPI cudaFreeArray(cudaArray_t array) {
+    ENTER();
+    if (!array) return cudaSuccess;
+    return record(cuArrayDestroy(array));
+}
+
+cudaError_t CUDARTAPI cudaArrayGetInfo(cudaChannelFormatDesc* desc, cudaExtent* extent, unsigned int* flags,
+                                       cudaArray_t array) {
+    ENTER();
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (CUresult r = cuArray3DGetDescriptor(&d, array)) return record(r);
+    if (desc) *desc = channelDesc(d.Format, d.NumChannels);
+    if (extent) *extent = {d.Width, d.Height, d.Depth};
+    if (flags) *flags = d.Flags;
+    return cudaSuccess;
+}
+
+cudaError_t CUDARTAPI cudaGetChannelDesc(cudaChannelFormatDesc* desc, cudaArray_const_t array) {
+    ENTER();
+    if (!desc) return record(cudaErrorInvalidValue);
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (CUresult r = cuArray3DGetDescriptor(&d, const_cast<CUarray>(array))) return record(r);
+    *desc = channelDesc(d.Format, d.NumChannels);
+    return cudaSuccess;
+}
+
+// Pitched allocations: rows 256-byte aligned (textures need texturePitchAlignment).
+cudaError_t CUDARTAPI cudaMallocPitch(void** devPtr, size_t* pitch, size_t width, size_t height) {
+    ENTER();
+    if (!devPtr || !pitch) return record(cudaErrorInvalidValue);
+    *pitch = (std::max<size_t>(width, 1) + 255) / 256 * 256;
+    CUdeviceptr p = 0;
+    if (CUresult r = cuMemAlloc(&p, *pitch * std::max<size_t>(height, 1))) return record(r);
+    *devPtr = reinterpret_cast<void*>(p);
+    return cudaSuccess;
+}
+
+cudaError_t CUDARTAPI cudaMalloc3D(cudaPitchedPtr* pitchedDevPtr, cudaExtent extent) {
+    ENTER();
+    if (!pitchedDevPtr) return record(cudaErrorInvalidValue);
+    size_t pitch = 0;
+    void* p = nullptr;
+    if (cudaError_t e = cudaMallocPitch(&p, &pitch, extent.width, extent.height * std::max<size_t>(extent.depth, 1)))
+        return e;
+    *pitchedDevPtr = {p, pitch, extent.width, extent.height};
+    return cudaSuccess;
+}
+
+cudaError_t CUDARTAPI cudaMemset2DAsync(void* devPtr, size_t pitch, int value, size_t width, size_t height,
+                                        cudaStream_t stream) {
+    ENTER();
+    if (width > pitch) return record(cudaErrorInvalidPitchValue);
+    for (size_t row = 0; row < height; ++row)
+        if (CUresult r = cuMemsetD8Async(reinterpret_cast<CUdeviceptr>(devPtr) + row * pitch, (unsigned char)value,
+                                         width, stream))
+            return record(r);
+    return cudaSuccess;
+}
+cudaError_t CUDARTAPI cudaMemset2D(void* devPtr, size_t pitch, int value, size_t width, size_t height) {
+    if (cudaError_t e = cudaMemset2DAsync(devPtr, pitch, value, width, height, nullptr)) return e;
+    return record(cuStreamSynchronize(nullptr));
+}
+cudaError_t CUDARTAPI cudaMemset3DAsync(cudaPitchedPtr p, int value, cudaExtent extent, cudaStream_t stream) {
+    for (size_t z = 0; z < extent.depth; ++z)
+        if (cudaError_t e = cudaMemset2DAsync(static_cast<char*>(p.ptr) + z * p.pitch * p.ysize, p.pitch, value,
+                                              extent.width, extent.height, stream))
+            return e;
+    return cudaSuccess;
+}
+cudaError_t CUDARTAPI cudaMemset3D(cudaPitchedPtr p, int value, cudaExtent extent) {
+    if (cudaError_t e = cudaMemset3DAsync(p, value, extent, nullptr)) return e;
+    return record(cuStreamSynchronize(nullptr));
+}
+
+cudaError_t CUDARTAPI cudaMemcpy2DToArrayAsync(cudaArray_t dst, size_t wOffset, size_t hOffset, const void* src,
+                                               size_t spitch, size_t width, size_t height, cudaMemcpyKind,
+                                               cudaStream_t stream) {
+    ENTER();
+    return record(copy2DArray(dst, wOffset, hOffset, nullptr, 0, nullptr, 0, 0, src, spitch, width, height, stream, true));
+}
+cudaError_t CUDARTAPI cudaMemcpy2DToArray(cudaArray_t dst, size_t wOffset, size_t hOffset, const void* src,
+                                          size_t spitch, size_t width, size_t height, cudaMemcpyKind) {
+    ENTER();
+    return record(copy2DArray(dst, wOffset, hOffset, nullptr, 0, nullptr, 0, 0, src, spitch, width, height, nullptr, false));
+}
+cudaError_t CUDARTAPI cudaMemcpy2DFromArrayAsync(void* dst, size_t dpitch, cudaArray_const_t src, size_t wOffset,
+                                                 size_t hOffset, size_t width, size_t height, cudaMemcpyKind,
+                                                 cudaStream_t stream) {
+    ENTER();
+    return record(copy2DArray(nullptr, 0, 0, dst, dpitch, const_cast<CUarray>(src), wOffset, hOffset, nullptr, 0, width,
+                              height, stream, true));
+}
+cudaError_t CUDARTAPI cudaMemcpy2DFromArray(void* dst, size_t dpitch, cudaArray_const_t src, size_t wOffset,
+                                            size_t hOffset, size_t width, size_t height, cudaMemcpyKind) {
+    ENTER();
+    return record(copy2DArray(nullptr, 0, 0, dst, dpitch, const_cast<CUarray>(src), wOffset, hOffset, nullptr, 0, width,
+                              height, nullptr, false));
+}
+cudaError_t CUDARTAPI cudaMemcpy2DArrayToArray(cudaArray_t dst, size_t wOffsetDst, size_t hOffsetDst,
+                                               cudaArray_const_t src, size_t wOffsetSrc, size_t hOffsetSrc,
+                                               size_t width, size_t height, cudaMemcpyKind) {
+    ENTER();
+    return record(copy2DArray(dst, wOffsetDst, hOffsetDst, nullptr, 0, const_cast<CUarray>(src), wOffsetSrc, hOffsetSrc,
+                              nullptr, 0, width, height, nullptr, false));
+}
+// Deprecated linear forms: `count` bytes from (wOffset, hOffset), wrapping rows.
+cudaError_t CUDARTAPI cudaMemcpyToArray(cudaArray_t dst, size_t wOffset, size_t hOffset, const void* src,
+                                        size_t count, cudaMemcpyKind kind) {
+    ENTER();
+    const size_t texel = arrayTexelBytes(dst);
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (!texel || cuArray3DGetDescriptor(&d, dst)) return record(cudaErrorInvalidValue);
+    const size_t offset = hOffset * d.Width * texel + wOffset;
+    if (offset == 0 && (count % (d.Width * texel)) == 0)
+        return cudaMemcpy2DToArray(dst, 0, 0, src, d.Width * texel, d.Width * texel, count / (d.Width * texel), kind);
+    return record(cuMemcpyHtoA(dst, offset, src, count));
+}
+cudaError_t CUDARTAPI cudaMemcpyFromArray(void* dst, cudaArray_const_t src, size_t wOffset, size_t hOffset,
+                                          size_t count, cudaMemcpyKind) {
+    ENTER();
+    const size_t texel = arrayTexelBytes(const_cast<CUarray>(src));
+    CUDA_ARRAY3D_DESCRIPTOR d{};
+    if (!texel || cuArray3DGetDescriptor(&d, const_cast<CUarray>(src))) return record(cudaErrorInvalidValue);
+    return record(cuMemcpyAtoD(reinterpret_cast<CUdeviceptr>(dst), const_cast<CUarray>(src),
+                               hOffset * d.Width * texel + wOffset, count));
+}
+
+cudaError_t CUDARTAPI cudaMemcpy3DAsync(const cudaMemcpy3DParms* p, cudaStream_t stream) {
+    ENTER();
+    if (!p) return record(cudaErrorInvalidValue);
+    CUDA_MEMCPY3D c{};
+    // extents are in elements for arrays, in bytes otherwise
+    const size_t texel = p->srcArray ? arrayTexelBytes(p->srcArray) : p->dstArray ? arrayTexelBytes(p->dstArray) : 1;
+    if (!texel) return record(cudaErrorInvalidValue);
+    if (p->srcArray) {
+        c.srcMemoryType = CU_MEMORYTYPE_ARRAY, c.srcArray = p->srcArray;
+        c.srcXInBytes = p->srcPos.x * texel;
+    } else {
+        c.srcMemoryType = CU_MEMORYTYPE_UNIFIED, c.srcDevice = reinterpret_cast<CUdeviceptr>(p->srcPtr.ptr);
+        c.srcPitch = p->srcPtr.pitch, c.srcHeight = p->srcPtr.ysize;
+        c.srcXInBytes = p->srcPos.x;
+    }
+    c.srcY = p->srcPos.y, c.srcZ = p->srcPos.z;
+    if (p->dstArray) {
+        c.dstMemoryType = CU_MEMORYTYPE_ARRAY, c.dstArray = p->dstArray;
+        c.dstXInBytes = p->dstPos.x * texel;
+    } else {
+        c.dstMemoryType = CU_MEMORYTYPE_UNIFIED, c.dstDevice = reinterpret_cast<CUdeviceptr>(p->dstPtr.ptr);
+        c.dstPitch = p->dstPtr.pitch, c.dstHeight = p->dstPtr.ysize;
+        c.dstXInBytes = p->dstPos.x;
+    }
+    c.dstY = p->dstPos.y, c.dstZ = p->dstPos.z;
+    c.WidthInBytes = (p->srcArray || p->dstArray) ? p->extent.width * texel : p->extent.width;
+    c.Height = std::max<size_t>(p->extent.height, 1);
+    c.Depth = std::max<size_t>(p->extent.depth, 1);
+    return record(stream ? cuMemcpy3DAsync(&c, stream) : cuMemcpy3D(&c));
+}
+cudaError_t CUDARTAPI cudaMemcpy3D(const cudaMemcpy3DParms* p) {
+    if (cudaError_t e = cudaMemcpy3DAsync(p, nullptr)) return e;
+    return cudaSuccess;
+}
+
+cudaError_t CUDARTAPI cudaCreateTextureObject(cudaTextureObject_t* texObject, const cudaResourceDesc* resDesc,
+                                              const cudaTextureDesc* texDesc, const cudaResourceViewDesc* viewDesc) {
+    ENTER();
+    if (!texObject || !texDesc) return record(cudaErrorInvalidValue);
+    if (viewDesc) return record(cudaErrorNotSupported);
+    CUDA_RESOURCE_DESC r;
+    if (cudaError_t e = driverResource(resDesc, r)) return record(e);
+    CUDA_TEXTURE_DESC t{};
+    for (int i = 0; i < 3; ++i) t.addressMode[i] = CUaddress_mode(texDesc->addressMode[i]);
+    t.filterMode = CUfilter_mode(texDesc->filterMode);
+    if (texDesc->readMode == cudaReadModeElementType) t.flags |= CU_TRSF_READ_AS_INTEGER;
+    if (texDesc->normalizedCoords) t.flags |= CU_TRSF_NORMALIZED_COORDINATES;
+    if (texDesc->sRGB) t.flags |= CU_TRSF_SRGB;
+    std::memcpy(t.borderColor, texDesc->borderColor, sizeof t.borderColor);
+    return record(cuTexObjectCreate(texObject, &r, &t, nullptr));
+}
+cudaError_t CUDARTAPI cudaDestroyTextureObject(cudaTextureObject_t texObject) {
+    ENTER();
+    return record(cuTexObjectDestroy(texObject));
+}
+cudaError_t CUDARTAPI cudaCreateSurfaceObject(cudaSurfaceObject_t* surfObject, const cudaResourceDesc* resDesc) {
+    ENTER();
+    if (!surfObject) return record(cudaErrorInvalidValue);
+    CUDA_RESOURCE_DESC r;
+    if (cudaError_t e = driverResource(resDesc, r)) return record(e);
+    return record(cuSurfObjectCreate(surfObject, &r));
+}
+cudaError_t CUDARTAPI cudaDestroySurfaceObject(cudaSurfaceObject_t surfObject) {
+    ENTER();
+    return record(cuSurfObjectDestroy(surfObject));
 }
 
 // ---- driver entry points, profiler, IPC ---------------------------------------------------------

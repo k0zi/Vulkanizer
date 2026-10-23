@@ -9,6 +9,7 @@
 #include "driver/printf.h"
 #include "vulkanizer/vulkanizer_ext.h"
 #include "ptx/fatbin.h"
+#include "ptx/texture.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -161,6 +162,14 @@ CUresult loadModule(CUmodule* module, const void* image, std::string* errorLog) 
         case ImageKind::Ptx: mod->source = static_cast<const char*>(image); break;
     }
 
+    {
+        std::string error;  // textures and surfaces: calls of the texture library (ptx/texture.h)
+        if (!ptx::rewriteTextureInstructions(mod->source, error)) {
+            VULKANIZER_ERROR("cuModuleLoad: %s", error.c_str());
+            if (errorLog) *errorLog = error;
+            return CUDA_ERROR_NOT_SUPPORTED;
+        }
+    }
     const auto t1 = Clock::now();
     ptx::ParseError err;
     if (!ptx::parseModule(mod->source, mod->ptx, err)) {

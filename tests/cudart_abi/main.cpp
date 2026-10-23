@@ -29,6 +29,9 @@ int main() {
     i = 0;
 #define ERR(e) check(#e, size_t(a.errors[i]), size_t(b.errors[i])), ++i;
     VULKANIZER_ERROR_VALUES(ERR)
+    i = 0;
+#define TEX(e) check(#e, a.texture[i], b.texture[i]), ++i;
+    VULKANIZER_TEXTURE_LAYOUT(TEX)
     std::printf(bad ? "%d mismatch(es)\n" : "OK\n", bad);
     return bad ? 1 : 0;
 }

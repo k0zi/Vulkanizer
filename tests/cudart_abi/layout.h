@@ -6,4 +6,5 @@ struct Layout {
     size_t propSize, funcAttrSize, launchConfigSize;
     std::vector<size_t> propOffsets, funcAttrOffsets, launchConfigOffsets;
     std::vector<long> errors;
+    std::vector<size_t> texture;  // VULKANIZER_TEXTURE_LAYOUT
 };

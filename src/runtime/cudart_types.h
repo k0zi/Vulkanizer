@@ -332,6 +332,98 @@ typedef struct cudaIpcEventHandle_st {
     char reserved[64];
 } cudaIpcEventHandle_t;
 
+// CUDA arrays, pitched memory, textures and surfaces (the driver's, api_texture.cpp).
+enum cudaChannelFormatKind {
+    cudaChannelFormatKindSigned = 0,
+    cudaChannelFormatKindUnsigned = 1,
+    cudaChannelFormatKindFloat = 2,
+    cudaChannelFormatKindNone = 3,
+};
+struct cudaChannelFormatDesc {
+    int x, y, z, w;
+    enum cudaChannelFormatKind f;
+};
+typedef struct CUarray_st* cudaArray_t;  // the driver's CUarray
+typedef const struct CUarray_st* cudaArray_const_t;
+typedef struct CUmipmappedArray_st* cudaMipmappedArray_t;
+struct cudaExtent {
+    size_t width, height, depth;
+};
+struct cudaPos {
+    size_t x, y, z;
+};
+struct cudaPitchedPtr {
+    void* ptr;
+    size_t pitch;
+    size_t xsize, ysize;
+};
+struct cudaMemcpy3DParms {
+    cudaArray_t srcArray;
+    struct cudaPos srcPos;
+    struct cudaPitchedPtr srcPtr;
+    cudaArray_t dstArray;
+    struct cudaPos dstPos;
+    struct cudaPitchedPtr dstPtr;
+    struct cudaExtent extent;
+    cudaMemcpyKind kind;
+};
+enum cudaResourceType {
+    cudaResourceTypeArray = 0,
+    cudaResourceTypeMipmappedArray = 1,
+    cudaResourceTypeLinear = 2,
+    cudaResourceTypePitch2D = 3,
+};
+struct cudaResourceDesc {
+    enum cudaResourceType resType;
+    union {
+        struct {
+            cudaArray_t array;
+        } array;
+        struct {
+            cudaMipmappedArray_t mipmap;
+        } mipmap;
+        struct {
+            void* devPtr;
+            struct cudaChannelFormatDesc desc;
+            size_t sizeInBytes;
+        } linear;
+        struct {
+            void* devPtr;
+            struct cudaChannelFormatDesc desc;
+            size_t width, height, pitchInBytes;
+        } pitch2D;
+#if VULKANIZER_CUDART_MAJOR >= 13  // added in CUDA 13
+        struct {
+            int reserved[32];
+        } reserved;
+#endif
+    } res;
+#if VULKANIZER_CUDART_MAJOR >= 13
+    unsigned int flags;
+#endif
+};
+enum cudaTextureAddressMode { cudaAddressModeWrap = 0, cudaAddressModeClamp = 1, cudaAddressModeMirror = 2, cudaAddressModeBorder = 3 };
+enum cudaTextureFilterMode { cudaFilterModePoint = 0, cudaFilterModeLinear = 1 };
+enum cudaTextureReadMode { cudaReadModeElementType = 0, cudaReadModeNormalizedFloat = 1 };
+struct cudaTextureDesc {
+    enum cudaTextureAddressMode addressMode[3];
+    enum cudaTextureFilterMode filterMode;
+    enum cudaTextureReadMode readMode;
+    int sRGB;
+    float borderColor[4];
+    int normalizedCoords;
+    unsigned int maxAnisotropy;
+    enum cudaTextureFilterMode mipmapFilterMode;
+    float mipmapLevelBias;
+    float minMipmapLevelClamp;
+    float maxMipmapLevelClamp;
+    int disableTrilinearOptimization;
+    int seamlessCubemap;
+};
+struct cudaResourceViewDesc;  // views are not supported
+typedef unsigned long long cudaTextureObject_t;
+typedef unsigned long long cudaSurfaceObject_t;
+
 typedef struct CUlib_st* cudaLibrary_t;
 typedef struct CUuserObject_st* cudaUserObject_t;
 

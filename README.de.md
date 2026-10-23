@@ -262,7 +262,9 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 - CUDA Graphs: Stream Capture und Wiedergabe funktionieren (die Graphen von llama.cpp, PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); auch Child-Graphen und Speicherknoten
   (stream-geordnete Allokation während der Aufzeichnung); keine bedingten Knoten.
-- (Noch) nicht unterstützt: Texturen, cuDNN.
+- (Noch) nicht unterstützt: cuDNN.
+- Texturen und Surfaces (Texture- und Surface-Objekte, CUDA-Arrays) werden in Software abgetastet, mit der Adressierung
+  und Filterung von CUDA; keine Mipmaps, Cubemaps, Texture-Referenzen oder formatierten Surface-Schreibzugriffe.
 - CUDA-IPC (`cudaIpc*`, `torch.multiprocessing` von PyTorch) funktioniert zwischen Prozessen desselben Benutzers; ein
   Interprozess-Event ist fertig, sobald es aufgezeichnet ist (das Aufzeichnen wartet auf das Gerät).
 - NCCL (`libnccl.so.2`, das „nccl“-Backend von `torch.distributed`: DDP, FSDP) funktioniert zwischen den Rängen eines
@@ -314,6 +316,7 @@ include/cuda.h        Clean-Room-Header der CUDA Driver API (Teilmenge)
 src/common            Logging
 src/vk                Vulkan-Instanz/-Gerät, Buffer, Pipelines
 src/ptx               PTX-Lexer, Modul- und Befehlsparser
+src/ptx/texture_lib.cu  Abtastung von Texturen und Surfaces in Software (als PTX eingebettet, tools/gen_texture_lib.sh)
 src/compiler          CFG + Strukturierung, SPIR-V-Builder, PTX -> SPIR-V-Compiler
 src/driver            die API-Oberfläche von libcuda.so
 src/runtime           libcudart.so.12 und .so.13 (CUDA Runtime API auf der Driver API, eine Quelle)

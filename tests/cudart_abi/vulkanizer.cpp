@@ -19,5 +19,7 @@ Layout vulkanizerLayout() {
     VULKANIZER_DEVICE_PROP_FIELDS(PROP)
     VULKANIZER_FUNC_ATTR_FIELDS(FATTR)
     VULKANIZER_ERROR_VALUES(ERR)
+#define TEX(e) l.texture.push_back(size_t(e));
+    VULKANIZER_TEXTURE_LAYOUT(TEX)
     return l;
 }
