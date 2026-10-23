@@ -80,6 +80,24 @@ struct CUevent_st {
     std::vector<CUgraphNode> captureDeps;
 };
 
+namespace vulkanizer::driver {
+// Graph memory (memory nodes: cuMemAllocAsync while capturing, cuGraphAddMemAllocNode): allocated
+// when the node is created, at a fixed address, and owned by the graph, its executable graphs and
+// the graphs containing it as a child, together. Freeing it while they exist (a free node, or a
+// free outside the graph) only marks it released: a graph is relaunchable any time. Once the last
+// of them is destroyed, released memory is freed (after the work recorded so far); the rest stays
+// allocated until the application frees it, as in CUDA.
+struct GraphAllocation {
+    bool owned = true;      // a graph owning it still exists
+    bool released = false;  // freed by the graph or the application
+};
+struct GraphMemory {
+    CUdevice device = 0;
+    std::vector<CUdeviceptr> allocations;
+    ~GraphMemory();
+};
+}  // namespace vulkanizer::driver
+
 // A node of a CUDA graph. Kernel nodes keep their parameters packed as cuLaunchKernel would.
 struct CUgraphNode_st {
     static constexpr uint32_t kMagic = 0x444e4753;  // 'SGND'
@@ -101,6 +119,9 @@ struct CUgraphNode_st {
     // host
     CUhostFn fn = nullptr;
     void* userData = nullptr;
+    // child graph: its nodes in order, and its memory; memory nodes: dst and bytes
+    std::vector<CUgraphNode_st> children;
+    std::vector<std::shared_ptr<vulkanizer::driver::GraphMemory>> childMemory;
 };
 
 struct CUgraph_st {
@@ -110,6 +131,7 @@ struct CUgraph_st {
     std::vector<std::unique_ptr<CUgraphNode_st>> nodes;  // in an order that respects the dependencies
     std::vector<CUstream> capturing;                       // streams capturing into this graph
     uint64_t captureId = 0;                                // cuStreamGetCaptureInfo's id
+    std::shared_ptr<vulkanizer::driver::GraphMemory> memory;  // of its memory nodes (created with the first)
 };
 
 // An instantiated graph: its own copy of the nodes, run in order on the launch stream.
@@ -119,6 +141,7 @@ struct CUgraphExec_st {
     CUcontext ctx = nullptr;
     std::vector<CUgraphNode_st> nodes;
     std::unordered_map<CUgraphNode, size_t> index;  // graph node -> position in `nodes`
+    std::vector<std::shared_ptr<vulkanizer::driver::GraphMemory>> memory;  // of the graphs it was made from
 };
 
 // A memory pool (stream-ordered allocation). Allocations come straight from the device; the pool
@@ -182,6 +205,7 @@ struct DeviceSlot {
         int refs = 0;
     };
     std::map<std::pair<int32_t, uint64_t>, IpcImport> ipcImports;
+    std::unordered_map<CUdeviceptr, GraphAllocation> graphAllocations;  // graph memory (GraphMemory), in `allocations`
     vk::Buffer printfBuffer;  // device printf records of the current launch
     vk::Buffer gridWorkspace;  // cooperative launches' {size, barrier} (cooperative groups' grid.sync())
 };
@@ -301,6 +325,12 @@ CUstream capturingStream(CUstream hStream);
 CUresult captureNode(CUstream hStream, std::unique_ptr<CUgraphNode_st> node);
 // Synchronizing a capturing stream is illegal: it ends the capture as invalidated.
 CUresult refuseIfCapturing(CUstream hStream);
+// Stream-ordered allocation and free on a capturing stream (`cs`): memory nodes (graph memory).
+CUresult captureMemAlloc(ApiScope& s, CUstream cs, size_t bytes, CUdeviceptr& out);
+CUresult captureMemFree(CUstream cs, CUdeviceptr dptr);
+// A free of graph memory outside a graph (cuMemFree, cuMemFreeAsync): true if it only marks it
+// released (its graph still exists); false if the memory is to be freed now (no graph owns it).
+bool releaseGraphMemory(DeviceSlot& slot, CUdeviceptr dptr);
 // cuStreamWaitEvent on an event recorded during a capture: `hStream` joins that capture.
 CUresult joinCapture(CUstream hStream, CUevent hEvent);
 

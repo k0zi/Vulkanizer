@@ -3,10 +3,13 @@
 // depend on earlier ones, and capture appends work in the order the streams issued it. Kernel
 // nodes keep their parameters packed (packParams), so a replay skips the launch bookkeeping.
 //
-// Capturing: kernel launches, copies, memsets, host functions and event records/waits on a
-// capturing stream become nodes (or dependency edges) instead of running. A stream joins another
-// one's capture by waiting on an event recorded there (fork/join, as CUDA does it). Synchronizing
-// a capturing stream invalidates its capture.
+// Capturing: kernel launches, copies, memsets, host functions, event records/waits, stream-ordered
+// allocations and frees, and graph launches on a capturing stream become nodes (or dependency
+// edges) instead of running. A stream joins another one's capture by waiting on an event recorded
+// there (fork/join, as CUDA does it). Synchronizing a capturing stream invalidates its capture.
+//
+// Memory nodes allocate when they are created (GraphMemory); a child graph node holds a copy of the
+// child's nodes and runs them in place.
 
 #include "driver/driver.h"
 
@@ -96,6 +99,10 @@ void getKernel(CUgraphNode_st& n, P* p) {
 
 CUresult runNode(ApiScope& s, const CUgraphNode_st& n) {
     switch (n.type) {
+        case CU_GRAPH_NODE_TYPE_GRAPH:
+            for (const CUgraphNode_st& child : n.children)
+                if (CUresult r = runNode(s, child)) return r;
+            return CUDA_SUCCESS;
         case CU_GRAPH_NODE_TYPE_KERNEL:
             return launchKernel(s, n.func, n.grid, n.block, n.sharedMem, n.params, n.cooperative);
         case CU_GRAPH_NODE_TYPE_MEMCPY:
@@ -113,14 +120,92 @@ CUresult runNode(ApiScope& s, const CUgraphNode_st& n) {
             if (VkResult vr = s.dev->finish()) return toCuResult(vr);  // after the work before it
             n.fn(n.userData);
             return CUDA_SUCCESS;
-        default:  // empty, event record/wait: ordering the single queue gives anyway
+        default:  // empty, event record/wait: ordering the single queue gives anyway; memory nodes allocated
+                  // when they were created
             return CUDA_SUCCESS;
     }
+}
+
+// A memory node's allocation, owned by the graph.
+CUresult allocateGraphMemory(ApiScope& s, CUgraph g, size_t bytes, CUdeviceptr& out) {
+    if (bytes == 0) return CUDA_ERROR_INVALID_VALUE;
+    vk::Buffer buf;
+    if (VkResult vr = s.dev->allocateBuffer(bytes, buf)) return toCuResult(vr);
+    s.slot->allocations[buf.address] = buf;
+    s.slot->allocatedBytes += buf.size;
+    s.slot->graphAllocations[buf.address] = GraphAllocation{};
+    if (!g->memory) {
+        g->memory = std::make_shared<GraphMemory>();
+        g->memory->device = s.slot->ordinal;
+    }
+    g->memory->allocations.push_back(buf.address);
+    out = buf.address;
+    return CUDA_SUCCESS;
+}
+
+// A child graph node of `child`'s nodes and memory (a graph, or an executable graph's copy).
+std::unique_ptr<CUgraphNode_st> childNode(const std::vector<CUgraphNode_st>& nodes,
+                                          std::vector<std::shared_ptr<GraphMemory>> memory) {
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_GRAPH;
+    node->children = nodes;
+    node->childMemory = std::move(memory);
+    return node;
 }
 
 }  // namespace
 
 namespace vulkanizer::driver {
+
+GraphMemory::~GraphMemory() {
+    std::lock_guard<std::recursive_mutex> lock(Driver::get().mutex());
+    DeviceSlot* slot = Driver::get().slot(device);
+    if (!slot || !slot->vk) return;
+    for (CUdeviceptr p : allocations) {
+        auto state = slot->graphAllocations.find(p);
+        if (state == slot->graphAllocations.end()) continue;
+        if (!state->second.released) {  // the application's now
+            state->second.owned = false;
+            continue;
+        }
+        slot->graphAllocations.erase(state);
+        auto it = slot->allocations.find(p);
+        if (it == slot->allocations.end()) continue;
+        slot->allocatedBytes -= it->second.size;
+        slot->vk->freeBufferAfter(it->second, slot->vk->currentSerial());  // after the launches recorded so far
+        slot->allocations.erase(it);
+    }
+}
+
+CUresult captureMemAlloc(ApiScope& s, CUstream cs, size_t bytes, CUdeviceptr& out) {
+    if (cs->captureStatus == CU_STREAM_CAPTURE_STATUS_INVALIDATED) return CUDA_ERROR_STREAM_CAPTURE_INVALIDATED;
+    if (CUresult r = allocateGraphMemory(s, cs->capture, bytes, out)) return r;
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_MEM_ALLOC;
+    node->dst = out;
+    node->bytes = bytes;
+    return captureNode(cs, std::move(node));
+}
+
+bool releaseGraphMemory(DeviceSlot& slot, CUdeviceptr dptr) {
+    auto it = slot.graphAllocations.find(dptr);
+    if (it == slot.graphAllocations.end()) return false;
+    if (it->second.owned) {
+        it->second.released = true;
+        return true;
+    }
+    slot.graphAllocations.erase(it);  // no graph left: an ordinary free
+    return false;
+}
+
+CUresult captureMemFree(CUstream cs, CUdeviceptr dptr) {
+    if (DeviceSlot* slot = Driver::get().slot(cs->ctx ? cs->ctx->device : 0))
+        if (auto it = slot->graphAllocations.find(dptr); it != slot->graphAllocations.end()) it->second.released = true;
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_MEM_FREE;
+    node->dst = dptr;
+    return captureNode(cs, std::move(node));
+}
 
 CUstream capturingStream(CUstream hStream) {
     return isRealStream(hStream) && hStream->capture ? hStream : nullptr;
@@ -498,6 +583,82 @@ CUresult CUDAAPI cuGraphNodeGetDependencies(CUgraphNode hNode, CUgraphNode* depe
     return cuGraphNodeGetDependencies_v2(hNode, dependencies, nullptr, numDependencies);
 }
 
+// ---- memory nodes and child graphs ------------------------------------------------------------
+
+CUresult CUDAAPI cuGraphAddMemAllocNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                        size_t numDependencies, CUDA_MEM_ALLOC_NODE_PARAMS* nodeParams) {
+    VULKANIZER_TRACE_API();
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!phGraphNode || !nodeParams || !validHandle(hGraph)) return CUDA_ERROR_INVALID_VALUE;
+    if (!validDeps(dependencies, numDependencies, hGraph)) return CUDA_ERROR_INVALID_VALUE;
+    if (nodeParams->poolProps.allocType != CU_MEM_ALLOCATION_TYPE_PINNED) return CUDA_ERROR_INVALID_VALUE;
+    if (CUresult r = allocateGraphMemory(s, hGraph, nodeParams->bytesize, nodeParams->dptr)) return r;
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_MEM_ALLOC;
+    node->dst = nodeParams->dptr;
+    node->bytes = nodeParams->bytesize;
+    *phGraphNode = addNode(hGraph, std::move(node), dependencies, numDependencies);
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuGraphMemAllocNodeGetParams(CUgraphNode hNode, CUDA_MEM_ALLOC_NODE_PARAMS* params_out) {
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!validHandle(hNode) || !params_out || hNode->type != CU_GRAPH_NODE_TYPE_MEM_ALLOC) return CUDA_ERROR_INVALID_VALUE;
+    *params_out = {};
+    params_out->poolProps.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
+    params_out->poolProps.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    params_out->poolProps.location.id = s.slot->ordinal;
+    params_out->bytesize = hNode->bytes;
+    params_out->dptr = hNode->dst;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuGraphAddMemFreeNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                       size_t numDependencies, CUdeviceptr dptr) {
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    auto state = s.slot->graphAllocations.find(dptr);
+    if (!phGraphNode || !validHandle(hGraph) || state == s.slot->graphAllocations.end()) return CUDA_ERROR_INVALID_VALUE;
+    if (!validDeps(dependencies, numDependencies, hGraph)) return CUDA_ERROR_INVALID_VALUE;
+    state->second.released = true;
+    auto node = std::make_unique<CUgraphNode_st>();
+    node->type = CU_GRAPH_NODE_TYPE_MEM_FREE;
+    node->dst = dptr;
+    *phGraphNode = addNode(hGraph, std::move(node), dependencies, numDependencies);
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuGraphMemFreeNodeGetParams(CUgraphNode hNode, CUdeviceptr* dptr_out) {
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!validHandle(hNode) || !dptr_out || hNode->type != CU_GRAPH_NODE_TYPE_MEM_FREE) return CUDA_ERROR_INVALID_VALUE;
+    *dptr_out = hNode->dst;
+    return CUDA_SUCCESS;
+}
+
+// Graph memory is not cached beyond the graphs that own it: nothing to trim.
+CUresult CUDAAPI cuDeviceGraphMemTrim(CUdevice device) {
+    return Driver::get().slot(device) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_DEVICE;
+}
+
+CUresult CUDAAPI cuGraphAddChildGraphNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                          size_t numDependencies, CUgraph childGraph) {
+    VULKANIZER_TRACE_API();
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!phGraphNode || !validHandle(hGraph) || !validHandle(childGraph) || childGraph == hGraph)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (!validDeps(dependencies, numDependencies, hGraph)) return CUDA_ERROR_INVALID_VALUE;
+    std::vector<CUgraphNode_st> nodes;
+    for (const auto& n : childGraph->nodes) nodes.push_back(*n);
+    std::vector<std::shared_ptr<GraphMemory>> memory;
+    if (childGraph->memory) memory.push_back(childGraph->memory);
+    *phGraphNode = addNode(hGraph, childNode(nodes, std::move(memory)), dependencies, numDependencies);
+    return CUDA_SUCCESS;
+}
+
 // ---- executable graphs ------------------------------------------------------------------------
 
 CUresult CUDAAPI cuGraphInstantiateWithFlags(CUgraphExec* phGraphExec, CUgraph hGraph, unsigned long long flags) {
@@ -511,6 +672,7 @@ CUresult CUDAAPI cuGraphInstantiateWithFlags(CUgraphExec* phGraphExec, CUgraph h
         e->index[n.get()] = e->nodes.size();
         e->nodes.push_back(*n);
     }
+    if (hGraph->memory) e->memory.push_back(hGraph->memory);
     Driver::get().registerHandle(e);
     *phGraphExec = e;
     return CUDA_SUCCESS;
@@ -560,6 +722,7 @@ CUresult CUDAAPI cuGraphExecUpdate_v2(CUgraphExec hGraphExec, CUgraph hGraph, CU
         hGraphExec->nodes[i] = *hGraph->nodes[i];
         hGraphExec->index[hGraph->nodes[i].get()] = i;
     }
+    if (hGraph->memory) hGraphExec->memory.push_back(hGraph->memory);  // the new nodes may use it
     if (resultInfo) *resultInfo = {CU_GRAPH_EXEC_UPDATE_SUCCESS, nullptr, nullptr};
     return CUDA_SUCCESS;
 }
@@ -576,7 +739,8 @@ CUresult CUDAAPI cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
     if (CUresult r = enterContext(s)) return r;
     if (!validHandle(hGraphExec)) return CUDA_ERROR_INVALID_VALUE;
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
-    if (capturingStream(hStream)) return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;  // no child graphs yet
+    if (CUstream cs = capturingStream(hStream))  // a child graph node of the capture
+        return captureNode(cs, childNode(hGraphExec->nodes, hGraphExec->memory));
     for (const CUgraphNode_st& n : hGraphExec->nodes)
         if (CUresult r = runNode(s, n)) return r;
     return CUDA_SUCCESS;

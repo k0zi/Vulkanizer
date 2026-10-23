@@ -1,5 +1,6 @@
 // CUDA graphs through the Driver API: stream capture (kernels, memsets, copies, host functions,
-// fork/join across streams), replay, invalidation, executable graph updates.
+// fork/join across streams, stream-ordered allocations, graph launches), replay, invalidation,
+// executable graph updates, memory nodes and child graphs.
 
 #include "test_util.h"
 
@@ -181,6 +182,107 @@ int main() {
     EXPECT_CU(CUDA_ERROR_STREAM_CAPTURE_INVALIDATED, cuStreamEndCapture(s1, &broken));
     EXPECT(broken == nullptr);
     EXPECT(all(download(y), 10.0f));  // the captured kernel never ran
+
+    // Memory nodes from capture: a scratch buffer allocated and freed inside the graph, and an output
+    // allocated in it but not freed there (the application's after a launch, valid beyond the graph).
+    CUdeviceptr scratch = 0, out = 0;
+    CHECK_CU(cuStreamBeginCapture(s1, CU_STREAM_CAPTURE_MODE_GLOBAL));
+    CHECK_CU(cuMemAllocAsync(&scratch, kN * 4, s1));
+    CHECK_CU(cuMemAllocAsync(&out, kN * 4, s1));
+    CHECK_CU(cuMemsetD32Async(scratch, oneBits, kN, s1));
+    axpb(s1, scratch, 3.0f, 4.0f);  // 7
+    CHECK_CU(cuMemcpyDtoDAsync(out, scratch, kN * 4, s1));
+    CHECK_CU(cuMemFreeAsync(scratch, s1));
+    CUgraph memGraph;
+    CHECK_CU(cuStreamEndCapture(s1, &memGraph));
+    CHECK_CU(cuGraphGetNodes(memGraph, nullptr, &numNodes));
+    std::vector<CUgraphNode> memNodes(numNodes);
+    CHECK_CU(cuGraphGetNodes(memGraph, memNodes.data(), &numNodes));
+    CHECK_CU(cuGraphNodeGetType(memNodes.front(), &type));
+    EXPECT(type == CU_GRAPH_NODE_TYPE_MEM_ALLOC);
+    CHECK_CU(cuGraphNodeGetType(memNodes.back(), &type));
+    EXPECT(type == CU_GRAPH_NODE_TYPE_MEM_FREE);
+    CUDA_MEM_ALLOC_NODE_PARAMS mp;
+    CHECK_CU(cuGraphMemAllocNodeGetParams(memNodes.front(), &mp));
+    EXPECT(mp.dptr == scratch && mp.bytesize == kN * 4);
+    CUgraphExec memExec;
+    CHECK_CU(cuGraphInstantiate(&memExec, memGraph, 0));
+    CHECK_CU(cuGraphDestroy(memGraph));  // the executable graph keeps the memory
+    for (int i = 0; i < 2; ++i) {
+        CHECK_CU(cuMemsetD32(out, 0, kN));
+        CHECK_CU(cuGraphLaunch(memExec, s1));
+        CHECK_CU(cuStreamSynchronize(s1));
+        EXPECT(all(download(out), 7.0f));
+    }
+    CHECK_CU(cuGraphExecDestroy(memExec));
+    EXPECT(all(download(out), 7.0f));  // not freed by the graph: still the application's
+    CHECK_CU(cuMemFreeAsync(out, s1));
+    CHECK_CU(cuStreamSynchronize(s1));
+    CUdeviceptr base;
+    size_t size;
+    EXPECT_CU(CUDA_ERROR_NOT_FOUND, cuMemGetAddressRange(&base, &size, out));  // and now freed
+
+    // Explicit memory nodes and a child graph: child = alloc, memset 2, *1 + 3 into y (5), free;
+    // the parent runs it twice, the second time through a captured graph launch.
+    CUgraph child;
+    CHECK_CU(cuGraphCreate(&child, 0));
+    CUDA_MEM_ALLOC_NODE_PARAMS ap{};
+    ap.poolProps.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
+    ap.poolProps.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    ap.poolProps.location.id = 0;
+    ap.bytesize = kN * 4;
+    CUgraphNode allocNode, setNode, freeNode;
+    CHECK_CU(cuGraphAddMemAllocNode(&allocNode, child, nullptr, 0, &ap));
+    const float two = 2.0f;
+    CUDA_MEMSET_NODE_PARAMS msp{};
+    msp.dst = ap.dptr;
+    std::memcpy(&msp.value, &two, 4);
+    msp.elementSize = 4;
+    msp.width = kN;
+    msp.height = 1;
+    CHECK_CU(cuGraphAddMemsetNode(&setNode, child, &allocNode, 1, &msp, ctx));
+    CUgraphNode copyNode;
+    {
+        // a capture into the child is not possible: add the copy through a captured sub-graph
+        CUgraph tmp;
+        CHECK_CU(cuStreamBeginCapture(s2, CU_STREAM_CAPTURE_MODE_GLOBAL));
+        axpb(s2, ap.dptr, 1.0f, 3.0f);
+        CHECK_CU(cuMemcpyDtoDAsync(y, ap.dptr, kN * 4, s2));
+        CHECK_CU(cuStreamEndCapture(s2, &tmp));
+        CHECK_CU(cuGraphAddChildGraphNode(&copyNode, child, &setNode, 1, tmp));
+        CHECK_CU(cuGraphDestroy(tmp));
+    }
+    CHECK_CU(cuGraphAddMemFreeNode(&freeNode, child, &copyNode, 1, ap.dptr));
+    CUdeviceptr freed = 0;
+    CHECK_CU(cuGraphMemFreeNodeGetParams(freeNode, &freed));
+    EXPECT(freed == ap.dptr);
+    CUgraph parent;
+    CHECK_CU(cuGraphCreate(&parent, 0));
+    CUgraphNode childNode;
+    CHECK_CU(cuGraphAddChildGraphNode(&childNode, parent, nullptr, 0, child));
+    CHECK_CU(cuGraphDestroy(child));
+    CUgraphExec parentExec;
+    CHECK_CU(cuGraphInstantiate(&parentExec, parent, 0));
+    CHECK_CU(cuMemsetD32(y, 0, kN));
+    CHECK_CU(cuGraphLaunch(parentExec, s1));
+    CHECK_CU(cuStreamSynchronize(s1));
+    EXPECT(all(download(y), 5.0f));
+    CHECK_CU(cuStreamBeginCapture(s1, CU_STREAM_CAPTURE_MODE_GLOBAL));
+    CHECK_CU(cuMemsetD32Async(y, 0, kN, s1));
+    CHECK_CU(cuGraphLaunch(parentExec, s1));  // a child graph node of the capture
+    axpb(s1, y, 2.0f, 0.0f);                  // 10
+    CUgraph outer;
+    CHECK_CU(cuStreamEndCapture(s1, &outer));
+    CHECK_CU(cuGraphExecDestroy(parentExec));
+    CHECK_CU(cuGraphDestroy(parent));
+    CUgraphExec outerExec;
+    CHECK_CU(cuGraphInstantiate(&outerExec, outer, 0));
+    CHECK_CU(cuGraphDestroy(outer));
+    CHECK_CU(cuMemsetD32(y, 0, kN));
+    CHECK_CU(cuGraphLaunch(outerExec, s1));
+    CHECK_CU(cuStreamSynchronize(s1));
+    EXPECT(all(download(y), 10.0f));
+    CHECK_CU(cuGraphExecDestroy(outerExec));
 
     // Entry points of a CUDA 12 caller.
     void* fn = nullptr;

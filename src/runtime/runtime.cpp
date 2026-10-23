@@ -994,6 +994,53 @@ cudaError_t CUDARTAPI cudaGraphAddKernelNode(cudaGraphNode_t* node, cudaGraph_t 
     return record(cuGraphAddKernelNode_v2(node, graph, deps, numDeps, &p));
 }
 
+// The runtime's parameter structs of these nodes (cudaMemsetParams, cudaHostNodeParams,
+// cudaMemAllocNodeParams) have the driver's layouts.
+cudaError_t CUDARTAPI cudaGraphAddEmptyNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                            size_t numDeps) {
+    ENTER();
+    return record(cuGraphAddEmptyNode(node, graph, deps, numDeps));
+}
+cudaError_t CUDARTAPI cudaGraphAddHostNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                           size_t numDeps, const void* params) {
+    ENTER();
+    return record(cuGraphAddHostNode(node, graph, deps, numDeps, static_cast<const CUDA_HOST_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphAddMemsetNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                             size_t numDeps, const void* params) {
+    ENTER();
+    CUcontext ctx = nullptr;
+    cuCtxGetCurrent(&ctx);
+    return record(cuGraphAddMemsetNode(node, graph, deps, numDeps, static_cast<const CUDA_MEMSET_NODE_PARAMS*>(params), ctx));
+}
+cudaError_t CUDARTAPI cudaGraphAddMemAllocNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                               size_t numDeps, void* params) {
+    ENTER();
+    return record(cuGraphAddMemAllocNode(node, graph, deps, numDeps, static_cast<CUDA_MEM_ALLOC_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphMemAllocNodeGetParams(cudaGraphNode_t node, void* params) {
+    ENTER();
+    return record(cuGraphMemAllocNodeGetParams(node, static_cast<CUDA_MEM_ALLOC_NODE_PARAMS*>(params)));
+}
+cudaError_t CUDARTAPI cudaGraphAddMemFreeNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                              size_t numDeps, void* dptr) {
+    ENTER();
+    return record(cuGraphAddMemFreeNode(node, graph, deps, numDeps, reinterpret_cast<CUdeviceptr>(dptr)));
+}
+cudaError_t CUDARTAPI cudaGraphMemFreeNodeGetParams(cudaGraphNode_t node, void* dptr) {
+    ENTER();
+    return record(cuGraphMemFreeNodeGetParams(node, static_cast<CUdeviceptr*>(dptr)));
+}
+cudaError_t CUDARTAPI cudaGraphAddChildGraphNode(cudaGraphNode_t* node, cudaGraph_t graph, const cudaGraphNode_t* deps,
+                                                 size_t numDeps, cudaGraph_t childGraph) {
+    ENTER();
+    return record(cuGraphAddChildGraphNode(node, graph, deps, numDeps, childGraph));
+}
+cudaError_t CUDARTAPI cudaDeviceGraphMemTrim(int device) {
+    ENTER();
+    return record(cuDeviceGraphMemTrim(device));
+}
+
 cudaError_t CUDARTAPI cudaGraphKernelNodeSetParams(cudaGraphNode_t node, const cudaKernelNodeParams* params) {
     ENTER();
     CUDA_KERNEL_NODE_PARAMS_v2 p;

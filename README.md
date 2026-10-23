@@ -229,7 +229,8 @@ Full list: [plan.md, section 4](plan.md).
 
 - No SASS execution: only binaries containing PTX run.
 - CUDA Graphs: stream capture and replay work (llama.cpp's graphs, PyTorch `CUDAGraph`,
-  `torch.compile(mode="reduce-overhead")`); no child graphs, memory nodes or conditional nodes.
+  `torch.compile(mode="reduce-overhead")`); child graphs and memory nodes (stream-ordered allocation during
+  capture) too; no conditional nodes.
 - Not (yet) supported: textures, cuDNN.
 - CUDA IPC (`cudaIpc*`, PyTorch's `torch.multiprocessing`) works between processes of the same user; an interprocess
   event is complete once recorded (recording it waits for the device).

@@ -59,8 +59,8 @@ Hátra, javasolt sorrendben:
 2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
 3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
 4. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
-5. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
-   queue (5.4).
+5. Nyitott részfeladatok: rögzített Vulkan command bufferek, feltételes csomópontok (5.3); külön copy queue
+   (5.4).
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -409,8 +409,22 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     (`at::cuda::CUDAGraph`, CUDA 12 és 13), `torch.compile(mode="reduce-overhead")` (`tests/torch/compile.py`).
   - Ehhez kellett: a device-címek 48 bitesek lettek (lásd az ismert korlátoknál), mert a PyTorch CUDA graph tree-je
     int64-ként kezeli a pointert.
-  - Hátra: rögzített Vulkan command bufferek (csak host-időt spórolna), child graph, memória-csomópontok
-    (`cuMemAllocAsync` capture alatt), `cudaGraphAddNode` általános paraméterekkel, feltételes csomópontok.
+  - [x] Memória-csomópontok és child graph (2026-10-23). A PyTorch `PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`
+    beállítással capture alatt `cudaMallocAsync`-et hív – eddig ez érvénytelenítette a capture-t.
+    - Graph-memória (`GraphMemory`): a csomópont létrehozásakor foglal, fix címen; a gráf, az instanciái és az őt
+      child-ként tartalmazó gráfok közösen birtokolják (a PyTorch az instanciálás után törli a gráfot). A futáskor
+      az alloc/free csomópont no-op. A CUDA szemantikája szerint a gráfban fel nem szabadított foglalás a gráf
+      után is él, a gráfon kívüli free-ig; a már elengedett (free-csomópont vagy gráfon kívüli free) az utolsó
+      tulajdonossal szabadul fel.
+    - Child graph: a csomópont a gyerek csomópontjainak másolata, helyben futnak; capture alatti `cuGraphLaunch`
+      is ilyen csomópont lesz. Explicit API: `cuGraphAddMemAllocNode`/`MemFreeNode`/`ChildGraphNode`, a
+      runtime-ban az empty/host/memset/mem/child csomópontok is.
+    - Teszt: `tests/graph.cpp` (capture-ből és explicit, child és beágyazott launch, a fel nem szabadított
+      memória élettartama; RADV és llvmpipe); PyTorch CUDA graph `cudaMallocAsync` backenddel, `torch_graph`
+      mindkét allokátorral (CUDA 12 és 13). A `torch.compile(mode="reduce-overhead")` a `cudaMallocAsync`
+      backenddel a PyTorch saját korlátjába fut (`checkPoolLiveAllocations`).
+  - Hátra: rögzített Vulkan command bufferek (csak host-időt spórolna), `cudaGraphAddNode` általános
+    paraméterekkel, feltételes csomópontok.
 - [x] **5.4 Teljesítmény**
   - [x] DtoH: a write-combined device-memóriából a CPU ~0,2 GB/s-mal olvas. A `Device::read` a GPU-val másol egy
     host-cached staging bufferbe (2 × 8 MiB, a GPU és a CPU másolása átfedve), 4 KiB alatt közvetlenül olvas.

@@ -169,6 +169,7 @@ CUresult CUDAAPI cuMemFree_v2(CUdeviceptr dptr) {
     if (CUresult r = enterContext(s)) return r;
     if (dptr == 0) return CUDA_SUCCESS;
     if (CUresult r = freeManaged(s, dptr); r != CUDA_ERROR_NOT_FOUND) return r;  // cuMemAllocManaged memory
+    if (releaseGraphMemory(*s.slot, dptr)) return CUDA_SUCCESS;  // graph memory its graph still owns
     auto it = s.slot->allocations.find(dptr);
     if (it == s.slot->allocations.end()) return CUDA_ERROR_INVALID_VALUE;
     s.slot->allocatedBytes -= it->second.size;

@@ -232,7 +232,8 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 
 - Nincs SASS-futtatás: csak PTX-et tartalmazó binárisok futnak.
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
-  `torch.compile(mode="reduce-overhead")`); child graph, memória- és feltételes csomópont nincs.
+  `torch.compile(mode="reduce-overhead")`); child graph és memória-csomópont (stream-rendezett
+  foglalás capture alatt) is; feltételes csomópont nincs.
 - (Még) nem támogatott: textúrák, cuDNN.
 - A CUDA IPC (`cudaIpc*`, a PyTorch `torch.multiprocessing`-je) azonos felhasználó folyamatai között működik; egy
   folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).

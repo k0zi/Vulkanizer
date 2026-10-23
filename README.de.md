@@ -233,7 +233,8 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 
 - Keine SASS-Ausführung: Nur Binaries mit PTX laufen.
 - CUDA Graphs: Stream Capture und Wiedergabe funktionieren (die Graphen von llama.cpp, PyTorch `CUDAGraph`,
-  `torch.compile(mode="reduce-overhead")`); keine Child-Graphen, Speicher- oder bedingten Knoten.
+  `torch.compile(mode="reduce-overhead")`); auch Child-Graphen und Speicherknoten
+  (stream-geordnete Allokation während der Aufzeichnung); keine bedingten Knoten.
 - (Noch) nicht unterstützt: Texturen, cuDNN.
 - CUDA-IPC (`cudaIpc*`, `torch.multiprocessing` von PyTorch) funktioniert zwischen Prozessen desselben Benutzers; ein
   Interprozess-Event ist fertig, sobald es aufgezeichnet ist (das Aufzeichnen wartet auf das Gerät).

@@ -233,7 +233,8 @@ Lista completa: [plan.md, sección 4](plan.md).
 
 - No se ejecuta SASS: solo funcionan los binarios que contienen PTX.
 - CUDA Graphs: la captura de streams y la reproducción funcionan (los grafos de llama.cpp, `CUDAGraph` de PyTorch,
-  `torch.compile(mode="reduce-overhead")`); no hay grafos hijos, nodos de memoria ni nodos condicionales.
+  `torch.compile(mode="reduce-overhead")`); también grafos hijos y nodos de memoria
+  (asignación ordenada por flujo durante la captura); no hay nodos condicionales.
 - (Aún) no compatible: texturas, cuDNN.
 - El IPC de CUDA (`cudaIpc*`, `torch.multiprocessing` de PyTorch) funciona entre procesos del mismo usuario; un evento
   entre procesos está completo en cuanto se registra (registrarlo espera al dispositivo).

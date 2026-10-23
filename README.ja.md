@@ -229,7 +229,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 
 - SASS は実行できません。PTX を含むバイナリのみ動作します。
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
-  `torch.compile(mode="reduce-overhead")`）。子グラフ、メモリノード、条件ノードは未対応です。
+  `torch.compile(mode="reduce-overhead")`）。子グラフとメモリノード（キャプチャ中のストリーム順序付き割り当て）にも対応しています。
+  条件ノードは未対応です。
 - （まだ）未対応：テクスチャ、cuDNN。
 - CUDA IPC（`cudaIpc*`、PyTorch の `torch.multiprocessing`）は同じユーザーのプロセス間で動作します。プロセス間イベントは
   記録した時点で完了します（記録はデバイスを待ちます）。

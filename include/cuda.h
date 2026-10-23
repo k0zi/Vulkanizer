@@ -942,6 +942,24 @@ CUresult CUDAAPI cuGraphAddMemsetNode(CUgraphNode* phGraphNode, CUgraph hGraph, 
                                       CUcontext ctx);
 CUresult CUDAAPI cuGraphAddHostNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
                                     size_t numDependencies, const CUDA_HOST_NODE_PARAMS* nodeParams);
+/* Memory nodes and child graphs */
+typedef struct CUDA_MEM_ALLOC_NODE_PARAMS_v1_st {
+    CUmemPoolProps poolProps;
+    const CUmemAccessDesc* accessDescs;
+    size_t accessDescCount;
+    size_t bytesize;
+    CUdeviceptr dptr; /* out */
+} CUDA_MEM_ALLOC_NODE_PARAMS_v1;
+typedef CUDA_MEM_ALLOC_NODE_PARAMS_v1 CUDA_MEM_ALLOC_NODE_PARAMS;
+CUresult CUDAAPI cuGraphAddMemAllocNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                        size_t numDependencies, CUDA_MEM_ALLOC_NODE_PARAMS* nodeParams);
+CUresult CUDAAPI cuGraphMemAllocNodeGetParams(CUgraphNode hNode, CUDA_MEM_ALLOC_NODE_PARAMS* params_out);
+CUresult CUDAAPI cuGraphAddMemFreeNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                       size_t numDependencies, CUdeviceptr dptr);
+CUresult CUDAAPI cuGraphMemFreeNodeGetParams(CUgraphNode hNode, CUdeviceptr* dptr_out);
+CUresult CUDAAPI cuDeviceGraphMemTrim(CUdevice device);
+CUresult CUDAAPI cuGraphAddChildGraphNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
+                                          size_t numDependencies, CUgraph childGraph);
 CUresult CUDAAPI cuGraphAddEmptyNode(CUgraphNode* phGraphNode, CUgraph hGraph, const CUgraphNode* dependencies,
                                      size_t numDependencies);
 CUresult CUDAAPI cuGraphGetNodes(CUgraph hGraph, CUgraphNode* nodes, size_t* numNodes);
