@@ -338,3 +338,17 @@ tools/                vulkanizer-info (eszközlista), vulkanizer-ptxc (offline f
                       build_llama.sh (a llama.cpp CUDA-buildje a Vulkanizer ellen)
                       build_whisper.sh (whisper.cpp)
 ```
+
+## Licenc és jogi nyilatkozat
+
+A Vulkanizer az [MIT licenc](LICENSE) alatt érhető el. A benne található harmadik féltől származó anyagokat (Joe és Kuo
+Sobol-irányszámai, BSD licenc) a [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) sorolja fel.
+
+A Vulkanizer nem tartalmaz NVIDIA forráskódot, headert vagy binárist: a CUDA headerei a nyilvános dokumentáció alapján
+írt clean-room deklarációk, és csak azt veszik át, amit a bináris kompatibilitás megkövetel. A `tools/setup_cuda.sh`
+által letöltött CUDA toolkit az NVIDIA szervereiről, az NVIDIA saját licence alatt érkezik, és nem része a Vulkanizernek.
+
+Az NVIDIA, CUDA, cuBLAS, cuFFT, cuRAND, cuSOLVER, cuSPARSE, NCCL és PTX az NVIDIA Corporation védjegyei vagy bejegyzett
+védjegyei; a Vulkan és a SPIR-V a Khronos Group Inc. bejegyzett védjegyei. Csak annak megjelölésére szerepelnek, amivel
+a Vulkanizer kompatibilis. A Vulkanizer független projekt, nem áll kapcsolatban az NVIDIA-val vagy a Khronos Grouppal,
+és azok nem támogatják vagy szponzorálják.

@@ -321,3 +321,15 @@ tools/                vulkanizer-info（设备列表）、vulkanizer-ptxc（离�
                       build_llama.sh（针对 Vulkanizer 的 llama.cpp CUDA 构建）
                       build_whisper.sh (whisper.cpp)
 ```
+
+## 许可证与法律声明
+
+Vulkanizer 以 [MIT 许可证](LICENSE) 发布。其中包含的第三方材料（Joe 与 Kuo 的 Sobol 方向数，BSD 许可证）列于
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+Vulkanizer 不包含任何 NVIDIA 源代码、头文件或二进制文件：其 CUDA 头文件是依据公开文档编写的 clean-room 声明，只保留二进制兼容
+所必需的内容。`tools/setup_cuda.sh` 下载的 CUDA 工具包来自 NVIDIA 的服务器，受 NVIDIA 自身许可证约束，不属于 Vulkanizer。
+
+NVIDIA、CUDA、cuBLAS、cuFFT、cuRAND、cuSOLVER、cuSPARSE、NCCL 和 PTX 是 NVIDIA Corporation 的商标或注册商标；Vulkan 和
+SPIR-V 是 The Khronos Group Inc. 的注册商标。它们仅用于说明 Vulkanizer 与哪些软件兼容。Vulkanizer 是独立项目，与 NVIDIA
+或 Khronos Group 无关联，也未获其认可或赞助。

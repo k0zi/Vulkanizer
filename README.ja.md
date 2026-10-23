@@ -335,3 +335,16 @@ tools/                vulkanizer-info（デバイス一覧）、vulkanizer-ptxc�
                       build_llama.sh（Vulkanizer 向けの llama.cpp CUDA ビルド）
                       build_whisper.sh (whisper.cpp)
 ```
+
+## ライセンスと法的表示
+
+Vulkanizer は [MIT ライセンス](LICENSE) で公開されています。同梱するサードパーティの素材（Joe と Kuo による Sobol 方向数、
+BSD ライセンス）は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) に記載しています。
+
+Vulkanizer には NVIDIA のソースコード、ヘッダ、バイナリは一切含まれていません。CUDA ヘッダは公開ドキュメントをもとに書いた
+クリーンルームの宣言で、バイナリ互換に必要なものだけを共有しています。`tools/setup_cuda.sh` がダウンロードする CUDA
+ツールキットは NVIDIA のサーバーから NVIDIA 独自のライセンスのもとで提供されるもので、Vulkanizer の一部ではありません。
+
+NVIDIA、CUDA、cuBLAS、cuFFT、cuRAND、cuSOLVER、cuSPARSE、NCCL、PTX は NVIDIA Corporation の商標または登録商標です。
+Vulkan と SPIR-V は The Khronos Group Inc. の登録商標です。これらは Vulkanizer の互換対象を示すためにのみ使用しています。
+Vulkanizer は独立したプロジェクトであり、NVIDIA および Khronos Group とは提携しておらず、その承認や後援も受けていません。

@@ -346,3 +346,18 @@ tools/                vulkanizer-info (liste des périphériques), vulkanizer-pt
                       build_llama.sh (compilation CUDA de llama.cpp avec Vulkanizer)
                       build_whisper.sh (whisper.cpp)
 ```
+
+## Licence et mentions légales
+
+Vulkanizer est distribué sous [licence MIT](LICENSE). Les éléments tiers qu’il inclut (les nombres directeurs de Sobol
+de Joe et Kuo, licence BSD) sont listés dans [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Vulkanizer ne contient aucun code source, en-tête ni binaire de NVIDIA : ses en-têtes CUDA sont des déclarations
+clean-room rédigées à partir de la documentation publique et ne reprennent que ce qu’exige la compatibilité binaire. Le
+toolkit CUDA téléchargé par `tools/setup_cuda.sh` provient des serveurs de NVIDIA, sous la propre licence de NVIDIA, et
+ne fait pas partie de Vulkanizer.
+
+NVIDIA, CUDA, cuBLAS, cuFFT, cuRAND, cuSOLVER, cuSPARSE, NCCL et PTX sont des marques ou des marques déposées de NVIDIA
+Corporation ; Vulkan et SPIR-V sont des marques déposées de The Khronos Group Inc. Elles ne servent qu’à indiquer ce
+avec quoi Vulkanizer est compatible. Vulkanizer est un projet indépendant, sans lien avec NVIDIA ni le Khronos Group, et
+n’est ni approuvé ni parrainé par eux.
