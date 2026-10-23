@@ -17,18 +17,18 @@ set(VULKANIZER_INSTALL_DATADIR ${CMAKE_INSTALL_DATADIR}/vulkanizer)
 set(VULKANIZER_INSTALL_INCLUDEDIR ${CMAKE_INSTALL_INCLUDEDIR}/vulkanizer)
 
 # Each library finds its neighbours (libcudart -> libcuda) without LD_LIBRARY_PATH.
-set_target_properties(vulkanizer_cuda vulkanizer_cudart vulkanizer_cublas vulkanizer_cublaslt vulkanizer_cusolver
+set_target_properties(vulkanizer_cuda vulkanizer_cudart vulkanizer_cublas vulkanizer_cublaslt vulkanizer_cusolver vulkanizer_cufft
   PROPERTIES INSTALL_RPATH "$ORIGIN")
-set_target_properties(vulkanizer_cudart13 vulkanizer_cublas13 vulkanizer_cublaslt13 vulkanizer_cusolver13
+set_target_properties(vulkanizer_cudart13 vulkanizer_cublas13 vulkanizer_cublaslt13 vulkanizer_cusolver13 vulkanizer_cufft13
   PROPERTIES INSTALL_RPATH "$ORIGIN:$ORIGIN/..")
 file(RELATIVE_PATH lib_from_bin /${CMAKE_INSTALL_BINDIR} /${VULKANIZER_INSTALL_LIBDIR})
 set_target_properties(vulkanizer-bandwidth PROPERTIES INSTALL_RPATH "$ORIGIN/${lib_from_bin}")
 
 # libcuda.so too: Triton links its launcher with -lcuda (TRITON_LIBCUDA_PATH).
 install(TARGETS vulkanizer_cuda LIBRARY DESTINATION ${VULKANIZER_INSTALL_LIBDIR})
-install(TARGETS vulkanizer_cudart vulkanizer_cublas vulkanizer_cublaslt vulkanizer_cusolver vulkanizer_nvrtc
+install(TARGETS vulkanizer_cudart vulkanizer_cublas vulkanizer_cublaslt vulkanizer_cusolver vulkanizer_cufft vulkanizer_nvrtc
   LIBRARY DESTINATION ${VULKANIZER_INSTALL_LIBDIR} NAMELINK_SKIP)
-install(TARGETS vulkanizer_cudart13 vulkanizer_cublas13 vulkanizer_cublaslt13 vulkanizer_cusolver13
+install(TARGETS vulkanizer_cudart13 vulkanizer_cublas13 vulkanizer_cublaslt13 vulkanizer_cusolver13 vulkanizer_cufft13
   LIBRARY DESTINATION ${VULKANIZER_INSTALL_LIBDIR}/cuda13 NAMELINK_SKIP)
 install(TARGETS vulkanizer-info vulkanizer-ptxc vulkanizer-bandwidth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 

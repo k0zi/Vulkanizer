@@ -1,0 +1,19 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "io.glsl"
+
+// The full array (src) into the caller's output, one work item per output element:
+//   C2C: every complex element;  R2C: the elements with i2 <= n2 / 2;  C2R: every real part.
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const int n0 = p.n[0], n1 = p.n[1], n2 = p.n[2], width = mode() == kR2C ? n2 / 2 + 1 : n2;
+    const int row = item / width, i2 = item - row * width, plane = row / n1, i1 = row - plane * n1, b = plane / n0,
+              i0 = plane - b * n0;
+    const cplx v = at(p.src, ((b * n0 + i0) * n1 + i1) * n2 + i2).v;
+    const int64_t o = offsetOf(b, i0, i1, i2);
+    if (mode() == kC2R) storeReal(p.dst, o, v.x);
+    else storeComplex(p.dst, o, v);
+}

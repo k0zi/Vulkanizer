@@ -1,0 +1,56 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Whole FFTs of length len along one axis of an array, in shared memory: each workgroup (its
+// number; `items` workgroups) loads L = radix lines (adjacent ones, so that strided axes are read
+// in contiguous runs), runs all the Stockham passes of radix.glsl on them (the radices packed
+// 4 bits each into `dist`, first pass lowest), ping-ponging between two shared buffers, and
+// stores them back (dst may be src). Line l of the axis is lines `count` = span in total.
+
+#ifdef DOUBLE
+const int kLocal = 1024;
+#else
+const int kLocal = 2048;
+#endif
+
+shared cplx buffers[2][kLocal];  // element e of line `sub` at e * L + sub
+int g_in, g_sub, g_lines;
+#define LOAD(e) buffers[g_in][(e) * g_lines + g_sub]
+#define STORE(e, value) buffers[1 - g_in][(e) * g_lines + g_sub] = (value)
+#include "radix.glsl"
+
+void main() {
+    const int group = groupIndex();
+    if (group >= p.items) return;
+    const int len = p.len, L = p.radix, tid = int(gl_LocalInvocationID.x), total = L * len, first = group * L;
+    g_lines = L;
+    // contiguous lines (inner = 1) are read along each line, strided ones across the L lines
+    for (int t = tid; t < total; t += 256) {
+        const int sub = p.inner == 1 ? t / len : t % L, e = p.inner == 1 ? t % len : t / L;
+        const int line = first + sub;
+        if (line >= p.span) continue;
+        buffers[0][e * L + sub] = at(p.src, (line / p.inner) * len * p.inner + line % p.inner + e * p.inner).v;
+    }
+    barrier();
+    g_in = 0;
+    uint64_t radices = uint64_t(p.dist);
+    for (int Ns = 1; Ns < len;) {
+        const int R = int(radices & 15ul);
+        radices >>= 4;
+        const int butterflies = L * (len / R);
+        for (int t = tid; t < butterflies; t += 256) {
+            g_sub = t % L;
+            butterfly(R, t / L, Ns, len);
+        }
+        barrier();
+        g_in = 1 - g_in;
+        Ns *= R;
+    }
+    for (int t = tid; t < total; t += 256) {
+        const int sub = p.inner == 1 ? t / len : t % L, e = p.inner == 1 ? t % len : t / L;
+        const int line = first + sub;
+        if (line >= p.span) continue;
+        at(p.dst, (line / p.inner) * len * p.inner + line % p.inner + e * p.inner).v = buffers[g_in][e * L + sub];
+    }
+}

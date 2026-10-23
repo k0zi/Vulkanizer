@@ -1,0 +1,26 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+#include "io.glsl"
+
+// The caller's input into the full array (dst), one work item per element (b, i0, i1, i2):
+//   C2C: the complex element;
+//   R2C: the real element, imaginary part 0;
+//   C2R: the Hermitian input holds i2 <= n2 / 2; the rest is conj(X(-i0, -i1, n2 - i2)).
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const int n0 = p.n[0], n1 = p.n[1], n2 = p.n[2];
+    const int row = item / n2, i2 = item - row * n2, plane = row / n1, i1 = row - plane * n1, b = plane / n0,
+              i0 = plane - b * n0;
+    cplx v;
+    if (mode() == kR2C) {
+        v = cplx(loadReal(p.src, offsetOf(b, i0, i1, i2)), 0);
+    } else if (mode() == kC2R && i2 > n2 / 2) {
+        v = conjugate(loadComplex(p.src, offsetOf(b, (n0 - i0) % n0, (n1 - i1) % n1, n2 - i2)));
+    } else {
+        v = loadComplex(p.src, offsetOf(b, i0, i1, i2));
+    }
+    at(p.dst, item).v = v;
+}

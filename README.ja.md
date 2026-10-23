@@ -10,8 +10,8 @@
 
 # Vulkanizer
 
-`libcuda.so`、`libcudart.so`、`libcublas.so` のドロップイン置き換えです。CUDA Driver API と Runtime API
-（および cuBLAS の GEMM 系）を Vulkan コンピュート上に実装しており、CUDA プログラムを NVIDIA カードなしで、
+`libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so` のドロップイン置き換えです。
+CUDA Driver API と Runtime API（および cuBLAS の GEMM 系、密行列の線形代数、FFT）を Vulkan コンピュート上に実装しており、CUDA プログラムを NVIDIA カードなしで、
 Vulkan 1.2 対応の任意の GPU（AMD、Intel、llvmpipe）で実行できます。
 計画・アーキテクチャ・フェーズ：[plan.md](plan.md)（ハンガリー語）。
 
@@ -47,8 +47,9 @@ build/bin/vulkanizer-info                       # Vulkanizer から見える Vul
 ```
 
 ビルドされたライブラリは `build/lib/` にあります：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、
-`libcublasLt.so.12`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム向けのランタイムと cuBLAS の
-CUDA 13 版（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`）があり、同じ `libcuda.so.1` を使います。
+`libcublasLt.so.12`、`libcusolver.so.11`、`libcufft.so.11`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム
+向けのランタイムとライブラリの CUDA 13 版（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`、
+`libcusolver.so.12`、`libcufft.so.12`）があり、同じ `libcuda.so.1` を使います。
 
 #### インストール（パッケージ）
 
@@ -148,13 +149,17 @@ tools/setup_torch.sh --cuda13              # CUDA 13.4 版を .work/torch-cf13 �
 PyTorch の公式 wheel には NVIDIA のネイティブ機械語（SASS）しか含まれず PTX がないため、Vulkanizer はそのカーネルを
 実行できません。conda-forge の CUDA ビルドは PTX（`compute_120`）も同梱しています。`tools/setup_torch.sh` はそれを
 micromamba で、システム全体へのインストールなしで導入します。`run_torch.sh` は NVIDIA のものの代わりに Vulkanizer の
-`libcuda`、`libcudart`、`libcublas`、`libcublasLt` を読み込み、NVIDIA のハードウェアやライブラリを必要とする機能を
+`libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver`、`libcufft` を読み込み、NVIDIA のハードウェアやライブラリを必要とする機能を
 すべて無効にします：cuDNN、融合 attention カーネル（`scaled_dot_product_attention` は math パスで実行）、そして
 `torch._native` の DSL カーネル（`TORCH_DISABLE_NATIVE_JIT=1`）です。その Triton カーネルは動作しますが、CuTe DSL
 カーネルは SASS にコンパイルされ、同じ 1 つのスイッチで両方が無効になります。`VULKANIZER_TORCH_DEFAULTS=0` で
 これらの設定を省略できます。
 Triton 自体（`torch.compile`、`@triton.jit`）は動作します。`tools/triton/ptxas` は Triton の PTX をアセンブルせずに
 そのまま渡し、Triton のランチャーは Vulkanizer の `include/cuda.h` に対してビルドされます（C コンパイラが必要）。
+`torch.linalg`（LU、Cholesky、QR、最小二乗、`eigh`、SVD、`pinv` など）は Vulkanizer の cuSOLVER 上で、`torch.fft`
+（`stft` を含む）はその cuFFT 上で動きます。MAGMA 独自のカーネルは動かないため、`run_torch.sh` は
+`TORCH_LINALG_PREFER_CUSOLVER=1` を設定します。PyTorch の jiterator は実行時に NVRTC でカーネルをネイティブコードに
+コンパイルしますが、`LD_AUDIT` ライブラリ（`libvulkanizer_nvrtc.so`）が代わりに PTX を渡させます。
 
 ### 6. ComfyUI
 
@@ -236,6 +241,9 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
   プロンプト処理が遅くなるため、既定では無効です。
 - PyTorch：cuDNN、NCCL、融合 attention のカーネルはありません。デバイス側の `assert` が失敗してもそのスレッドが
   止まるだけです（`cudaErrorAssert` はありません）。
+- cuSOLVER：実数型（f32、f64）のみで、`gesvda`、LDL^T（`sytrf`）、非対称固有値問題（`geev`）はありません。`eigh` と
+  SVD は Jacobi 反復を使うため、大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランは
+  ありません。長さが 2048（f64：1024）を超える変換は基数ごとにメモリを 1 回走査します。
 - ComfyUI：CUDA 13（cu130）向けに最適化されたパスはありません。
 
 ## スクリプト
@@ -271,6 +279,10 @@ src/compiler          CFG と構造化、SPIR-V ビルダ、PTX -> SPIR-V コン
 src/driver            libcuda.so の API 面
 src/runtime           libcudart.so.12 と .so.13（Driver API 上に構築した CUDA Runtime API、同一ソース）
 src/cublas            libcublas.so.12/.13（GLSL カーネルによる GEMM/TRSM）、include/cublas/cublas_v2.h
+src/linalg            GLSL による密行列分解（LU、Cholesky、QR、Jacobi eigh/SVD）、cuBLAS と cuSOLVER で共用
+src/cusolver          libcusolver.so.11/.12、include/cusolver/cusolverDn.h
+src/cufft             libcufft.so.11/.12（GLSL による Stockham と Bluestein の FFT）、include/cufft/cufft.h
+src/nvrtc             LD_AUDIT ライブラリ：NVRTC に cubin ではなく PTX を渡させる（PyTorch の jiterator）
 tests/                Driver API のテストと内部 Vulkan テスト
 tests/cuda            nvcc でコンパイルした Runtime API のプログラム
 tests/cudart_abi      クリーンルームのランタイム型と公式ヘッダとの ABI 一致チェック

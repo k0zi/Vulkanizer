@@ -1,0 +1,21 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One Stockham autosort pass (radix.glsl) of an FFT of length len along one axis of the full array
+// (element stride `inner`), from src to dst, one work item per butterfly. After the last pass
+// (span * radix = len) dst holds the transform in natural order. For lengths fft_local.comp cannot
+// hold in shared memory.
+
+int g_base;
+#define LOAD(e) at(p.src, g_base + (e) * p.inner).v
+#define STORE(e, value) at(p.dst, g_base + (e) * p.inner).v = (value)
+#include "radix.glsl"
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const int quarter = p.len / p.radix, line = item / quarter;
+    g_base = (line / p.inner) * p.len * p.inner + line % p.inner;
+    butterfly(p.radix, item % quarter, p.span, p.len);
+}

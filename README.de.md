@@ -10,8 +10,8 @@ In dieser Ära beispiellosen Chaos hängt das Schicksal des Kosmos am seidenen F
 
 # Vulkanizer
 
-Direkter Ersatz für `libcuda.so`, `libcudart.so` und `libcublas.so`: implementiert die CUDA Driver und Runtime API
-(und die GEMM-Familie von cuBLAS) auf Vulkan Compute, sodass CUDA-Programme ohne NVIDIA-Karte laufen, auf jeder
+Direkter Ersatz für `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so` und `libcufft.so`: implementiert
+die CUDA Driver und Runtime API (und die GEMM-Familie von cuBLAS, dichte lineare Algebra und FFTs) auf Vulkan Compute, sodass CUDA-Programme ohne NVIDIA-Karte laufen, auf jeder
 Vulkan-1.2-GPU (AMD, Intel, llvmpipe).
 Plan, Architektur und Phasen: [plan.md](plan.md) (auf Ungarisch).
 
@@ -47,8 +47,9 @@ build/bin/vulkanizer-info                       # welche Vulkan-Geräte Vulkaniz
 ```
 
 Die gebauten Bibliotheken liegen in `build/lib/`: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`,
-`libcublasLt.so.12`. `build/lib/cuda13/` enthält die CUDA-13-Versionen von Runtime und cuBLAS (`libcudart.so.13`,
-`libcublas.so.13`, `libcublasLt.so.13`) für Programme, die mit CUDA 13 gebaut wurden; sie nutzen dieselbe `libcuda.so.1`.
+`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`. `build/lib/cuda13/` enthält die CUDA-13-Versionen von
+Runtime und Bibliotheken (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`, `libcusolver.so.12`,
+`libcufft.so.12`) für Programme, die mit CUDA 13 gebaut wurden; sie nutzen dieselbe `libcuda.so.1`.
 
 #### Installation (Paket)
 
@@ -148,7 +149,7 @@ Bibliotheken aus `build/lib/cuda13`.
 Die offiziellen PyTorch-Wheels enthalten nur nativen NVIDIA-Maschinencode (SASS), kein PTX, daher kann Vulkanizer
 ihre Kernel nicht ausführen. Die CUDA-Builds von conda-forge liefern auch PTX mit (`compute_120`):
 `tools/setup_torch.sh` installiert sie mit micromamba, ohne systemweite Installation. `run_torch.sh` lädt
-`libcuda`, `libcudart`, `libcublas` und `libcublasLt` von Vulkanizer statt der von NVIDIA und schaltet alles ab, was
+`libcuda`, `libcudart`, `libcublas`, `libcublasLt`, `libcusolver` und `libcufft` von Vulkanizer statt der von NVIDIA und schaltet alles ab, was
 NVIDIA-Hardware oder -Bibliotheken braucht: cuDNN, die fusionierten Attention-Kernel (`scaled_dot_product_attention`
 läuft auf dem Math-Pfad) und die DSL-Kernel von `torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`): Seine
 Triton-Kernel funktionieren, seine CuTe-DSL-Kernel werden aber nach SASS übersetzt, und derselbe Schalter deaktiviert
@@ -156,6 +157,10 @@ beide. `VULKANIZER_TORCH_DEFAULTS=0` überspringt das.
 Triton selbst (`torch.compile`, `@triton.jit`) funktioniert: `tools/triton/ptxas` reicht das PTX von Triton durch,
 statt es zu assemblieren, und der Launcher von Triton wird gegen `include/cuda.h` von Vulkanizer gebaut (braucht einen
 C-Compiler).
+`torch.linalg` (LU, Cholesky, QR, kleinste Quadrate, `eigh`, SVD, `pinv`, ...) läuft auf dem cuSOLVER von Vulkanizer,
+`torch.fft` (auch `stft`) auf seinem cuFFT; `run_torch.sh` setzt `TORCH_LINALG_PREFER_CUSOLVER=1`, da die eigenen
+Kernel von MAGMA nicht laufen. Der Jiterator von PyTorch übersetzt seine Kernel zur Laufzeit mit NVRTC in nativen Code;
+eine `LD_AUDIT`-Bibliothek (`libvulkanizer_nvrtc.so`) lässt ihn stattdessen das PTX übergeben.
 
 ### 6. ComfyUI
 
@@ -238,6 +243,9 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
   Prompt-Verarbeitung damit langsamer, daher ist sie standardmäßig aus.
 - PyTorch: keine cuDNN-, NCCL- oder fusionierten Attention-Kernel; ein fehlgeschlagenes `assert` auf dem Gerät hält
   nur den Thread an (kein `cudaErrorAssert`).
+- cuSOLVER: nur reelle Typen (f32, f64), kein `gesvda`, kein LDL^T (`sytrf`), keine unsymmetrischen Eigenwertprobleme
+  (`geev`); `eigh` und SVD nutzen Jacobi-Iterationen, langsam für große Matrizen (n ≳ 1000). cuFFT: keine Callbacks
+  und keine Multi-GPU-Pläne; Transformationen länger als 2048 (f64: 1024) brauchen einen Speicherdurchlauf pro Radix.
 - ComfyUI: keine für CUDA 13 (cu130) optimierten Pfade.
 
 ## Skripte
@@ -273,6 +281,10 @@ src/compiler          CFG + Strukturierung, SPIR-V-Builder, PTX -> SPIR-V-Compil
 src/driver            die API-Oberfläche von libcuda.so
 src/runtime           libcudart.so.12 und .so.13 (CUDA Runtime API auf der Driver API, eine Quelle)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM mit GLSL-Kerneln), include/cublas/cublas_v2.h
+src/linalg            dichte Zerlegungen (LU, Cholesky, QR, Jacobi-eigh/SVD) in GLSL, gemeinsam für cuBLAS und cuSOLVER
+src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
+src/cufft             libcufft.so.11/.12 (Stockham- und Bluestein-FFTs in GLSL), include/cufft/cufft.h
+src/nvrtc             LD_AUDIT-Bibliothek: NVRTC übergibt PTX statt eines Cubins (Jiterator von PyTorch)
 tests/                Driver-API-Tests + interner Vulkan-Test
 tests/cuda            mit nvcc kompilierte Runtime-API-Programme
 tests/cudart_abi      ABI-Abgleich der Clean-Room-Runtime-Typen mit den offiziellen Headern

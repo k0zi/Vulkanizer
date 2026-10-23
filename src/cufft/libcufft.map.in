@@ -1,0 +1,5 @@
+/* Same symbol version as the official libcufft.so.@VULKANIZER_CUFFT_MAJOR@. */
+libcufft.so.@VULKANIZER_CUFFT_MAJOR@ {
+  global: cufft*;
+  local: *;
+};

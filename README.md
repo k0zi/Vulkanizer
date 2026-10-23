@@ -10,8 +10,8 @@ In this era of unprecedented chaos, the fate of the cosmos hangs in the balance.
 
 # Vulkanizer
 
-Drop-in `libcuda.so`, `libcudart.so` and `libcublas.so`: implements the CUDA Driver and Runtime API (and the cuBLAS
-GEMM family) on top of Vulkan compute, so CUDA programs run without an NVIDIA card, on any
+Drop-in `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so` and `libcufft.so`: implements the CUDA Driver
+and Runtime API (and the cuBLAS GEMM family, dense linear algebra and FFTs) on top of Vulkan compute, so CUDA programs run without an NVIDIA card, on any
 Vulkan 1.2 GPU (AMD, Intel, llvmpipe).
 Plan, architecture and phases: [plan.md](plan.md) (in Hungarian).
 
@@ -46,9 +46,10 @@ build/bin/vulkanizer-info                       # which Vulkan devices Vulkanize
 ./test.sh                                  # tests (optional)
 ```
 
-The built libraries are in `build/lib/`: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`.
-`build/lib/cuda13/` holds the CUDA 13 versions of the runtime and cuBLAS (`libcudart.so.13`, `libcublas.so.13`,
-`libcublasLt.so.13`), for programs built with CUDA 13; they use the same `libcuda.so.1`.
+The built libraries are in `build/lib/`: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`, `libcublasLt.so.12`,
+`libcusolver.so.11`, `libcufft.so.11`. `build/lib/cuda13/` holds the CUDA 13 versions of the runtime and the
+libraries (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`), for
+programs built with CUDA 13; they use the same `libcuda.so.1`.
 
 #### Installing (package)
 
@@ -148,13 +149,17 @@ loads the libraries from `build/lib/cuda13`.
 The official PyTorch wheels contain only native NVIDIA machine code (SASS), no PTX, so Vulkanizer cannot
 run their kernels. The conda-forge CUDA builds also ship PTX (`compute_120`):
 `tools/setup_torch.sh` installs these with micromamba, without a system-wide install. `run_torch.sh` loads
-Vulkanizer's `libcuda`, `libcudart`, `libcublas` and `libcublasLt` instead of NVIDIA's,
+Vulkanizer's `libcuda`, `libcudart`, `libcublas`, `libcublasLt`, `libcusolver` and `libcufft` instead of NVIDIA's,
 and disables everything that requires NVIDIA hardware or libraries: cuDNN, the fused attention kernels
 (so `scaled_dot_product_attention` runs on the math path) and the DSL kernels of `torch._native`
 (`TORCH_DISABLE_NATIVE_JIT=1`): its Triton kernels work, but its CuTe DSL kernels compile to SASS and the one
 switch turns off both. `VULKANIZER_TORCH_DEFAULTS=0` skips this.
 Triton itself (`torch.compile`, `@triton.jit`) works: `tools/triton/ptxas` hands Triton's PTX through instead of
 assembling it, and Triton's launcher is built against Vulkanizer's `include/cuda.h` (needs a C compiler).
+`torch.linalg` (LU, Cholesky, QR, least squares, `eigh`, SVD, `pinv`, ...) runs on Vulkanizer's cuSOLVER and
+`torch.fft` (including `stft`) on its cuFFT; `run_torch.sh` sets `TORCH_LINALG_PREFER_CUSOLVER=1`, since MAGMA's own
+kernels do not run. PyTorch's jiterator compiles its kernels at run time with NVRTC to native code; an `LD_AUDIT`
+library (`libvulkanizer_nvrtc.so`) makes it hand over the PTX instead.
 
 ### 6. ComfyUI
 
@@ -236,6 +241,9 @@ Full list: [plan.md, section 4](plan.md).
   processing is slower with it, so it is off by default.
 - PyTorch: no cuDNN, NCCL or fused attention kernels; a device-side `assert` failure only stops the
   thread (no `cudaErrorAssert`).
+- cuSOLVER: real types (f32, f64) only, no `gesvda`, LDL^T (`sytrf`) or non-symmetric eigenproblems (`geev`); `eigh`
+  and SVD use Jacobi iterations, slow for large matrices (n ≳ 1000). cuFFT: no callbacks or multi-GPU plans;
+  transforms longer than 2048 (f64: 1024) take one pass over memory per radix.
 - ComfyUI: no CUDA 13 (cu130) optimized paths.
 
 ## Scripts
@@ -271,6 +279,10 @@ src/compiler          CFG + structurization, SPIR-V builder, PTX -> SPIR-V compi
 src/driver            the libcuda.so API surface
 src/runtime           libcudart.so.12 and .so.13 (CUDA Runtime API built on the Driver API, one source)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM with GLSL kernels), include/cublas/cublas_v2.h
+src/linalg            dense factorizations (LU, Cholesky, QR, Jacobi eigh/SVD) in GLSL, shared by cuBLAS and cuSOLVER
+src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
+src/cufft             libcufft.so.11/.12 (Stockham and Bluestein FFTs in GLSL), include/cufft/cufft.h
+src/nvrtc             LD_AUDIT library: NVRTC hands over PTX instead of a cubin (PyTorch's jiterator)
 tests/                Driver API tests + internal Vulkan test
 tests/cuda            Runtime API programs compiled with nvcc
 tests/cudart_abi      ABI match of the clean-room runtime types against the official headers

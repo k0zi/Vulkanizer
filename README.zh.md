@@ -10,8 +10,8 @@
 
 # Vulkanizer
 
-可直接替换 `libcuda.so`、`libcudart.so` 和 `libcublas.so`：在 Vulkan 计算之上实现 CUDA Driver API 与 Runtime API
-（以及 cuBLAS 的 GEMM 系列），让 CUDA 程序无需 NVIDIA 显卡即可在任何支持 Vulkan 1.2 的 GPU（AMD、Intel、llvmpipe）上运行。
+可直接替换 `libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so` 和 `libcufft.so`：在 Vulkan 计算之上实现
+CUDA Driver API 与 Runtime API（以及 cuBLAS 的 GEMM 系列、稠密线性代数和 FFT），让 CUDA 程序无需 NVIDIA 显卡即可在任何支持 Vulkan 1.2 的 GPU（AMD、Intel、llvmpipe）上运行。
 计划、架构与阶段：[plan.md](plan.md)（匈牙利语）。
 
 ## 环境要求
@@ -45,8 +45,9 @@ build/bin/vulkanizer-info                       # Vulkanizer 能看到哪些 Vul
 ./test.sh                                  # 测试（可选）
 ```
 
-构建出的库位于 `build/lib/`：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、`libcublasLt.so.12`。
-`build/lib/cuda13/` 中是运行时和 cuBLAS 的 CUDA 13 版本（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`），
+构建出的库位于 `build/lib/`：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、`libcublasLt.so.12`、
+`libcusolver.so.11`、`libcufft.so.11`。`build/lib/cuda13/` 中是运行时和这些库的 CUDA 13 版本（`libcudart.so.13`、
+`libcublas.so.13`、`libcublasLt.so.13`、`libcusolver.so.12`、`libcufft.so.12`），
 供用 CUDA 13 构建的程序使用；它们使用同一个 `libcuda.so.1`。
 
 #### 安装（软件包）
@@ -143,12 +144,16 @@ tools/setup_torch.sh --cuda13              # CUDA 13.4 版本，位于 .work/tor
 
 PyTorch 官方 wheel 只包含 NVIDIA 原生机器码（SASS），没有 PTX，因此 Vulkanizer 无法运行其中的内核。
 conda-forge 的 CUDA 构建同时附带 PTX（`compute_120`）：`tools/setup_torch.sh` 用 micromamba 安装它们，无需系统级安装。
-`run_torch.sh` 加载 Vulkanizer 的 `libcuda`、`libcudart`、`libcublas` 和 `libcublasLt` 来代替 NVIDIA 的库，
+`run_torch.sh` 加载 Vulkanizer 的 `libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver` 和 `libcufft`
+来代替 NVIDIA 的库，
 并关闭所有需要 NVIDIA 硬件或库的功能：cuDNN、融合的 attention 内核（`scaled_dot_product_attention` 走数学路径），
 以及 `torch._native` 的 DSL 内核（`TORCH_DISABLE_NATIVE_JIT=1`）：其中的 Triton 内核可以工作，但 CuTe DSL 内核会编译成
 SASS，而同一个开关会同时关闭两者。`VULKANIZER_TORCH_DEFAULTS=0` 可跳过这些设置。
 Triton 本身（`torch.compile`、`@triton.jit`）可以工作：`tools/triton/ptxas` 直接传递 Triton 生成的 PTX 而不进行汇编，
 Triton 的启动器则针对 Vulkanizer 的 `include/cuda.h` 构建（需要 C 编译器）。
+`torch.linalg`（LU、Cholesky、QR、最小二乘、`eigh`、SVD、`pinv` 等）运行在 Vulkanizer 的 cuSOLVER 上，`torch.fft`（包括
+`stft`）运行在它的 cuFFT 上；由于 MAGMA 自己的内核无法运行，`run_torch.sh` 会设置 `TORCH_LINALG_PREFER_CUSOLVER=1`。
+PyTorch 的 jiterator 在运行时用 NVRTC 把内核编译成原生代码；一个 `LD_AUDIT` 库（`libvulkanizer_nvrtc.so`）让它改为交出 PTX。
 
 ### 6. ComfyUI
 
@@ -228,6 +233,9 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - llama.cpp 的 flash attention 可以正确运行（`tools/build_llama.sh --fa`），但在没有 tensor core 的情况下，
   它会让提示词处理变慢，因此默认关闭。
 - PyTorch：没有 cuDNN、NCCL 和融合 attention 内核；设备端 `assert` 失败只会停止该线程（没有 `cudaErrorAssert`）。
+- cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；`eigh` 和 SVD
+  使用 Jacobi 迭代，对大矩阵（n ≳ 1000）较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换每个基数
+  遍历一次内存。
 - ComfyUI：没有针对 CUDA 13（cu130）优化的路径。
 
 ## 脚本
@@ -263,6 +271,10 @@ src/compiler          CFG + 结构化、SPIR-V 生成器、PTX -> SPIR-V 编译�
 src/driver            libcuda.so 的 API 接口
 src/runtime           libcudart.so.12 和 .so.13（基于 Driver API 的 CUDA Runtime API，同一份源码）
 src/cublas            libcublas.so.12/.13（使用 GLSL 内核的 GEMM/TRSM），include/cublas/cublas_v2.h
+src/linalg            GLSL 编写的稠密分解（LU、Cholesky、QR、Jacobi eigh/SVD），由 cuBLAS 和 cuSOLVER 共用
+src/cusolver          libcusolver.so.11/.12，include/cusolver/cusolverDn.h
+src/cufft             libcufft.so.11/.12（GLSL 编写的 Stockham 与 Bluestein FFT），include/cufft/cufft.h
+src/nvrtc             LD_AUDIT 库：让 NVRTC 交出 PTX 而不是 cubin（PyTorch 的 jiterator）
 tests/                Driver API 测试 + 内部 Vulkan 测试
 tests/cuda            用 nvcc 编译的 Runtime API 程序
 tests/cudart_abi      clean-room 运行时类型与官方头文件的 ABI 一致性检查

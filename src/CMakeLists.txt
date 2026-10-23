@@ -185,6 +185,49 @@ endfunction()
 vulkanizer_cusolver("" 11 11.7.5 ${CMAKE_BINARY_DIR}/lib)
 vulkanizer_cusolver(13 12 12.3.5 ${CMAKE_BINARY_DIR}/lib/cuda13)
 
+# cuFFT: libcufft.so.11 for CUDA 12 and libcufft.so.12 (in lib/cuda13) for CUDA 13; GLSL kernels
+# in f32 and f64 (-DDOUBLE).
+set(cufft_gen ${CMAKE_CURRENT_BINARY_DIR}/cufft)
+set(cufft_shaders)
+foreach(shader fft_gather fft_pass fft_local fft_bluestein fft_scatter)
+  foreach(variant "" _f64)
+    set(defines)
+    if(variant)
+      set(defines -DDOUBLE)
+    endif()
+    add_custom_command(
+      OUTPUT ${cufft_gen}/${shader}${variant}.comp.inc
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${cufft_gen}
+      COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num ${defines} -I ${CMAKE_CURRENT_SOURCE_DIR}/cufft/shaders
+              -o ${cufft_gen}/${shader}${variant}.comp.inc ${CMAKE_CURRENT_SOURCE_DIR}/cufft/shaders/${shader}.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cufft/shaders/${shader}.comp ${CMAKE_CURRENT_SOURCE_DIR}/cufft/shaders/common.glsl
+              ${CMAKE_CURRENT_SOURCE_DIR}/cufft/shaders/io.glsl ${CMAKE_CURRENT_SOURCE_DIR}/cufft/shaders/radix.glsl
+      COMMENT "glslc ${shader}${variant}.comp"
+    )
+    list(APPEND cufft_shaders ${cufft_gen}/${shader}${variant}.comp.inc)
+  endforeach()
+endforeach()
+function(vulkanizer_cufft suffix major version outdir)
+  set(VULKANIZER_CUFFT_MAJOR ${major})  # for the version script template
+  set(map ${CMAKE_CURRENT_BINARY_DIR}/libcufft${major}.map)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cufft/libcufft.map.in ${map} @ONLY)
+  add_library(vulkanizer_cufft${suffix} SHARED cufft/cufft.cpp ${cufft_shaders})
+  target_link_libraries(vulkanizer_cufft${suffix} PRIVATE vulkanizer_common vulkanizer_cuda)
+  target_include_directories(vulkanizer_cufft${suffix} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${cufft_gen}
+    PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
+  string(REPLACE "." ";" parts ${version})  # cufftGetVersion: major * 1000 + minor * 100 + patch
+  list(GET parts 0 v0)
+  list(GET parts 1 v1)
+  list(GET parts 2 v2)
+  math(EXPR version_number "${v0} * 1000 + ${v1} * 100 + ${v2}")
+  target_compile_definitions(vulkanizer_cufft${suffix} PRIVATE VULKANIZER_CUFFT_VERSION=${version_number})
+  set_target_properties(vulkanizer_cufft${suffix} PROPERTIES OUTPUT_NAME cufft VERSION ${version}
+    SOVERSION ${major} LINK_DEPENDS ${map} LIBRARY_OUTPUT_DIRECTORY ${outdir})
+  target_link_options(vulkanizer_cufft${suffix} PRIVATE -Wl,--version-script=${map} -Wl,--no-undefined)
+endfunction()
+vulkanizer_cufft("" 11 11.4.1 ${CMAKE_BINARY_DIR}/lib)
+vulkanizer_cufft(13 12 12.4.0 ${CMAKE_BINARY_DIR}/lib/cuda13)
+
 # NVRTC PTX shim, an LD_AUDIT library (run_torch.sh, vulkanizer-run --torch): run-time compiled
 # programs get their PTX instead of a cubin.
 add_library(vulkanizer_nvrtc SHARED nvrtc/nvrtc_ptx.cpp)

@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Bluestein's FFT of a length N (= span) whose factors are not all small radices, along one axis
+// of the full array: X_k = w_k sum_n (x_n w_n) conj(w_(k-n)) with the chirp w_n = exp(-+pi i n^2 / N)
+// (the table), a convolution done with FFTs of the power of two M (= len) >= 2N - 1, in steps:
+//   pre:      B(line, m) = x_m w_m for m < N, else 0 (src: the full array, dst: B, lines x M)
+//   multiply: B *= the transformed filter (aux: forward, then inverse; already divided by M)
+//   post:     X_k = w_k B(line, k) (src: B, dst: the full array)
+// with B forward transformed between pre and multiply and inverse transformed after (fft_pass).
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const int M = p.len, N = p.span;
+    const uint step = (p.flags >> kStepShift) & 3u;
+    if (step == kMultiply) {
+        const cplx f = at(p.aux, (inverse() ? M : 0) + item % M).v;
+        at(p.dst, item).v = cmul(at(p.dst, item).v, f);
+        return;
+    }
+    const int width = step == kPre ? M : N;
+    const int line = item / width, m = item % width;
+    const int element = (line / p.inner) * N * p.inner + line % p.inner + m * p.inner;
+    if (step == kPre) {
+        cplx x = cplx(0);
+        if (m < N) {
+            const cplx w = at(p.table, m).v;
+            x = cmul(at(p.src, element).v, inverse() ? conjugate(w) : w);
+        }
+        at(p.dst, line * M + m).v = x;
+    } else {
+        const cplx w = at(p.table, m).v;
+        at(p.dst, element).v = cmul(at(p.src, line * M + m).v, inverse() ? conjugate(w) : w);
+    }
+}

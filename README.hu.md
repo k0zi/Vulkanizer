@@ -10,8 +10,9 @@ A példátlan káosz e korszakában a kozmosz sorsa hajszálon függ. A pusztít
 
 # Vulkanizer
 
-A `libcuda.so`, `libcudart.so` és `libcublas.so` közvetlen helyettesítője: a CUDA Driver és Runtime API-t (és a
-cuBLAS GEMM-családját) Vulkan compute-ra építve valósítja meg, így a CUDA-programok NVIDIA-kártya nélkül futnak, bármely
+A `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so` és `libcufft.so` közvetlen helyettesítője: a CUDA
+Driver és Runtime API-t (és a cuBLAS GEMM-családját, a sűrű lineáris algebrát és az FFT-t) Vulkan compute-ra építve
+valósítja meg, így a CUDA-programok NVIDIA-kártya nélkül futnak, bármely
 Vulkan 1.2-es GPU-n (AMD, Intel, llvmpipe).
 Terv, architektúra és fázisok: [plan.md](plan.md).
 
@@ -47,9 +48,9 @@ build/bin/vulkanizer-info                       # milyen Vulkan eszközöket lá
 ```
 
 A lefordított könyvtárak a `build/lib/`-ben vannak: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`,
-`libcublasLt.so.12`. A `build/lib/cuda13/` a runtime és a cuBLAS CUDA 13-as változatait tartalmazza
-(`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`) a CUDA 13-mal fordított programokhoz; ezek ugyanazt a
-`libcuda.so.1`-et használják.
+`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`. A `build/lib/cuda13/` a runtime és a könyvtárak CUDA 13-as
+változatait tartalmazza (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`, `libcusolver.so.12`,
+`libcufft.so.12`) a CUDA 13-mal fordított programokhoz; ezek ugyanazt a `libcuda.so.1`-et használják.
 
 #### Telepítés (csomag)
 
@@ -149,12 +150,16 @@ néven a `.work/torch-cf13` ellen. Olyan környezetben, ahol `libcudart.so.13` v
 A hivatalos PyTorch wheelekben csak natív NVIDIA gépi kód (SASS) van, PTX nincs, így a Vulkanizer nem tudja futtatni a
 kerneleiket. A conda-forge CUDA-buildjei PTX-et is tartalmaznak (`compute_120`): a `tools/setup_torch.sh` ezeket
 telepíti micromambával, rendszerszintű telepítés nélkül. A `run_torch.sh` az NVIDIA-é helyett a Vulkanizer `libcuda`,
-`libcudart`, `libcublas` és `libcublasLt` könyvtárait tölti be, és kikapcsol mindent, ami NVIDIA hardvert vagy
+`libcudart`, `libcublas`, `libcublasLt`, `libcusolver` és `libcufft` könyvtárait tölti be, és kikapcsol mindent, ami NVIDIA hardvert vagy
 könyvtárat igényel: a cuDNN-t, a fúzionált attention kerneleket (a `scaled_dot_product_attention` a math úton fut) és a
 `torch._native` DSL-kerneleit (`TORCH_DISABLE_NATIVE_JIT=1`): a Triton-kernelei működnek, a CuTe DSL kernelei viszont
 SASS-ra fordulnak, és ugyanaz az egy kapcsoló mindkettőt tiltja. A `VULKANIZER_TORCH_DEFAULTS=0` mindezt kihagyja.
 Maga a Triton (`torch.compile`, `@triton.jit`) működik: a `tools/triton/ptxas` továbbadja a Triton PTX-ét ahelyett,
 hogy lefordítaná, a Triton launchere pedig a Vulkanizer `include/cuda.h`-ja ellen fordul (C-fordító kell hozzá).
+A `torch.linalg` (LU, Cholesky, QR, legkisebb négyzetek, `eigh`, SVD, `pinv`, ...) a Vulkanizer cuSOLVER-én, a
+`torch.fft` (a `stft` is) a cuFFT-jén fut; a `run_torch.sh` beállítja a `TORCH_LINALG_PREFER_CUSOLVER=1`-et, mert a
+MAGMA saját kernelei nem futnak. A PyTorch jiteratora futásidőben NVRTC-vel natív kódra fordítja a kerneleit; egy
+`LD_AUDIT` könyvtár (`libvulkanizer_nvrtc.so`) ehelyett a PTX-et adatja át vele.
 
 ### 6. ComfyUI
 
@@ -237,6 +242,10 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   prompt feldolgozása, ezért alapból ki van kapcsolva.
 - PyTorch: nincsenek cuDNN-, NCCL- és fúzionált attention kernelek; egy eszközoldali `assert` hibája csak a szálat
   állítja meg (nincs `cudaErrorAssert`).
+- cuSOLVER: csak valós típusok (f32, f64), nincs `gesvda`, LDL^T (`sytrf`) és nem szimmetrikus sajátérték-feladat
+  (`geev`); az `eigh` és az SVD Jacobi-iterációt használ, ami nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek
+  callbackek és több GPU-s tervek; a 2048-nál (f64: 1024) hosszabb transzformációk radixonként egyszer bejárják a
+  memóriát.
 - ComfyUI: nincsenek a CUDA 13-ra (cu130) optimalizált utak.
 
 ## Szkriptek
@@ -272,6 +281,10 @@ src/compiler          CFG + strukturálás, SPIR-V builder, PTX -> SPIR-V fordí
 src/driver            a libcuda.so API-felülete
 src/runtime           libcudart.so.12 és .so.13 (a CUDA Runtime API a Driver API-ra építve, egy forrásból)
 src/cublas            libcublas.so.12/.13 (GEMM/TRSM GLSL-kernelekkel), include/cublas/cublas_v2.h
+src/linalg            sűrű felbontások (LU, Cholesky, QR, Jacobi eigh/SVD) GLSL-ben, közös a cuBLAS-szal és a cuSOLVER-rel
+src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
+src/cufft             libcufft.so.11/.12 (Stockham és Bluestein FFT GLSL-ben), include/cufft/cufft.h
+src/nvrtc             LD_AUDIT könyvtár: az NVRTC cubin helyett PTX-et ad (a PyTorch jiteratorához)
 tests/                Driver API tesztek + belső Vulkan teszt
 tests/cuda            nvcc-vel fordított Runtime API programok
 tests/cudart_abi      a clean-room runtime típusok ABI-egyezése a hivatalos headerekkel

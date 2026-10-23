@@ -64,7 +64,7 @@ if [[ $TORCH -eq 1 ]]; then
   fi
   CUDA_LIB="$LIB"
   if [[ $MAJOR == 13 ]]; then CUDA_LIB="$LIB/cuda13"; fi
-  export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$MAJOR:$CUDA_LIB/libcublas.so.$MAJOR:$CUDA_LIB/libcublasLt.so.$MAJOR:$CUDA_LIB/libcusolver.so.$((MAJOR - 1))${LD_PRELOAD:+:$LD_PRELOAD}"
+  export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$MAJOR:$CUDA_LIB/libcublas.so.$MAJOR:$CUDA_LIB/libcublasLt.so.$MAJOR:$CUDA_LIB/libcusolver.so.$((MAJOR - 1)):$CUDA_LIB/libcufft.so.$((MAJOR - 1))${LD_PRELOAD:+:$LD_PRELOAD}"
   # run-time compiled kernels (PyTorch's jiterator) as PTX, not cubins
   export LD_AUDIT="$LIB/libvulkanizer_nvrtc.so${LD_AUDIT:+:$LD_AUDIT}"
   export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda

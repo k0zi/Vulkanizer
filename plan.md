@@ -56,7 +56,7 @@ Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
 
 Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
-2. **4.2** További könyvtárak: a `libcusolver` kész, következik a `libcufft` (`torch.fft`), majd a `libcusparse`.
+2. **4.2** További könyvtárak: a `libcusolver` és a `libcufft` kész, hátra a `libcusparse` (ha kell).
 3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
 4. **5.6** maradéka: IPC (`cudaIpc*`, a PyTorch multiprocessing tenzor-megosztásához), NCCL, eszközök közti UVA.
 5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
@@ -200,7 +200,22 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       matrix_norm; CUDA 12 és 13 – ALL OK).
     - Nincs: komplex típusok, `gesvdaStridedBatched`, LDL^T (`sytrf`), nem szimmetrikus sajátérték (`Xgeev`);
       ezek `CUSOLVER_STATUS_NOT_SUPPORTED`-et adnak. Nagy mátrixokra (n ≳ 1000) a Jacobi lassú (n²·sweep dispatch).
-  - [ ] `libcufft` (`torch.fft`): plan + C2C/R2C/C2R, Stockham radix-2/3/5 és Bluestein a többi hosszra.
+  - [x] `libcufft.so.11` / `.so.12` (CUDA 12 / 13) – `torch.fft` (fft/ifft, rfft/irfft, fft2, fftn, hfft, `stft`).
+    - API: plan 1–3 dimenzióra, batch, advanced layout (embed, stride, dist), C2C/R2C/C2R, f32 / f64 / f16
+      (`cufftXtMakePlanMany`; az f16 f32-ben számol), workspace (`SetAutoAllocation`/`SetWorkArea`).
+    - Menet: gather a felhasználói tömbből a munkaterület összefüggő komplex tömbjébe (R2C: képzetes rész 0; C2R:
+      Hermite-kiegészítés), tengelyenként FFT, scatter. A valós transzformációk teljes hosszú komplexként futnak.
+    - Stockham autosort, radix 4, 2, 3, 5, 7, 11, 13 (radixonként külön, kigörgetett butterfly függvény); a gyökök
+      táblázata a hoston, f64-ben készül. 2048 (f64: 1024) hosszig az egész FFT egy dispatch shared memóriában, egy
+      munkacsoport több vonallal (strided tengelyen szomszédos vonalak, így coalesced az olvasás); hosszabbra radixonként
+      egy globális pass. 13-nál nagyobb prímtényezőre Bluestein (chirp-z, kettőhatvány-FFT-kkel; a szűrő FFT-je a hoston).
+    - Tanulság: a 64 bites egész osztás (index → koordináták) GPU-n emulált és nagyon lassú – 32 bites indexeléssel
+      5–7× gyorsabb lett (a terv < 2^31 elemet enged).
+    - Mérés (Renoir iGPU vs. 8 szálas CPU-s pocketfft): fft 64×65536 c64 17,5 vs 35 ms, rfft2 16×512×512 11 vs 16 ms,
+      fft 256×1000 0,6 vs 0,75 ms; prím (1009, Bluestein) ~2 ms.
+    - Tesztek: `tests/cufft.cpp` (ctest, 30 eset, RADV és llvmpipe), `torch_fft` (CUDA 12 és 13 – ALL OK).
+    - Hátra (ha kell): négylépéses FFT a 2048-nál hosszabb vonalakra (két shared memóriás dispatch a sok globális pass
+      helyett), R2C/C2R fél hosszú komplex trükkel, callbackek.
   - [ ] `libcusparse` (a PyTorch sparse része init hibával áll meg), `libcurand` (a PyTorch nem használja).
 - [x] **4.3** Célalkalmazás: a llama.cpp CUDA backendje (`tools/build_llama.sh`).
 - [x] **4.4 Mérföldkő:** a SmolLM2-135M (Q8_0 és Q4_0) szöveget generál a Renoir iGPU-n.
