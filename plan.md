@@ -52,7 +52,7 @@ Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben 
 Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
 az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`), az 5.6 (cooperative
 groups, több GPU, IPC, NCCL, UVA), valamint az 5.7 (llama tg ~31 → ~38 t/s). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
-Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
+Triton, `torch.compile`), ComfyUI (Z-Image Turbo), Numba (`numba-cuda`).
 
 Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
@@ -556,6 +556,28 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       kommunikátora; RADV és llvmpipe); PyTorch: egyrangú DDP, `torchrun --nproc_per_node 2` DDP (a replikák
       azonosak maradnak, `all_gather_object`, `barrier`) és FSDP2 (`fully_shard`; az egyfolyamatos referenciától
       7e-9) CUDA 12-n és 13-on.
+
+- [x] **5.8** Új célalkalmazás: Numba és CuPy (2026-10-23).
+  - CuPy: nem futhat – statikusan linkeli a CUDA runtime-ot (`cuGetExportTable` ismeretlen interfészei), mint az
+    NVIDIA NCCL-je; ez a „Statikusan linkelt libcudart” korlát.
+  - Numba (`numba-cuda` a `cuda.core`/`cuda.bindings` NVIDIA-kötéseken): libNVVM-mel PTX-et ad, és a driver API-t
+    hívja. Ami hiányzott hozzá:
+    - CUDA 12 library API (`api_library.cpp`): `cuLibraryLoadData/LoadFromFile/Unload/GetKernel/GetKernelCount/
+      EnumerateKernels/GetModule/GetGlobal/GetManaged`, `cuKernelGetFunction/GetLibrary/GetAttribute/SetAttribute/
+      SetCacheConfig/GetName/GetParamInfo`, `cuModuleGetFunctionCount/EnumerateFunctions`, `cuFuncGetName/GetModule`.
+      A library egy modul (a betöltéskor aktuális contextben, ha nincs, az első eszköz primary contextjében); a
+      `CUkernel` maga a `CUfunction`, így a `cuLaunchKernel` közvetlenül indítja (ahogy a CUDA is engedi).
+    - JIT linkelés (`api_link.cpp`, `cuLinkCreate/AddData/AddFile/Complete/Destroy`): a "cubin" kimenet PTX: egy
+      bemenet változatlan, több esetén egy fejléc, és a máshol definiált függvények `.extern` deklarációi kiesnek;
+      fatbinból a PTX, könyvtár-archívum (`libcudadevrt.a`) kihagyva, cubin/objektum elutasítva.
+    - nvJitLink (a `cuda.core` linkere): az LD_AUDIT könyvtár (`libvulkanizer_nvrtc.so`) a link-függvényeit (sima és
+      `__nvJitLinkX_12_N` nevek) a driver `cuLink*`-jára köti (a libcuda szimbólumtáblájából, mert az audit-könyvtár
+      külön névtérben fut), az `nvJitLinkVersion` pedig hibát ad: a Numba ebből dönti el az LTO-t, így LTO-IR helyett
+      PTX-et ad.
+  - Teszt: `tests/library.cpp` (kontextus nélküli betöltés, enumerálás, CUkernel-indítás, globális, két PTX modul
+    linkelése `.extern` hívással, a cubin elutasítása; RADV és llvmpipe). Numba (`numba1.py` jellegű próba): saxpy,
+    shared memória + atomics, komplex/while, `cuda.reduce`, device-függvény + libdevice, stream/event – mind helyes.
+    Futtatás: `CUDA_HOME=<env> ./run_torch.sh --env <env> script.py` (a `CUDA_HOME` a conda-env libNVVM-jéhez kell).
 
 ## 3. Ismert korlátok / kockázatok
 

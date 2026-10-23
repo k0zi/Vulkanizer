@@ -1,9 +1,14 @@
 // An LD_AUDIT library (run_torch.sh, vulkanizer-run --torch): programs that compile CUDA C++ at run
-// time and load the result as a cubin (PyTorch's jiterator, CuPy) get the program's PTX instead,
+// time and load the result as a cubin (PyTorch's jiterator) get the program's PTX instead,
 // which Vulkanizer translates; a cubin is native NVIDIA machine code it cannot run.
 // nvrtcCompileProgram compiles for the virtual architecture (compute_XX for a requested sm_XX, which
 // would make NVRTC keep machine code only), and nvrtcGetCUBINSize/nvrtcGetCUBIN are answered with
 // nvrtcGetPTXSize/nvrtcGetPTX of the same program, or passed on where there is no PTX.
+// nvJitLink, which links PTX into a cubin too (cuda.core, Numba), is replaced by the driver's cuLink*,
+// whose linked image is PTX here: its link functions (plain and versioned names, __nvJitLinkX_12_N)
+// are bound to ones calling Vulkanizer's libcuda, found in its symbol table like the PTX getters.
+// nvJitLinkVersion fails, so that users choosing link-time optimization by its presence (Numba)
+// emit PTX rather than LTO-IR, which only NVIDIA's nvJitLink can compile.
 // An audit library because PyTorch looks NVRTC up with dlopen + dlsym, which a preloaded library
 // cannot interpose: the dynamic linker reports every binding, dlsym's too, to la_symbind64.
 
@@ -11,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -89,6 +95,163 @@ int cubin(void* program, char* code) {
     return realCubin ? realCubin(program, code) : kInternalError;
 }
 
+// ---- nvJitLink on cuLink* ----------------------------------------------------------------------
+
+const struct link_map* cudaLibrary;  // Vulkanizer's libcuda, once loaded
+
+using LinkCreateFn = int (*)(unsigned, void*, void**, void**);
+using LinkAddDataFn = int (*)(void*, int, void*, size_t, const char*, unsigned, void*, void**);
+using LinkCompleteFn = int (*)(void*, void**, size_t*);
+using LinkDestroyFn = int (*)(void*);
+LinkCreateFn linkCreate;
+LinkAddDataFn linkAddData;
+LinkCompleteFn linkComplete;
+LinkDestroyFn linkDestroy;
+
+constexpr int kJitSuccess = 0, kJitInvalidInput = 3, kJitInternal = 6;
+
+bool findCuLink() {
+    if (linkCreate) return true;
+    if (!cudaLibrary) return false;
+    linkCreate = reinterpret_cast<LinkCreateFn>(lookup(cudaLibrary, "cuLinkCreate_v2"));
+    linkAddData = reinterpret_cast<LinkAddDataFn>(lookup(cudaLibrary, "cuLinkAddData_v2"));
+    linkComplete = reinterpret_cast<LinkCompleteFn>(lookup(cudaLibrary, "cuLinkComplete"));
+    linkDestroy = reinterpret_cast<LinkDestroyFn>(lookup(cudaLibrary, "cuLinkDestroy"));
+    return linkCreate && linkAddData && linkComplete && linkDestroy;
+}
+
+struct JitLink {
+    void* state = nullptr;
+    std::vector<char> image;  // the linked PTX
+    std::string errors;
+};
+
+int jitCreate(JitLink** handle, uint32_t, const char**) {
+    if (!handle || !findCuLink()) return kJitInternal;
+    auto* h = new JitLink();
+    if (linkCreate(0, nullptr, nullptr, &h->state) != 0) {
+        delete h;
+        return kJitInternal;
+    }
+    *handle = h;
+    return kJitSuccess;
+}
+
+int jitDestroy(JitLink** handle) {
+    if (!handle || !*handle) return kJitInvalidInput;
+    if ((*handle)->state) linkDestroy((*handle)->state);
+    delete *handle;
+    *handle = nullptr;
+    return kJitSuccess;
+}
+
+// nvJitLinkInputType -> CUjitInputType: cubin, PTX, (LTO-IR: none), fat binary, object, library
+int jitAddData(JitLink* h, int type, const void* data, size_t size, const char* name) {
+    static const int kTypes[] = {-1, 0, 1, -1, 2, 3, 4};
+    const int cuType = type >= 0 && type < 7 ? kTypes[type] : -1;
+    if (!h || cuType < 0) {
+        if (h) h->errors += std::string(name ? name : "input") + ": LTO-IR cannot be linked by Vulkanizer\n";
+        return kJitInvalidInput;
+    }
+    if (linkAddData(h->state, cuType, const_cast<void*>(data), size, name, 0, nullptr, nullptr) != 0) {
+        h->errors += std::string(name ? name : "input") + ": only PTX (or a fat binary with PTX) can be linked\n";
+        return kJitInvalidInput;
+    }
+    return kJitSuccess;
+}
+
+int jitAddFile(JitLink* h, int type, const char* fileName) {
+    if (!h || !fileName) return kJitInvalidInput;
+    FILE* f = std::fopen(fileName, "rb");
+    if (!f) return kJitInvalidInput;
+    std::vector<char> data;
+    char buf[65536];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) data.insert(data.end(), buf, buf + n);
+    std::fclose(f);
+    data.push_back(0);
+    return jitAddData(h, type, data.data(), data.size() - 1, fileName);
+}
+
+int jitComplete(JitLink* h) {
+    if (!h) return kJitInvalidInput;
+    void* image = nullptr;
+    size_t size = 0;
+    if (linkComplete(h->state, &image, &size) != 0) {
+        h->errors += "link failed\n";
+        return kJitInternal;
+    }
+    h->image.assign(static_cast<const char*>(image), static_cast<const char*>(image) + size);
+    return kJitSuccess;
+}
+
+int jitImageSize(JitLink* h, size_t* size) {
+    if (!h || !size) return kJitInvalidInput;
+    *size = h->image.size();
+    return kJitSuccess;
+}
+
+int jitImage(JitLink* h, void* out) {
+    if (!h || !out) return kJitInvalidInput;
+    std::memcpy(out, h->image.data(), h->image.size());
+    return kJitSuccess;
+}
+
+int jitErrorLogSize(JitLink* h, size_t* size) {
+    if (!h || !size) return kJitInvalidInput;
+    *size = h->errors.size() + 1;
+    return kJitSuccess;
+}
+
+int jitErrorLog(JitLink* h, char* log) {
+    if (!h || !log) return kJitInvalidInput;
+    std::memcpy(log, h->errors.c_str(), h->errors.size() + 1);
+    return kJitSuccess;
+}
+
+int jitInfoLogSize(JitLink* h, size_t* size) {
+    if (!h || !size) return kJitInvalidInput;
+    *size = 1;
+    return kJitSuccess;
+}
+
+int jitVersion(unsigned*, unsigned*) { return kJitInternal; }
+
+int jitInfoLog(JitLink* h, char* log) {
+    if (!h || !log) return kJitInvalidInput;
+    log[0] = 0;
+    return kJitSuccess;
+}
+
+// The replacement of an nvJitLink function (name without "__" and "_12_N"), or 0.
+uintptr_t jitReplacement(const char* name) {
+    std::string n = name;
+    if (n.rfind("__", 0) == 0) n.erase(0, 2);
+    if (const size_t v = n.find("_12_"); v != std::string::npos) n.erase(v);
+    struct Entry {
+        const char* name;
+        uintptr_t fn;
+    };
+    static const Entry kTable[] = {
+        {"nvJitLinkCreate", reinterpret_cast<uintptr_t>(&jitCreate)},
+        {"nvJitLinkDestroy", reinterpret_cast<uintptr_t>(&jitDestroy)},
+        {"nvJitLinkAddData", reinterpret_cast<uintptr_t>(&jitAddData)},
+        {"nvJitLinkAddFile", reinterpret_cast<uintptr_t>(&jitAddFile)},
+        {"nvJitLinkComplete", reinterpret_cast<uintptr_t>(&jitComplete)},
+        {"nvJitLinkGetLinkedCubinSize", reinterpret_cast<uintptr_t>(&jitImageSize)},
+        {"nvJitLinkGetLinkedCubin", reinterpret_cast<uintptr_t>(&jitImage)},
+        {"nvJitLinkGetLinkedPtxSize", reinterpret_cast<uintptr_t>(&jitImageSize)},
+        {"nvJitLinkGetLinkedPtx", reinterpret_cast<uintptr_t>(&jitImage)},
+        {"nvJitLinkGetErrorLogSize", reinterpret_cast<uintptr_t>(&jitErrorLogSize)},
+        {"nvJitLinkGetErrorLog", reinterpret_cast<uintptr_t>(&jitErrorLog)},
+        {"nvJitLinkGetInfoLogSize", reinterpret_cast<uintptr_t>(&jitInfoLogSize)},
+        {"nvJitLinkGetInfoLog", reinterpret_cast<uintptr_t>(&jitInfoLog)},
+        {"nvJitLinkVersion", reinterpret_cast<uintptr_t>(&jitVersion)},
+    };
+    for (const Entry& e : kTable)
+        if (n == e.name) return e.fn;
+    return 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -98,10 +261,15 @@ unsigned la_version(unsigned) { return LAV_CURRENT; }
 // Bindings to and from every object are reported (no PLT enter/exit hooks: no per-call cost).
 unsigned la_objopen(struct link_map* map, Lmid_t, uintptr_t*) {
     if (map->l_name && std::strstr(map->l_name, "libnvrtc.so")) nvrtcLibrary = map;
+    if (map->l_name && std::strstr(map->l_name, "/libcuda.so")) cudaLibrary = map;
     return LA_FLG_BINDTO | LA_FLG_BINDFROM;
 }
 
 uintptr_t la_symbind64(Elf64_Sym* sym, unsigned, uintptr_t*, uintptr_t*, unsigned*, const char* name) {
+    if (!std::strncmp(name, "nvJitLink", 9) || !std::strncmp(name, "__nvJitLink", 11)) {
+        const uintptr_t replacement = jitReplacement(name);
+        return replacement && findCuLink() ? replacement : sym->st_value;
+    }
     if (std::strncmp(name, "nvrtc", 5) != 0) return sym->st_value;
     const uintptr_t real = sym->st_value;
     if (!std::strcmp(name, "nvrtcGetPTXSize")) realPtxSize = reinterpret_cast<SizeFn>(real);

@@ -208,6 +208,23 @@ Dann <http://127.0.0.1:8188> öffnen. Modelle kommen wie gewohnt nach `models/`.
   rechnet das Modell auf der GPU in fp16, daher unterscheiden sich vollständige Bilder von einem fp32-Lauf auf der CPU
   in feinen Details).
 
+### 7. Numba
+
+Numba (`numba-cuda`, `@cuda.jit`) übersetzt Kernel mit libNVVM nach PTX, das Vulkanizer ausführt (`CUDA_HOME` lässt es
+libNVVM in einer conda-Umgebung finden):
+
+```sh
+export MAMBA_ROOT_PREFIX=$PWD/.work/mamba-root CONDA_OVERRIDE_CUDA=12.9
+.work/micromamba/bin/micromamba create -y -p .work/numba-cf -c conda-forge \
+    python=3.13 numba numba-cuda "cuda-version=12.9" cuda-nvvm cuda-nvrtc numpy
+CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
+```
+
+Sein Linker ist nvJitLink, das nativen Code erzeugen würde: unter `run_torch.sh` (und `vulkanizer-run --torch`) gehen
+die Link-Aufrufe von nvJitLink an `cuLink*` des Treibers, dessen gelinktes Abbild hier PTX ist, und nvJitLink meldet
+keine Version, sodass Numba PTX statt LTO-IR erzeugt. CuPy läuft nicht: es linkt die CUDA-Runtime statisch (siehe
+Einschränkungen).
+
 ### Nützliche Umgebungsvariablen
 
 | Variable | Wirkung |
@@ -232,6 +249,8 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 ### Einschränkungen
 
 - Keine SASS-Ausführung: Nur Binaries mit PTX laufen.
+- Programme und Bibliotheken mit statisch gelinkter CUDA-Runtime (CuPy, NCCL von NVIDIA) laufen nicht: diese
+  Runtime braucht undokumentierte Interna des NVIDIA-Treibers.
 - CUDA Graphs: Stream Capture und Wiedergabe funktionieren (die Graphen von llama.cpp, PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); auch Child-Graphen und Speicherknoten
   (stream-geordnete Allokation während der Aufzeichnung); keine bedingten Knoten.
@@ -296,7 +315,7 @@ src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham- und Bluestein-FFTs in GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 in GLSL), include/cusparse/cusparse.h
 src/nccl              libnccl.so.2 (Kollektive zwischen den Rängen eines Rechners), include/nccl/nccl.h
-src/nvrtc             LD_AUDIT-Bibliothek: NVRTC übergibt PTX statt eines Cubins (Jiterator von PyTorch)
+src/nvrtc             LD_AUDIT-Bibliothek: NVRTC übergibt PTX statt eines Cubins (Jiterator von PyTorch), nvJitLink linkt über cuLink* (Numba)
 tests/                Driver-API-Tests + interner Vulkan-Test
 tests/cuda            mit nvcc kompilierte Runtime-API-Programme
 tests/cudart_abi      ABI-Abgleich der Clean-Room-Runtime-Typen mit den offiziellen Headern

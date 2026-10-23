@@ -207,6 +207,22 @@ Ezután nyisd meg a <http://127.0.0.1:8188> címet. A modellek a szokott módon 
   a GPU-n, fp32-ben és fp16-ban a CPU-n. A GPU legfeljebb annyira térhet el az fp32-től, mint maga az fp16 (a ComfyUI
   fp16-ban futtatja a modellt a GPU-n, ezért a teljes képek a finom részletekben eltérnek egy CPU-s fp32 futástól).
 
+### 7. Numba
+
+A Numba (`numba-cuda`, `@cuda.jit`) libNVVM-mel PTX-re fordítja a kerneleket, amit a Vulkanizer futtat (a `CUDA_HOME`
+alapján találja meg a libNVVM-et a conda-környezetben):
+
+```sh
+export MAMBA_ROOT_PREFIX=$PWD/.work/mamba-root CONDA_OVERRIDE_CUDA=12.9
+.work/micromamba/bin/micromamba create -y -p .work/numba-cf -c conda-forge \
+    python=3.13 numba numba-cuda "cuda-version=12.9" cuda-nvvm cuda-nvrtc numpy
+CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
+```
+
+A linkere az nvJitLink, ami natív kódot adna: a `run_torch.sh` (és a `vulkanizer-run --torch`) alatt az nvJitLink
+linkhívásai a driver `cuLink*`-jához mennek, aminek a linkelt képe itt PTX, az nvJitLink pedig nem ad verziót, így a
+Numba LTO-IR helyett PTX-et ad. A CuPy nem fut: statikusan linkeli a CUDA runtime-ot (lásd a korlátoknál).
+
 ### Hasznos környezeti változók
 
 | Változó | Hatás |
@@ -231,6 +247,8 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 ### Korlátok
 
 - Nincs SASS-futtatás: csak PTX-et tartalmazó binárisok futnak.
+- A statikusan linkelt CUDA runtime-ot tartalmazó programok és könyvtárak (CuPy, az NVIDIA NCCL-je) nem futnak: ez a
+  runtime az NVIDIA-driver nem dokumentált belső részeit igényli.
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph és memória-csomópont (stream-rendezett
   foglalás capture alatt) is; feltételes csomópont nincs.
@@ -295,7 +313,7 @@ src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham és Bluestein FFT GLSL-ben), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 GLSL-ben), include/cusparse/cusparse.h
 src/nccl              libnccl.so.2 (kollektívák egy gép rangjai között), include/nccl/nccl.h
-src/nvrtc             LD_AUDIT könyvtár: az NVRTC cubin helyett PTX-et ad (a PyTorch jiteratorához)
+src/nvrtc             LD_AUDIT könyvtár: az NVRTC cubin helyett PTX-et ad (a PyTorch jiteratorához), az nvJitLink cuLink*-kal linkel (Numba)
 tests/                Driver API tesztek + belső Vulkan teszt
 tests/cuda            nvcc-vel fordított Runtime API programok
 tests/cudart_abi      a clean-room runtime típusok ABI-egyezése a hivatalos headerekkel

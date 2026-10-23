@@ -198,6 +198,22 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
   GPU 上用 fp16，CPU 上分别用 fp32 和 fp16。GPU 与 fp32 的偏差不得超过 fp16 本身的偏差
   （ComfyUI 在 GPU 上以 fp16 运行模型，因此完整图像与 CPU 上 fp32 的结果在细节上会有差异）。
 
+### 7. Numba
+
+Numba（`numba-cuda`、`@cuda.jit`）用 libNVVM 把内核编译成 PTX，由 Vulkanizer 运行（`CUDA_HOME` 让它在 conda 环境中找到
+libNVVM）：
+
+```sh
+export MAMBA_ROOT_PREFIX=$PWD/.work/mamba-root CONDA_OVERRIDE_CUDA=12.9
+.work/micromamba/bin/micromamba create -y -p .work/numba-cf -c conda-forge \
+    python=3.13 numba numba-cuda "cuda-version=12.9" cuda-nvvm cuda-nvrtc numpy
+CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
+```
+
+它的链接器是 nvJitLink，原本会生成原生代码：在 `run_torch.sh`（以及 `vulkanizer-run --torch`）下，nvJitLink 的链接调用
+会转到驱动的 `cuLink*`，其链接结果在这里是 PTX；nvJitLink 不报告版本，因此 Numba 生成 PTX 而不是 LTO-IR。CuPy 无法运行：
+它静态链接了 CUDA 运行时（见“限制”）。
+
 ### 常用环境变量
 
 | 变量 | 作用 |
@@ -222,6 +238,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 ### 限制
 
 - 不执行 SASS：只有包含 PTX 的二进制文件才能运行。
+- 静态链接 CUDA 运行时的程序和库（CuPy、NVIDIA 的 NCCL）无法运行：该运行时依赖 NVIDIA 驱动未公开的内部接口。
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
   也支持子图和内存节点（捕获期间的流序分配）；不支持条件节点。
 - （尚）不支持：纹理、cuDNN。
@@ -280,7 +297,7 @@ src/cusolver          libcusolver.so.11/.12，include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL 编写的 Stockham 与 Bluestein FFT），include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL 编写的 SpMV/SpMM/SDDMM/SpSV/csrgeam2），include/cusparse/cusparse.h
 src/nccl              libnccl.so.2（同一台机器各 rank 之间的集合通信），include/nccl/nccl.h
-src/nvrtc             LD_AUDIT 库：让 NVRTC 交出 PTX 而不是 cubin（PyTorch 的 jiterator）
+src/nvrtc             LD_AUDIT 库：让 NVRTC 交出 PTX 而不是 cubin（PyTorch 的 jiterator），nvJitLink 改用 cuLink* 链接（Numba）
 tests/                Driver API 测试 + 内部 Vulkan 测试
 tests/cuda            用 nvcc 编译的 Runtime API 程序
 tests/cudart_abi      clean-room 运行时类型与官方头文件的 ABI 一致性检查

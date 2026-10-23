@@ -204,6 +204,23 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
   GPU では fp16、CPU では fp32 と fp16 で実行します。GPU と fp32 の差は fp16 自体の差を超えてはいけません
   （ComfyUI は GPU でモデルを fp16 で実行するため、完成画像は CPU での fp32 実行と細部が異なります）。
 
+### 7. Numba
+
+Numba（`numba-cuda`、`@cuda.jit`）は libNVVM でカーネルを PTX にコンパイルし、それを Vulkanizer が実行します
+（`CUDA_HOME` で conda 環境内の libNVVM を見つけます）：
+
+```sh
+export MAMBA_ROOT_PREFIX=$PWD/.work/mamba-root CONDA_OVERRIDE_CUDA=12.9
+.work/micromamba/bin/micromamba create -y -p .work/numba-cf -c conda-forge \
+    python=3.13 numba numba-cuda "cuda-version=12.9" cuda-nvvm cuda-nvrtc numpy
+CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
+```
+
+リンカは nvJitLink で、本来はネイティブコードを生成します。`run_torch.sh`（および `vulkanizer-run --torch`）の下では
+nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、そのリンク結果はここでは PTX です。また nvJitLink は
+バージョンを返さないため、Numba は LTO-IR ではなく PTX を生成します。CuPy は動きません：CUDA ランタイムを静的に
+リンクしているためです（制限事項を参照）。
+
 ### 便利な環境変数
 
 | 変数 | 効果 |
@@ -228,6 +245,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 ### 制限事項
 
 - SASS は実行できません。PTX を含むバイナリのみ動作します。
+- CUDA ランタイムを静的にリンクしたプログラムやライブラリ（CuPy、NVIDIA の NCCL）は動きません。そのランタイムは
+  NVIDIA ドライバの非公開の内部機能を必要とします。
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフとメモリノード（キャプチャ中のストリーム順序付き割り当て）にも対応しています。
   条件ノードは未対応です。
@@ -291,7 +310,7 @@ src/cusolver          libcusolver.so.11/.12、include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL による Stockham と Bluestein の FFT）、include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL による SpMV/SpMM/SDDMM/SpSV/csrgeam2）、include/cusparse/cusparse.h
 src/nccl              libnccl.so.2（1 台のマシンのランク間の集合通信）、include/nccl/nccl.h
-src/nvrtc             LD_AUDIT ライブラリ：NVRTC に cubin ではなく PTX を渡させる（PyTorch の jiterator）
+src/nvrtc             LD_AUDIT ライブラリ：NVRTC に cubin ではなく PTX を渡させる（PyTorch の jiterator）、nvJitLink は cuLink* でリンク（Numba）
 tests/                Driver API のテストと内部 Vulkan テスト
 tests/cuda            nvcc でコンパイルした Runtime API のプログラム
 tests/cudart_abi      クリーンルームのランタイム型と公式ヘッダとの ABI 一致チェック

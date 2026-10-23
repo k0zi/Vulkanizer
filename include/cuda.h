@@ -38,6 +38,7 @@ typedef struct CUfunc_st* CUfunction;
 typedef struct CUstream_st* CUstream;
 typedef struct CUevent_st* CUevent;
 typedef struct CUmemPoolHandle_st* CUmemoryPool;
+typedef struct CUkern_st* CUkernel;
 typedef unsigned long long CUmemGenericAllocationHandle_v1;
 typedef CUmemGenericAllocationHandle_v1 CUmemGenericAllocationHandle;
 
@@ -478,7 +479,6 @@ typedef struct CUctxCreateParams_st {
 
 // ---- CUDA graphs and stream capture -----------------------------------------------------------
 typedef void (*CUhostFn)(void* userData);
-typedef struct CUkern_st* CUkernel;
 typedef struct CUgraph_st* CUgraph;
 typedef struct CUgraphNode_st* CUgraphNode;
 typedef struct CUgraphExec_st* CUgraphExec;
@@ -830,6 +830,62 @@ CUresult CUDAAPI cuModuleLoadFatBinary(CUmodule* module, const void* fatCubin);
 CUresult CUDAAPI cuModuleUnload(CUmodule hmod);
 CUresult CUDAAPI cuModuleGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUmodule hmod, const char* name);
 CUresult CUDAAPI cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name);
+
+/* JIT linking: the linked image is PTX (what Vulkanizer loads), not a cubin. */
+typedef struct CUlinkState_st* CUlinkState;
+typedef enum CUjitInputType_enum {
+    CU_JIT_INPUT_CUBIN = 0,
+    CU_JIT_INPUT_PTX = 1,
+    CU_JIT_INPUT_FATBINARY = 2,
+    CU_JIT_INPUT_OBJECT = 3,
+    CU_JIT_INPUT_LIBRARY = 4,
+    CU_JIT_INPUT_NVVM = 5,
+    CU_JIT_NUM_INPUT_TYPES = 6
+} CUjitInputType;
+#define cuLinkCreate cuLinkCreate_v2
+#define cuLinkAddData cuLinkAddData_v2
+#define cuLinkAddFile cuLinkAddFile_v2
+CUresult CUDAAPI cuLinkCreate(unsigned int numOptions, CUjit_option* options, void** optionValues, CUlinkState* stateOut);
+CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type, void* data, size_t size, const char* name,
+                               unsigned int numOptions, CUjit_option* options, void** optionValues);
+CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type, const char* path, unsigned int numOptions,
+                               CUjit_option* options, void** optionValues);
+CUresult CUDAAPI cuLinkComplete(CUlinkState state, void** cubinOut, size_t* sizeOut);
+CUresult CUDAAPI cuLinkDestroy(CUlinkState state);
+
+CUresult CUDAAPI cuModuleGetFunctionCount(unsigned int* count, CUmodule mod);
+CUresult CUDAAPI cuModuleEnumerateFunctions(CUfunction* functions, unsigned int numFunctions, CUmodule mod);
+CUresult CUDAAPI cuFuncGetName(const char** name, CUfunction hfunc);
+CUresult CUDAAPI cuFuncGetModule(CUmodule* hmod, CUfunction hfunc);
+
+/* Libraries: context-independent modules (CUDA 12); a CUkernel may be launched as a CUfunction. */
+typedef struct CUlib_st* CUlibrary;
+typedef enum CUlibraryOption_enum {
+    CU_LIBRARY_HOST_UNIVERSAL_FUNCTION_AND_DATA_TABLE = 0,
+    CU_LIBRARY_BINARY_IS_PRESERVED = 1,
+    CU_LIBRARY_NUM_OPTIONS
+} CUlibraryOption;
+CUresult CUDAAPI cuLibraryLoadData(CUlibrary* library, const void* code, CUjit_option* jitOptions,
+                                   void** jitOptionsValues, unsigned int numJitOptions, CUlibraryOption* libraryOptions,
+                                   void** libraryOptionValues, unsigned int numLibraryOptions);
+CUresult CUDAAPI cuLibraryLoadFromFile(CUlibrary* library, const char* fileName, CUjit_option* jitOptions,
+                                       void** jitOptionsValues, unsigned int numJitOptions,
+                                       CUlibraryOption* libraryOptions, void** libraryOptionValues,
+                                       unsigned int numLibraryOptions);
+CUresult CUDAAPI cuLibraryUnload(CUlibrary library);
+CUresult CUDAAPI cuLibraryGetKernel(CUkernel* pKernel, CUlibrary library, const char* name);
+CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int* count, CUlibrary lib);
+CUresult CUDAAPI cuLibraryEnumerateKernels(CUkernel* kernels, unsigned int numKernels, CUlibrary lib);
+CUresult CUDAAPI cuLibraryGetModule(CUmodule* pMod, CUlibrary library);
+CUresult CUDAAPI cuLibraryGetGlobal(CUdeviceptr* dptr, size_t* bytes, CUlibrary library, const char* name);
+CUresult CUDAAPI cuLibraryGetManaged(CUdeviceptr* dptr, size_t* bytes, CUlibrary library, const char* name);
+CUresult CUDAAPI cuKernelGetFunction(CUfunction* pFunc, CUkernel kernel);
+CUresult CUDAAPI cuKernelGetLibrary(CUlibrary* pLib, CUkernel kernel);
+CUresult CUDAAPI cuKernelGetAttribute(int* pi, CUfunction_attribute attrib, CUkernel kernel, CUdevice dev);
+CUresult CUDAAPI cuKernelSetAttribute(CUfunction_attribute attrib, int val, CUkernel kernel, CUdevice dev);
+CUresult CUDAAPI cuKernelSetCacheConfig(CUkernel kernel, CUfunc_cache config, CUdevice dev);
+CUresult CUDAAPI cuKernelGetName(const char** name, CUkernel hfunc);
+CUresult CUDAAPI cuKernelGetParamInfo(CUkernel kernel, size_t paramIndex, size_t* paramOffset, size_t* paramSize);
 
 CUresult CUDAAPI cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc);
 CUresult CUDAAPI cuFuncGetParamInfo(CUfunction func, size_t paramIndex, size_t* paramOffset, size_t* paramSize);
