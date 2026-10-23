@@ -107,9 +107,9 @@ tools/build_llama.sh                  # clona e compila .work/llama.cpp com o ba
 ./run.sh .work/llama-build/bin/llama-bench -m model.gguf -ngl 99
 ```
 
-`VULKANIZER_FAST_FMA=1` acelera a geração de tokens em GPUs cujo `fma` do Vulkan não é fundido (p. ex. AMD GFX9): por
-padrão, o Vulkanizer emula ali um fma exato; esta opção usa no lugar a versão mais rápida, porém menos precisa, do
-driver. Para LLMs a diferença é desprezível.
+Em GPUs cujo `fma` do Vulkan não é fundido (p. ex. AMD GFX9), o Vulkanizer emula o `fma` de arredondamento único do
+CUDA para código IEEE, mas usa o `fma` rápido do driver para código compilado com fast math (`-ftz`, como o backend CUDA
+do llama.cpp). `VULKANIZER_FAST_FMA=1` usa o rápido em tudo, `VULKANIZER_EXACT_FMA=1` emula em tudo.
 
 ### 4. bitnet.c
 
@@ -210,8 +210,10 @@ Depois abra <http://127.0.0.1:8188>. Os modelos vão em `models/`, como de costu
 | `VULKANIZER_BATCH_MS=<ms>` | Orçamento de tempo de GPU de um envio à fila (padrão 50; `0` = sem limite). Kernels mais longos são divididos para não atingir o timeout de GPU do driver do kernel (amdgpu: 2 s) |
 | `CUDA_LAUNCH_BLOCKING=1` | Cada lançamento de kernel espera a GPU, assim erros e travamentos aparecem no lançamento que os causou |
 | `VULKANIZER_FAST_FMA=1` | `fma` f32 mais rápido e menos preciso |
+| `VULKANIZER_EXACT_FMA=1` | `fma` f32 exato também para código fast math (`.ftz`), mais lento |
 | `VULKANIZER_GEMM_F32=1` | GEMMs do cuBLAS com `COMPUTE_16F` também multiplicam em f32 |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | Local do cache de kernels, ou desativá-lo |
+| `VULKANIZER_CACHE_SIZE=<MiB>` | Limite de tamanho do cache de kernels em MiB (padrão 256); as entradas usadas há mais tempo saem primeiro |
 | `VULKANIZER_CC=86` | A compute capability informada |
 | `VULKANIZER_DUMP=<dir>` | Grava o SPIR-V gerado (`<kernel>.spv`) |
 
@@ -222,7 +224,10 @@ Lista completa: [plan.md, seção 4](plan.md).
 - Sem execução de SASS: só rodam binários que contêm PTX.
 - CUDA Graphs: a captura de streams e a reprodução funcionam (os grafos do llama.cpp, `CUDAGraph` do PyTorch,
   `torch.compile(mode="reduce-overhead")`); sem grafos filhos, nós de memória ou nós condicionais.
-- (Ainda) não suportado: texturas, cuDNN, NCCL, múltiplas GPUs.
+- (Ainda) não suportado: texturas, cuDNN, NCCL, IPC do CUDA.
+- Várias GPUs são dispositivos separados: `cudaMemcpyPeer` copia entre elas pela memória do host, mas um kernel nunca
+  acessa a memória de outra GPU (sem acesso entre pares). Lançamentos cooperativos (`grid.sync()`) funcionam até o
+  número de blocos que cabem ao mesmo tempo na GPU.
 - A memória managed, fixada (pinned) e registrada é memória do host que a GPU usa no lugar, no mesmo endereço;
   a memória managed nunca migra para a GPU (numa GPU integrada é a mesma memória de qualquer forma).
 - Enquanto existir memória do host registrada (`cuMemHostRegister`), cada submissão à GPU fica mais lenta (o kernel

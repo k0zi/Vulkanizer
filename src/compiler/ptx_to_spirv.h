@@ -25,6 +25,7 @@ struct Target {
     bool integerDotProduct = false;  // OpSDot/OpUDot/OpSUDot on packed 4x8-bit vectors
     bool fusedFma = false;           // the driver's Fma rounds once; otherwise f32 fma is emulated:
     bool fmaInF64 = false;           // in f64 (else with f32 TwoProduct/TwoSum)
+    bool exactFtzFma = false;        // .ftz fma is emulated too (else the driver's Fma, see fusedMulAdd)
     bool fusedFma64 = false;         // the same for f64 Fma; otherwise emulated with f64 TwoProduct/TwoSum
 };
 
@@ -39,6 +40,10 @@ struct Target {
 //  - parameter blocks that do not fit: the push constants start with the address of a copy
 //    of the parameter buffer (`paramsInBuffer`)
 //  - device printf: the address of the launch's printf buffer at `printfOffset`
+//  - cooperative groups: the grid workspace address (%envreg2:%envreg1) at `workspaceOffset`, 0 unless
+//    the launch is cooperative
+//  - global addresses: specialization constant 5 = the device's address bits 63..47 (high word),
+//    set on every address (common/device_address.h)
 //  - packable kernels: specialization constant 4 = K blocks per workgroup along x; the
 //    workgroup is (K * blockDim.x, blockDim.y, blockDim.z) and the grid ceil(gridDim.x / K)
 struct KernelBinary {
@@ -51,6 +56,7 @@ struct KernelBinary {
     uint32_t gridOffset = kNone;
     bool paramsInBuffer = false;
     uint32_t printfOffset = kNone;
+    uint32_t workspaceOffset = kNone;
     uint32_t staticSharedBytes = 0;
     uint32_t localBytes = 0;
     // No block-level barrier and no shared memory: several CUDA blocks may share one workgroup.

@@ -69,6 +69,7 @@ typedef enum cudaError_enum {
     CUDA_ERROR_NOT_MAPPED = 211,
     CUDA_ERROR_UNSUPPORTED_LIMIT = 215,
     CUDA_ERROR_CONTEXT_ALREADY_IN_USE = 216,
+    CUDA_ERROR_PEER_ACCESS_UNSUPPORTED = 217,
     CUDA_ERROR_INVALID_PTX = 218,
     CUDA_ERROR_JIT_COMPILER_NOT_FOUND = 221,
     CUDA_ERROR_UNSUPPORTED_PTX_VERSION = 222,
@@ -160,6 +161,7 @@ typedef enum CUdevice_attribute_enum {
     CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED = 99,
     CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED = 102,
     CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED = 103,
+    CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR = 106,
     CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED = 107,
     CU_DEVICE_ATTRIBUTE_READ_ONLY_HOST_REGISTER_SUPPORTED = 113,
     CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED = 115,
@@ -755,6 +757,15 @@ CUresult CUDAAPI cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t
 CUresult CUDAAPI cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
 CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount);
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount, CUstream hStream);
+/* Between contexts of different devices (multi-GPU): copied through host memory. */
+CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice, CUcontext srcContext,
+                              size_t ByteCount);
+CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
+                                   CUcontext srcContext, size_t ByteCount, CUstream hStream);
+/* Kernels never reach another device's memory: separate Vulkan devices share no address space. */
+CUresult CUDAAPI cuDeviceCanAccessPeer(int* canAccessPeer, CUdevice dev, CUdevice peerDev);
+CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int Flags);
+CUresult CUDAAPI cuCtxDisablePeerAccess(CUcontext peerContext);
 CUresult CUDAAPI cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream hStream);
 CUresult CUDAAPI cuMemcpyDtoHAsync(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
 CUresult CUDAAPI cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream hStream);
@@ -850,6 +861,23 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f,
                                 unsigned int sharedMemBytes, CUstream hStream,
                                 void** kernelParams, void** extra);
 CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra);
+
+/* Cooperative launches: all blocks resident at once, grid-wide synchronization. */
+typedef struct CUDA_LAUNCH_PARAMS_st {
+    CUfunction function;
+    unsigned int gridDimX, gridDimY, gridDimZ;
+    unsigned int blockDimX, blockDimY, blockDimZ;
+    unsigned int sharedMemBytes;
+    CUstream hStream;
+    void** kernelParams;
+} CUDA_LAUNCH_PARAMS_v1;
+typedef CUDA_LAUNCH_PARAMS_v1 CUDA_LAUNCH_PARAMS;
+CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                                           unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
+                                           unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
+                                           void** kernelParams);
+CUresult CUDAAPI cuLaunchCooperativeKernelMultiDevice(CUDA_LAUNCH_PARAMS* launchParamsList, unsigned int numDevices,
+                                                      unsigned int flags);
 
 /* ------------------------------------------------------------------------ */
 /* Streams and events                                                       */

@@ -25,6 +25,9 @@ struct PhysicalDeviceInfo {
     uint8_t uuid[VK_UUID_SIZE]{};
     uint32_t computeQueueFamily = 0;
     bool computeQueueSparse = false;  // the compute queue family supports sparse binding
+    uint32_t computeUnits = 0;        // active compute units (VK_AMD_shader_core_properties2); 0: unknown
+    bool hasPciInfo = false;          // VK_EXT_pci_bus_info
+    uint32_t pciDomain = 0, pciBus = 0, pciDevice = 0;
 
     bool isCpu() const { return props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU; }
     const char* name() const { return props.deviceName; }

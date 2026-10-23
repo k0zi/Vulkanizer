@@ -235,6 +235,7 @@ compiler::Target targetFor(const DeviceSlot& slot) {
     t.integerDotProduct = f.integerDotProduct;
     t.fusedFma = f.fusedFma || envFlag("VULKANIZER_FAST_FMA");
     t.fmaInF64 = envFlag("VULKANIZER_FMA_F64");
+    t.exactFtzFma = envFlag("VULKANIZER_EXACT_FMA");
     t.fusedFma64 = f.fusedFma64 || envFlag("VULKANIZER_FAST_FMA");
     return t;
 }
@@ -273,7 +274,7 @@ CUresult packParams(const ptx::Entry& e, void** kernelParams, void** extra, std:
 
 // The launch proper, with the parameters packed (packParams): cuLaunchKernel and graph replay.
 CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const unsigned block[3],
-                      unsigned sharedMemBytes, const std::vector<uint8_t>& params) {
+                      unsigned sharedMemBytes, const std::vector<uint8_t>& params, bool cooperative) {
     const ptx::Entry& e = *f->entry;
     const VkPhysicalDeviceLimits& lim = s.slot->info->props.limits;
     const unsigned gridDimX = grid[0], gridDimY = grid[1], gridDimZ = grid[2];
@@ -288,6 +289,17 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
         VULKANIZER_ERROR("'%s': %u static + %u dynamic bytes of shared memory exceed the device limit (%u)", e.name.c_str(),
                     f->binary.staticSharedBytes, sharedMemBytes, lim.maxComputeSharedMemorySize);
         return CUDA_ERROR_INVALID_VALUE;
+    }
+    if (cooperative) {
+        // grid.sync() waits for every block, so all of them must be resident at once.
+        int perSm = 0, sms = 0;
+        if (CUresult r = cuOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, f, int(blockDimX * blockDimY * blockDimZ),
+                                                                     sharedMemBytes))
+            return r;
+        if (CUresult r = cuDeviceGetAttribute(&sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, f->module->ctx->device))
+            return r;
+        if (uint64_t(gridDimX) * gridDimY * gridDimZ > uint64_t(perSm) * uint64_t(sms))
+            return CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE;
     }
     std::vector<uint8_t> push(f->binary.pushConstantSize, 0);
     if (f->binary.paramsInBuffer) {
@@ -312,13 +324,29 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
         std::memcpy(push.data() + f->binary.printfOffset, &s.slot->printfBuffer.address, sizeof(VkDeviceAddress));
     }
 
+    // The grid workspace of cooperative groups (0 for other launches, as with CUDA: grid_group's
+    // is_valid() is false there). One per device: launches run one after the other, and every
+    // grid.sync() adds 0x80000000 to the barrier word in all, so it never needs resetting.
+    if (f->binary.workspaceOffset != compiler::KernelBinary::kNone) {
+        CUdeviceptr workspace = 0;
+        if (cooperative) {
+            if (!s.slot->gridWorkspace.buffer) {
+                if (VkResult vr = s.dev->allocateBuffer(16, s.slot->gridWorkspace)) return toCuResult(vr);
+                const uint32_t init[4] = {16, 0, 0, 0};  // wsSize, barrier
+                if (VkResult vr = s.dev->write(s.slot->gridWorkspace, 0, init, sizeof init)) return toCuResult(vr);
+            }
+            workspace = s.slot->gridWorkspace.address;
+        }
+        std::memcpy(push.data() + f->binary.workspaceOffset, &workspace, sizeof workspace);
+    }
+
     // Small blocks of a packable kernel share a workgroup (up to kPackThreads threads): fuller
     // waves, and more of them resident than the per-CU workgroup limit would allow. Only whole
     // warps are packed, so CUDA warps stay aligned to the hardware's.
     constexpr uint32_t kPackThreads = 256;
     const uint32_t threads = blockDimX * blockDimY * blockDimZ;
     uint32_t pack = 1;
-    if (f->binary.packable && blockDimX % 32 == 0 && threads < kPackThreads && gridDimX > 1 && !envFlag("VULKANIZER_NO_PACK")) {
+    if (f->binary.packable && !cooperative && blockDimX % 32 == 0 && threads < kPackThreads && gridDimX > 1 && !envFlag("VULKANIZER_NO_PACK")) {
         pack = std::min<uint32_t>(kPackThreads / threads, gridDimX);
         pack = std::min(pack, lim.maxComputeWorkGroupSize[0] / blockDimX);
         pack = std::min(pack, lim.maxComputeWorkGroupInvocations / threads);
@@ -341,7 +369,7 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
     const bool buffered = f->binary.paramsInBuffer;
     const VkResult vr = s.dev->dispatch(it->second, (gridDimX + pack - 1) / pack, gridDimY, gridDimZ, push.data(),
                                         static_cast<uint32_t>(push.size()), f->entry->name.c_str(),
-                                        buffered ? params.data() : nullptr, buffered ? params.size() : 0);
+                                        buffered ? params.data() : nullptr, buffered ? params.size() : 0, cooperative);
     if (vr == VK_SUCCESS && printf) flushDevicePrintf(*s.slot, *f->module);  // read() waits for the kernel
     return toCuResult(vr);
 }
@@ -532,10 +560,10 @@ CUresult CUDAAPI cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunc
     return CUDA_SUCCESS;
 }
 
-CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
-                                unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
-                                unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
-    VULKANIZER_TRACE_API();
+static CUresult launchEntry(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                            unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                            unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra,
+                            bool cooperative) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     if (!validHandle(f)) return CUDA_ERROR_INVALID_HANDLE;
@@ -566,25 +594,59 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned in
         std::copy(block, block + 3, node->block);
         node->sharedMem = sharedMemBytes;
         node->params = std::move(params);
+        node->cooperative = cooperative;
         return captureNode(cs, std::move(node));
     }
-    return launchKernel(s, f, grid, block, sharedMemBytes, params);
+    return launchKernel(s, f, grid, block, sharedMemBytes, params, cooperative);
+}
+
+CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
+                                unsigned int blockDimX, unsigned int blockDimY, unsigned int blockDimZ,
+                                unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
+    VULKANIZER_TRACE_API();
+    return launchEntry(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream,
+                       kernelParams, extra, false);
+}
+
+// Grid-wide synchronization (cooperative groups): every block must be resident at once, which
+// the launch checks against the occupancy (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE).
+CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                                           unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
+                                           unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
+                                           void** kernelParams) {
+    VULKANIZER_TRACE_API();
+    return launchEntry(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream,
+                       kernelParams, nullptr, true);
+}
+
+CUresult CUDAAPI cuLaunchCooperativeKernel_ptsz(CUfunction f, unsigned int gridDimX, unsigned int gridDimY,
+                                                unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
+                                                unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
+                                                void** kernelParams) {
+    return cuLaunchCooperativeKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes,
+                                     hStream, kernelParams);
+}
+
+// Launches across several devices (deprecated since CUDA 11.3): one device per context here.
+CUresult CUDAAPI cuLaunchCooperativeKernelMultiDevice(CUDA_LAUNCH_PARAMS*, unsigned int, unsigned int) {
+    VULKANIZER_TRACE_API();
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
     VULKANIZER_TRACE_API();
     if (!config || (config->numAttrs && !config->attrs)) return CUDA_ERROR_INVALID_VALUE;
+    bool cooperative = false;
     for (unsigned int i = 0; i < config->numAttrs; ++i) {
         const CUlaunchAttribute& a = config->attrs[i];
         if (a.id == CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION &&
             uint64_t(a.value.clusterDim.x) * a.value.clusterDim.y * a.value.clusterDim.z > 1)
             return CUDA_ERROR_NOT_SUPPORTED;  // thread block clusters (sm_90)
-        if (a.id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE && a.value.cooperative)
-            VULKANIZER_WARN_ONCE("cuLaunchKernelEx: cooperative launches run without grid-wide synchronization");
+        if (a.id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE) cooperative = a.value.cooperative != 0;
         // Everything else is a scheduling hint, or ordering that the single queue gives anyway.
     }
-    return cuLaunchKernel(f, config->gridDimX, config->gridDimY, config->gridDimZ, config->blockDimX, config->blockDimY,
-                          config->blockDimZ, config->sharedMemBytes, config->hStream, kernelParams, extra);
+    return launchEntry(f, config->gridDimX, config->gridDimY, config->gridDimZ, config->blockDimX, config->blockDimY,
+                       config->blockDimZ, config->sharedMemBytes, config->hStream, kernelParams, extra, cooperative);
 }
 
 CUresult CUDAAPI cuLaunchKernelEx_ptsz(const CUlaunchConfig* config, CUfunction f, void** kernelParams, void** extra) {
@@ -616,20 +678,21 @@ CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config) {
     return validHandle(hfunc) ? CUDA_SUCCESS : CUDA_ERROR_INVALID_HANDLE;
 }
 
-// Resident blocks per multiprocessor by threads and shared memory, as the runtime computes it.
+// Resident blocks per multiprocessor by threads and shared memory (the runtime's occupancy
+// functions use this too). Cooperative launches are limited by it.
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int* numBlocks, CUfunction func, int blockSize,
                                                                       size_t dynamicSMemSize, unsigned int flags) {
     VULKANIZER_TRACE_API();
     if (!numBlocks || blockSize <= 0) return CUDA_ERROR_INVALID_VALUE;
     if (!validHandle(func)) return CUDA_ERROR_INVALID_HANDLE;
-    int threadsPerSm = 0, smemPerSm = 0, staticSmem = 0;
+    int threadsPerSm = 0, blocksPerSm = 0, smemPerSm = 0, staticSmem = 0;
     const CUdevice dev = func->module->ctx->device;
     if (CUresult r = cuDeviceGetAttribute(&threadsPerSm, CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev)) return r;
+    if (CUresult r = cuDeviceGetAttribute(&blocksPerSm, CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR, dev)) return r;
     if (CUresult r = cuDeviceGetAttribute(&smemPerSm, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, dev))
         return r;
     if (CUresult r = cuFuncGetAttribute(&staticSmem, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func)) return r;
-    constexpr int kBlocksPerSm = 32;
-    int n = std::min(threadsPerSm / blockSize, kBlocksPerSm);
+    int n = std::min(threadsPerSm / blockSize, blocksPerSm);
     if (const size_t smem = size_t(staticSmem) + dynamicSMemSize) n = std::min<int>(n, int(size_t(smemPerSm) / smem));
     *numBlocks = std::max(n, 0);
     return CUDA_SUCCESS;

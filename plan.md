@@ -50,17 +50,19 @@ Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben 
 ### Állapot (2026-10-22)
 
 Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs)
-az 5.4 (teljesítmény) és az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
+az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`) és az 5.6-ból a cooperative
+groups és a több GPU alapjai. Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
 Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
 
 Hátra, javasolt sorrendben:
-1. **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
+1. **5.7** llama.cpp tg a natívhoz közel (folyamatban).
 2. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
 3. **4.2** További könyvtárak (`libcurand`, `libcufft`, `libcusparse`, `libcusolver`) – ha egy célalkalmazás kéri.
 4. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
-5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
-6. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
-   queue (5.4); a kernel cache-nek nincs méretkorlátja (a régi build-ID-k bejegyzései megmaradnak, 3.10).
+5. **5.6** maradéka: IPC (`cudaIpc*`, a PyTorch multiprocessing tenzor-megosztásához), NCCL, eszközök közti UVA.
+6. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
+7. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
+   queue (5.4).
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -159,7 +161,8 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - [x] **3.9** Ha a paraméter-buffer nem fér el a push constantban: batch-enkénti feltöltési aréna, a push constantban csak a cím megy át. Dinamikus `ld.param` is működik.
 - [x] **3.10** Kernel cache lemezen (`src/driver/kernel_cache.cpp`): a lefordított SPIR-V és metaadatai a
   `~/.cache/vulkanizer/kernels` alatt, kulcs: a libcuda build-ID-je + a PTX modul hash-e + kernelnév + target-jellemzők
-  (`VULKANIZER_CACHE_DIR=<dir>|off`). A pipeline-okat a Mesa saját shader cache-e tárolja.
+  (`VULKANIZER_CACHE_DIR=<dir>|off`). A pipeline-okat a Mesa saját shader cache-e tárolja. Méretkorlát LRU-val
+  (`VULKANIZER_CACHE_SIZE`, alap 256 MiB): a korábbi buildek bejegyzései így kikerülnek.
 - [x] **3.11 Teszt korpusz** (`tests/cuda/rt_kernels.cu`, CPU referenciával): reduction, tiled matmul, histogram, atomics, warp-műveletek, változók és generikus pointerek, math, bitműveletek, half, device függvényhívások, launch limitek. Plusz `rt_printf`.
 - [x] **3.12** Device oldali `printf` (launch-onkénti buffer, host oldali formázás).
 - [x] **3.13 Korán kilépő szálak és `__syncthreads`**
@@ -216,7 +219,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     A sorok számát a llama.cpp fordítási időben, architektúra szerint választja (a GCN-táblát csak HIP-buildben),
     ezt a Vulkanizer a forrás módosítása nélkül nem tudja befolyásolni.
   - Kipróbálva és elvetve: kétszeres ciklus-unroll a fordítóban (több betöltés repül egyszerre; mmvq-n 2%,
-    tg-ben zajon belül); `VULKANIZER_FAST_FMA` (mmvq-n 1%).
+    tg-ben zajon belül). (A `VULKANIZER_FAST_FMA` itt mért „1%”-a tévesnek bizonyult, lásd 5.7.)
   - Nyitva, de nem a Vulkanizer szűk keresztmetszete: a flash attention tile kernel pp-ben lassú (tensor core
     nélkül), ezért alapból ki van kapcsolva; a `cpy_q_f32` (q4_0 → f32) 3,4× lassabb a natívnál (szálanként egy
     blokk, 128 bájtos lépésközű írások), de inferenciában nem fut.
@@ -369,6 +372,23 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - Hátra (halasztva): külön transfer queue a másolásoknak. A másolások már most sem blokkolnak (a compute queue-n,
     sorban futnak); a külön queue a kernelekkel való átfedést hozná, integrált GPU-n (közös memória-sávszélesség)
     kevés haszonnal.
+- [ ] **5.7** llama.cpp tokengenerálás (tg) a natív Vulkan backendhez közel.
+  - Kiinduló helyzet (2026-10-23, TinyLlama Q4_0, Renoir, felváltva mérve): Vulkanizer tg64 ~31 t/s, natív ~60–65.
+    A gép teljesítményállapota (memóriaórajel) futásról futásra 20%-ot is mozdít: csak felváltott A/B mérés számít.
+  - [x] `.ftz` fma natívan: a ggml-cuda `--use_fast_math`-tal fordul, a forró `fma.rn.ftz.f32` utasításokra nem kell
+    a ~30 utasításos egyszeri-kerekítés emuláció (az a RADV GFX9 unfused `Fma`-ja miatt kell; a `DenormPreserve`
+    sem ad fused fma-t, a driver szétbontja). A nem-ftz fma marad emulált (a matematikai könyvtárak hibamentes
+    transzformációi); f16 fma mindig natív (két f16 szorzata f32-ben pontos). `VULKANIZER_EXACT_FMA=1` a régi
+    viselkedés. tg64 31 → 37,7 t/s (+21%), a szöveg azonos.
+  - Elemzés (`VULKANIZER_PIPELINE_STATS=1`: VGPR, SGPR, spill, wave/SIMD pipeline-onként): a Q4_0 mmvq nem
+    sávszélesség-, hanem utasításkiadás-korlátos. K = 2048-nál egy 128 szálas workgroup egy sort számol egyetlen
+    iterációban (~500 utasítás/szál); tokenenként ~264 ezer sor ≈ 280 millió wave-utasítás ≈ 20 ms a Vega 8-on.
+    Occupancy rendben (6–7 wave/SIMD, nincs spill). A kód nagyobb tételei: 64 bites címszámítás (~55 utasítás,
+    `v_add_co/addc` párok, minden betöltéshez külön), dp4a emuláció (~12 utasítás/dp4a, nincs hardveres dot4).
+  - Kipróbálva, nem segít: `shfl.bfly` → `OpGroupNonUniformShuffleXor` (az ACO már swizzle-t ad).
+  - Hátra: a címszámítás 32 bites offsetre + skalár bázisra (`global_load v, voffset, s[base]`), olcsóbb dp4a;
+    a KV-cache másolás (`cpy_scalar` f16, 5004 utasítás, ~1 ms/token: a 64 bites div/rem gyors útja mellett a
+    lassú út is beinline-olódik).
 - [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
   - [x] Install és csomagok (`cmake/install.cmake`, `tools/package.sh [--check]`): CPack `.deb` (függőségek
     `dpkg-shlibdeps`-ből: libvulkan1, libstdc++; ajánlott: mesa-vulkan-drivers) és `.tar.gz`. A könyvtárak a
@@ -383,6 +403,36 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - [x] Dokumentáció: README „Telepítés (csomag)” szakasz mind a 8 nyelven.
   - [ ] Jogi átnézés publikálás előtt (nem fejlesztési feladat).
 - [ ] **5.6** Cooperative groups (grid-szintű szinkronizálás), multi-GPU, NCCL, IPC.
+  - [x] Cooperative groups (`grid.sync()`, `rt_kernels cooperative`, CUDA 12 és 13): `cuLaunchCooperativeKernel`
+    (`_ptsz`), `cuLaunchKernelEx`/`cudaLaunchKernelEx` cooperative attribútuma, `cudaLaunchCooperativeKernel`,
+    graph-csomópontként is. A toolkit fejléce a grid workspace címét a `%envreg1`/`%envreg2` regiszterekből olvassa: a
+    fordító ezeket egy push-constant mezőből adja (`KernelBinary::workspaceOffset`), a driver kooperatív indításnál
+    egy eszközönkénti workspace címét írja bele, máskor 0-t (`is_valid()` hamis, mint a CUDA-ban).
+    - Minden blokknak egyszerre rezidensnek kell lennie: a grid legfeljebb occupancy × SM-szám, különben
+      `CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`; a dispatch nem darabolódik (`Device::dispatch(..., whole)`) és nem
+      csomagolódik. Az SM-szám AMD-n a valós CU-szám (`VK_AMD_shader_core_properties2`), a runtime occupancy-függvényei
+      a driverét hívják (`MAX_BLOCKS_PER_MULTIPROCESSOR` = 32, llvmpipe-on 1: szálanként egy workgroup fut).
+    - A PTX memóriarendezése: az `ld/st/atom/red` `.acquire`/`.release`/`.acq_rel` minősítője az utasítás köré tett,
+      hatókörének megfelelő fence (eddig elveszett: az `atom.add.release.gpu` relaxed volt). A grid workspace-t használó
+      kernelekben a `bar.sync` device-hatókörű, és a globális elérések Volatile-ok: a blokk többi wave-jének store-jai
+      így érnek a GPU szintjére, és a más blokkok által írt adatot nem a driver korábbi loadjaiból olvassa vissza.
+    - Korlát: a rezidencia becslés; egy sok regisztert használó kernelből kevesebb fér el egy CU-n, a túl nagy grid
+      ilyenkor holtpontra jut (GPU-n timeout → device lost, llvmpipe-on végtelen várakozás).
+  - [x] Több GPU (`rt_kernels multigpu`, `VULKANIZER_ALLOW_CPU=1`-gyel RADV + llvmpipe): `cuMemcpyPeer(Async)`,
+    `cudaMemcpyPeer(Async)` eszközök között host-memórián át; másik eszköz eventjére váró stream (`cuStreamWaitEvent`) a
+    hoston vár; `cuDeviceCanAccessPeer` = 0, `cuCtxEnablePeerAccess` → `PEER_ACCESS_UNSUPPORTED` (külön Vulkan
+    device-ok nem osztoznak memórián); valós PCI-cím (`VK_EXT_pci_bus_info`), különben az eszközindex.
+    - Közben javítva: az llvmpipe-on minden nvcc-teszt segfaultolt az 5.2 óta (a kernelek a 0xFFFF8000 felső biteket
+      OR-olták az llvmpipe CPU-pointereire). A felső bitek most eszközönként a tényleges BDA-ból jönnek
+      (`Device::hostAddressBits()`), és minden pipeline az 5-ös specializációs konstansként kapja meg. Emulált warpokon
+      (subgroup < 32) a predikált `redux`/`shfl` stb. minden szálon fut (a barrierek nem lehetnek divergens ágban), a
+      predikátum csak a célregisztert választja.
+    - Hátra: eszközök közti UVA (`cudaMemcpyDefault` két eszköz pointerével: a keresés a current context eszközén
+      belül történik), NCCL, IPC.
+    - llama.cpp két eszközön (RADV + llvmpipe) eljut a rétegek szétosztásáig és a peer másolásig, de az llvmpipe-on a
+      `rope_norm` kernel (blockDim.x = 1) összeomlik: az llvmpipe a `set_rows_stride != 0` feltétel mögötti
+      `row_indices[i]` loadot a feltétel elé emeli (Volatile-lal is), és a null pointerből olvas. A Vulkanizer a loadot a
+      feltételen belül adja (Mesa-oldali viselkedés); RADV-n ugyanez nem fordul elő.
 
 ## 3. Ismert korlátok / kockázatok
 
@@ -396,9 +446,11 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 - **Device-címek**: a RADV a buffereket a 48 bites címtér felső felébe teszi (0xffff8...), ami int64-ként negatív
   (a PyTorch CUDA graph tree-je, `ctypes` ettől elbukik). A Vulkanizer ezért a bitek 63..48 nélkül adja ki a címeket
   (`vk::kAddressMask`, 0x8000... alakúak, pozitívak), a kernelek pedig minden elérés előtt visszaállítják a felső
-  biteket (a PTX-fordító a báziscímen, egyetlen 32 bites OR-ral 0xFFFF8000-val; a GLSL shaderek `canon()`-nal), így a
+  biteket (a PTX-fordító a báziscímen, egyetlen 32 bites OR-ral a device felső bitjeivel – RADV-n 0xFFFF8000,
+  llvmpipe-on 0, az 5-ös specializációs konstans; a GLSL shaderek `canon()`-nal), így a
   host-memória h címe is érvényes device-cím (lásd 5.2). Mérhető ára nincs.
-- **UVA**: több Vulkan device címtere ütközhet; jelenleg a pointer-keresés a current context device-án belül történik.
+- **UVA**: több Vulkan device címtere ütközhet; a pointer-keresés a current context device-án belül történik
+  (eszközök között `cudaMemcpyPeer` működik, a `cudaMemcpyDefault` két eszköz pointerével nem).
 - **Regisztrált host-memória** (`cuMemHostRegister`): amíg él, minden GPU-submit lassabb (a kernel minden submitnál
   újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát ez nem érinti.
 - **libcudart privát export table-jei** (`cuGetExportTable`) nem dokumentáltak, CUDA verziónként változhatnak → verzió-specifikus kezelés, sok trace-elés.
@@ -410,17 +462,21 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
 |---|---|
 | `VULKANIZER_LOG` | `off`/`error`/`warn` (default)/`info`/`debug`/`trace` – `trace` minden API hívást logol |
 | `VULKANIZER_DEVICE` | Device név részlet (case-insensitive), pl. `radv`, `llvmpipe` |
-| `VULKANIZER_ALLOW_CPU` | `1` = CPU Vulkan device-ok (llvmpipe) is látszanak |
+| `VULKANIZER_ALLOW_CPU` | `1` = CPU Vulkan device-ok (llvmpipe) is látszanak (több GPU kipróbálásához is) |
+| `VULKANIZER_SM_COUNT` | Jelentett multiprocessor-szám (alap: AMD-n a valós CU-szám, máshol 8; CPU-n a szálak száma) |
 | `VULKANIZER_VALIDATION` | `1` = Vulkan validation layer bekapcsolása |
 | `VULKANIZER_CC` | Jelentett compute capability, pl. `75`, `86` |
 | `VULKANIZER_SPIRV_VAL` | `1` = minden generált SPIR-V `spirv-val`-on megy át (hibás modul → a kernel nem indítható) |
 | `VULKANIZER_DUMP` | Könyvtár, ahova a generált SPIR-V (`<kernel>.spv`) és a modulok PTX-e (`<hash>.ptx`) kiíródik |
 | `VULKANIZER_CACHE_DIR` | Kernel cache helye (alap: `$XDG_CACHE_HOME/vulkanizer`, `~/.cache/vulkanizer`); `off` kikapcsolja |
+| `VULKANIZER_CACHE_SIZE` | A kernel cache méretkorlátja MiB-ban (alap: 256). Fölötte a legrégebben használt bejegyzések törlődnek a korlát 3/4-éig (találatkor a fájl mtime-ja frissül; processzenként egyszer, az első új kernel tárolásakor) |
 | `VULKANIZER_EAGER` | `1` = a nagy modulok kerneleit is betöltéskor fordítja (alapból csak a ≤16 kerneleseket) |
 | `VULKANIZER_PROFILE` | `1` = kilépéskor kiírja a kernelenkénti GPU-időt és az API-hívásonkénti host-időt |
 | `VULKANIZER_BATCH_MS` | Egy submit becsült GPU-ideje legfeljebb ennyi ms (alap: 50); a hosszabb dispatch több submitra bomlik. Az amdgpu 2 s után reseteli a GPU-t. `0` = nincs korlát |
 | `CUDA_LAUNCH_BLOCKING` | `1` = minden kernelindítás megvárja a GPU-t (hiba/lefagyás az okozó indításnál jelentkezik) |
 | `VULKANIZER_FAST_FMA` | `1` = az f32 `fma` a driver natív (esetleg nem fused) `Fma`-ja, ott is, ahol a próba szerint nem fused (gyorsabb, kevésbé pontos) |
+| `VULKANIZER_EXACT_FMA` | `1` = a `.ftz` (fast math) f32 `fma` is emulált egyszeri kerekítéssel (alapból ott a driver `Fma`-ja fut) |
+| `VULKANIZER_PIPELINE_STATS` | `1` = minden pipeline létrehozásakor kiírja a driver statisztikáit (VGPR, SGPR, spill, wave/SIMD, utasítások) |
 | `VULKANIZER_FMA_F64` | `1` = a nem fused eszközön az f32 `fma` f64-ben számolódik (alapból f32 TwoProduct/TwoSum emuláció) |
 | `VULKANIZER_NO_VMM` | `1` = nincs sparse binding, így nincs CUDA VMM (`cuMemAddressReserve` stb. `NOT_SUPPORTED`) |
 | `VULKANIZER_NO_SUBALLOC` | `1` = minden `cuMemAlloc` külön Vulkan-memóriát kap (nincs sub-allokátor) |

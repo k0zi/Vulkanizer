@@ -89,6 +89,9 @@ static const ErrorInfo kErrors[] = {
     {CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED, "CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED",
      "pointer does not correspond to a registered memory region"},
     {CUDA_ERROR_LAUNCH_FAILED, "CUDA_ERROR_LAUNCH_FAILED", "unspecified launch failure"},
+    {CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "CUDA_ERROR_PEER_ACCESS_UNSUPPORTED", "peer access is not supported between these two devices"},
+    {CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE, "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE",
+     "too many blocks in cooperative launch"},
     {CUDA_ERROR_NOT_PERMITTED, "CUDA_ERROR_NOT_PERMITTED", "operation not permitted"},
     {CUDA_ERROR_NOT_SUPPORTED, "CUDA_ERROR_NOT_SUPPORTED", "operation not supported"},
     {CUDA_ERROR_UNKNOWN, "CUDA_ERROR_UNKNOWN", "unknown error"},
@@ -318,11 +321,14 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
         case CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE: *pi = 4 * 1024 * 1024; break;
         case CU_DEVICE_ATTRIBUTE_TEXTURE_ALIGNMENT: *pi = 512; break;
         case CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT:
-            // TODO: VK_AMD_shader_core_properties / VK_ARM_shader_core_builtins give real numbers.
+            // Compute units where the driver reports them (AMD); cooperative launches are sized by it.
             if (const char* env = std::getenv("VULKANIZER_SM_COUNT"); env && std::atoi(env) > 0) *pi = std::atoi(env);
+            else if (info.computeUnits) *pi = int(info.computeUnits);
             else *pi = info.isCpu() ? static_cast<int>(std::max(1u, std::thread::hardware_concurrency())) : 8;
             break;
         case CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR: *pi = 2048; break;
+        // llvmpipe runs one workgroup per thread at a time (cooperative launches rely on residency)
+        case CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR: *pi = info.isCpu() ? 1 : 32; break;
         case CU_DEVICE_ATTRIBUTE_INTEGRATED:
             *pi = info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || info.isCpu();
             break;
@@ -359,13 +365,15 @@ CUresult CUDAAPI cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevi
         case CU_DEVICE_ATTRIBUTE_COMPUTE_MODE:
         case CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS:
         case CU_DEVICE_ATTRIBUTE_ECC_ENABLED:
-        case CU_DEVICE_ATTRIBUTE_PCI_BUS_ID:
-        case CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID:
-        case CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID:
         case CU_DEVICE_ATTRIBUTE_TCC_DRIVER:
         case CU_DEVICE_ATTRIBUTE_STREAM_PRIORITIES_SUPPORTED:
-        case CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD:
-        case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: *pi = 0; break;
+        case CU_DEVICE_ATTRIBUTE_MULTI_GPU_BOARD: *pi = 0; break;
+        // The PCI address where the driver tells it (VK_EXT_pci_bus_info); otherwise the device
+        // index as the bus number, so that devices stay distinct (multi-GPU programs key on it).
+        case CU_DEVICE_ATTRIBUTE_PCI_BUS_ID: *pi = info.hasPciInfo ? int(info.pciBus) : dev; break;
+        case CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: *pi = info.hasPciInfo ? int(info.pciDevice) : 0; break;
+        case CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: *pi = info.hasPciInfo ? int(info.pciDomain) : 0; break;
+        case CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH: *pi = 1; break;  // grid.sync() (cuLaunchCooperativeKernel)
         default:
             if (attrib <= 0 || attrib > 150) return CUDA_ERROR_INVALID_VALUE;
             VULKANIZER_INFO("cuDeviceGetAttribute: attribute %d not modeled, reporting 0", static_cast<int>(attrib));

@@ -107,9 +107,9 @@ tools/build_llama.sh                  # clones and builds .work/llama.cpp with t
 ./run.sh .work/llama-build/bin/llama-bench -m model.gguf -ngl 99
 ```
 
-`VULKANIZER_FAST_FMA=1` speeds up token generation on GPUs where Vulkan `fma` is not fused (e.g. AMD GFX9):
-by default Vulkanizer emulates an exact fma there; this switch uses the driver's faster but less precise
-version instead. For LLMs the difference is negligible.
+On GPUs where Vulkan `fma` is not fused (e.g. AMD GFX9), Vulkanizer emulates CUDA's single-rounding `fma`
+for IEEE code, but uses the driver's fast `fma` for code built with fast math (`-ftz`, such as llama.cpp's CUDA backend).
+`VULKANIZER_FAST_FMA=1` uses the fast one everywhere, `VULKANIZER_EXACT_FMA=1` emulates it everywhere.
 
 ### 4. bitnet.c
 
@@ -210,8 +210,10 @@ Then open <http://127.0.0.1:8188>. Models go into `models/` as usual. Notes:
 | `VULKANIZER_BATCH_MS=<ms>` | GPU time budget of one queue submission (default 50; `0` = no limit). Longer kernels are split, so the kernel driver's GPU timeout (amdgpu: 2 s) is not hit |
 | `CUDA_LAUNCH_BLOCKING=1` | Every kernel launch waits for the GPU, so errors and hangs show at the launch that caused them |
 | `VULKANIZER_FAST_FMA=1` | Faster, less precise f32 `fma` |
+| `VULKANIZER_EXACT_FMA=1` | Exact f32 `fma` for fast-math (`.ftz`) code too (slower) |
 | `VULKANIZER_GEMM_F32=1` | cuBLAS `COMPUTE_16F` GEMMs also run with f32 multiplication |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | Location of the kernel cache, or disable it |
+| `VULKANIZER_CACHE_SIZE=<MiB>` | Kernel cache size limit in MiB (default 256); the least recently used entries go first |
 | `VULKANIZER_CC=86` | The reported compute capability |
 | `VULKANIZER_DUMP=<dir>` | Dump the generated SPIR-V (`<kernel>.spv`) |
 
@@ -222,7 +224,10 @@ Full list: [plan.md, section 4](plan.md).
 - No SASS execution: only binaries containing PTX run.
 - CUDA Graphs: stream capture and replay work (llama.cpp's graphs, PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); no child graphs, memory nodes or conditional nodes.
-- Not (yet) supported: textures, cuDNN, NCCL, multi-GPU.
+- Not (yet) supported: textures, cuDNN, NCCL, CUDA IPC.
+- Several GPUs are separate devices: `cudaMemcpyPeer` copies between them through host memory, but a kernel never
+  reaches another GPU's memory (no peer access). Cooperative launches (`grid.sync()`) work up to the number of blocks
+  that fit on the GPU at once.
 - Managed, pinned and registered memory are host memory the GPU uses in place at the same address; managed memory
   never migrates to the GPU (on an integrated GPU it is the same memory anyway).
 - While registered host memory (`cuMemHostRegister`) exists, every GPU submission is slower (the kernel revalidates

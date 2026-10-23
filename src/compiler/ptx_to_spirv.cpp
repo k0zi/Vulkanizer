@@ -88,6 +88,7 @@ public:
         out.gridOffset = usesGrid_ ? gridOffset_ : KernelBinary::kNone;
         out.paramsInBuffer = paramsInBuffer_;
         out.printfOffset = usesPrintf_ ? printfOffset_ : KernelBinary::kNone;
+        out.workspaceOffset = usesWorkspace_ ? workspaceOffset_ : KernelBinary::kNone;
         out.staticSharedBytes = sharedStatic_;
         out.localBytes = localBytes_;
         out.packable = packable_;
@@ -349,7 +350,10 @@ private:
                                         {b_.op(spv::OpIMul, tU32(), {blockDim_[0], blockDim_[1]}), blockDim_[2]});
             v = b_.op(spv::OpShiftRightLogical, tU32(), {b_.op(spv::OpIAdd, tU32(), {size, cU32(31)}), cU32(5)});
         } else if (n == "%warpsz") v = cU32(32);
-        else if (n.starts_with("%envreg")) v = cU32(0);  // driver-defined environment, unused here
+        // The driver's environment: %envreg2:%envreg1 (low:high) is the grid workspace of cooperative
+        // launches (cooperative groups' grid.sync()); the others are not used.
+        else if (n == "%envreg1" || n == "%envreg2") v = pushWord(workspaceOffset_ / 4 + (n == "%envreg1"));
+        else if (n.starts_with("%envreg")) v = cU32(0);
         else if (n == "%dynamic_smem_size") v = dynamicWords_ ? b_.op(spv::OpShiftLeftLogical, tU32(), {dynamicWords_, cU32(2)}) : cU32(0);
         else if (n == "%total_smem_size")
             v = b_.op(spv::OpIAdd, tU32(), {cU32(sharedStatic_), dynamicWords_ ? b_.op(spv::OpShiftLeftLogical, tU32(), {dynamicWords_, cU32(2)}) : cU32(0)});
@@ -471,7 +475,10 @@ private:
     void setupPushConstants() {
         for (const ptx::Instruction& ins : fn_.instructions) {
             usesPrintf_ |= ins.opcode == "vprintf";
-            for (const ptx::Operand& o : ins.operands) usesGrid_ |= o.kind == ptx::OperandKind::Special && o.name == "%nctaid";
+            for (const ptx::Operand& o : ins.operands) {
+                usesGrid_ |= o.kind == ptx::OperandKind::Special && o.name == "%nctaid";
+                usesWorkspace_ |= o.kind == ptx::OperandKind::Special && (o.name == "%envreg1" || o.name == "%envreg2");
+            }
         }
         auto layout = [&](uint32_t paramArea) {
             uint32_t at = paramArea;
@@ -486,6 +493,10 @@ private:
             if (usesPrintf_) {
                 printfOffset_ = uint32_t(alignTo(at, 8));
                 at = printfOffset_ + 8;
+            }
+            if (usesWorkspace_) {
+                workspaceOffset_ = uint32_t(alignTo(at, 8));
+                at = workspaceOffset_ + 8;
             }
             return uint32_t(alignTo(at, 4));
         };
@@ -714,16 +725,18 @@ private:
         return b_.op(spv::OpConvertUToPtr, b_.typePointer(spv::StorageClassPhysicalStorageBuffer, type), {addr});
     }
 
-    // Device addresses come without their top bits (vk/device.h): bits 63..47 are set again, which
-    // also turns a host pointer into the address its imported pages have (pinned, registered and
-    // managed memory). Done on the high word alone (one 32-bit OR), and to the base before a
-    // constant offset is added, so the GPU compiler can still fold offsets into its loads and stores.
+    // Device addresses come without their top bits (common/device_address.h): the device's bits
+    // 63..47 (specialization constant 5) are set again, which also turns a host pointer into the
+    // address its pages have on the device (pinned, registered and managed memory). Done on the high
+    // word alone (one 32-bit OR), and to the base before a constant offset is added, so the GPU
+    // compiler can still fold offsets into its loads and stores.
     uint32_t canonical(uint32_t addr) {
+        if (!addressHigh_) addressHigh_ = b_.specConstInt(32, 0xFFFF8000u, 5);
         const uint32_t v2 = b_.typeVector(tU32(), 2);
         const uint32_t words = b_.op(spv::OpBitcast, v2, {addr});
         const uint32_t lo = b_.op(spv::OpCompositeExtract, tU32(), {words, 0});
         const uint32_t hi = b_.op(spv::OpCompositeExtract, tU32(), {words, 1});
-        const uint32_t hiExt = b_.op(spv::OpBitwiseOr, tU32(), {hi, cU32(uint32_t(common::kHostAddressBits >> 32))});
+        const uint32_t hiExt = b_.op(spv::OpBitwiseOr, tU32(), {hi, addressHigh_});
         return b_.op(spv::OpBitcast, tU64(), {b_.op(spv::OpCompositeConstruct, v2, {lo, hiExt})});
     }
 
@@ -788,7 +801,9 @@ private:
             const uint32_t type = memType(ins, a.type, a.count);
             std::vector<uint32_t> ops{globalPointer(addr, type), uint32_t(spv::MemoryAccessAlignedMask),
                                       elemBytes * a.count};
-            if (a.isVolatile) ops[1] |= spv::MemoryAccessVolatileMask;
+            // Across grid.sync() a block reads what other blocks wrote, at addresses it may have read
+            // before: without Volatile the driver reuses the earlier loads (or their cache lines).
+            if (a.isVolatile || usesWorkspace_) ops[1] |= spv::MemoryAccessVolatileMask;
             const uint32_t loaded = b_.op(spv::OpLoad, type, ops);
             for (uint32_t i = 0; i < a.count; ++i) {
                 const uint32_t bits =
@@ -814,7 +829,7 @@ private:
             const uint32_t data = a.count > 1 ? b_.op(spv::OpCompositeConstruct, type, parts) : parts[0];
             std::vector<uint32_t> ops{globalPointer(addr, type), data, uint32_t(spv::MemoryAccessAlignedMask),
                                       elemBytes * a.count};
-            if (a.isVolatile) ops[2] |= spv::MemoryAccessVolatileMask;
+            if (a.isVolatile || usesWorkspace_) ops[2] |= spv::MemoryAccessVolatileMask;
             b_.opVoid(spv::OpStore, ops);
             return;
         }
@@ -929,6 +944,25 @@ private:
                                               uint32_t(spv::MemorySemanticsUniformMemoryMask) |
                                               uint32_t(spv::MemorySemanticsWorkgroupMemoryMask);
 
+    // Memory order of ld/st/atom/red (.relaxed when not given): .release orders the earlier accesses
+    // before it, .acquire the later ones after it, as fences of the instruction's scope around the
+    // access (cooperative groups' grid.sync(): atom.add.release.gpu, then a spin on ld.acquire.gpu).
+    void emitOrdered(const ptx::Instruction& ins) {
+        const bool acqRel = ins.has(".acq_rel");
+        const bool release = acqRel || ins.has(".release"), acquire = acqRel || ins.has(".acquire");
+        const uint32_t scope = ins.has(".cta") ? spv::ScopeWorkgroup : spv::ScopeDevice;
+        constexpr uint32_t kStorage =
+            uint32_t(spv::MemorySemanticsUniformMemoryMask) | uint32_t(spv::MemorySemanticsWorkgroupMemoryMask);
+        if (release)
+            b_.opVoid(spv::OpMemoryBarrier, {cU32(scope), cU32(uint32_t(spv::MemorySemanticsReleaseMask) | kStorage)});
+        const std::string_view op = ins.opcode;
+        if (op == "ld") emitLd(ins);
+        else if (op == "st") emitSt(ins);
+        else emitAtom(ins);
+        if (acquire)
+            b_.opVoid(spv::OpMemoryBarrier, {cU32(scope), cU32(uint32_t(spv::MemorySemanticsAcquireMask) | kStorage)});
+    }
+
     // bar.sync / barrier.sync / bar.warp.sync / membar / fence
     void emitBarrier(const ptx::Instruction& ins) {
         const std::string_view op = ins.opcode;
@@ -944,7 +978,12 @@ private:
         if (ins.has(".red")) return emitBarrierReduction(ins);
         if (ins.has(".arrive")) fail(ins, "bar.arrive is not supported yet");
         if (ins.operands.size() > 1) VULKANIZER_WARN_ONCE("bar.sync with a thread count is treated as a full block barrier");
-        b_.opVoid(spv::OpControlBarrier, {cU32(spv::ScopeWorkgroup), cU32(spv::ScopeWorkgroup), cU32(kSemAcqRelAll)});
+        // In grid.sync() only one thread per block orders the block's global accesses at GPU scope
+        // (atom.release / ld.acquire around bar.sync), which PTX makes cumulative over the barrier.
+        // Vulkan's workgroup-scope barrier is not (on AMD, the other waves' stores may still be in
+        // flight), so kernels using the grid workspace get device-scope barriers.
+        const uint32_t memoryScope = usesWorkspace_ ? spv::ScopeDevice : spv::ScopeWorkgroup;
+        b_.opVoid(spv::OpControlBarrier, {cU32(spv::ScopeWorkgroup), cU32(memoryScope), cU32(kSemAcqRelAll)});
     }
 
     // bar.red.popc.u32 d, a{, b}, {!}c   bar.red.{and,or}.pred p, a{, b}, {!}c
@@ -1275,7 +1314,7 @@ private:
         const uint32_t bv = value(ins, ins.operands[2], t);
         if (t.isFloat()) {
             uint32_t r;
-            if (isMad) r = fusedMulAdd(t, a, bv, value(ins, ins.operands[3], t));
+            if (isMad) r = fusedMulAdd(t, a, bv, value(ins, ins.operands[3], t), exactFma(ins));
             else r = b_.op(spv::OpFMul, type, {a, bv});
             if (ins.has(".sat")) r = saturate(r, t);
             storeReg(ins, dstReg(ins).name, t, r);
@@ -1320,9 +1359,10 @@ private:
     // f64, where the product is exact, and rounded once to f32 (up to a rare double rounding).
     // f64 fma is emulated the same way where the driver's f64 Fma is unfused (llvmpipe).
     // VULKANIZER_FAST_FMA=1 uses the driver's Fma anyway: fastest, least precise.
-    uint32_t fusedMulAdd(const PtxType& t, uint32_t a, uint32_t b, uint32_t c) {
+    // `exact` false: the driver's Fma suffices (exactFma()).
+    uint32_t fusedMulAdd(const PtxType& t, uint32_t a, uint32_t b, uint32_t c, bool exact) {
         if (t.width == 64 && !t_.fusedFma64) return fmaEmulated(64, a, b, c);
-        if (t.width != 32 || t_.fusedFma) return glsl(tFloat(t.width), GLSLstd450Fma, {a, b, c});
+        if (t.width != 32 || t_.fusedFma || !exact) return glsl(tFloat(t.width), GLSLstd450Fma, {a, b, c});
         if (t_.fmaInF64 && t_.float64) {
             const uint32_t d = tFloat(64);
             auto wide = [&](uint32_t x) { return b_.op(spv::OpFConvert, d, {x}); };
@@ -1331,6 +1371,13 @@ private:
         }
         return fmaEmulated(32, a, b, c);
     }
+
+    // Whether an f32 fma/mad needs the single rounding. Not with .ftz: nvcc emits it for code built
+    // with -ftz=true (--use_fast_math, as ggml-cuda is), which gave up IEEE results anyway, and the
+    // emulation costs some 30 instructions (half of llama.cpp's matrix-vector kernels on RADV GFX9).
+    // The error-free transformations of math libraries live in IEEE code (fma.rn.f32).
+    // VULKANIZER_EXACT_FMA=1 emulates the .ftz ones too.
+    bool exactFma(const ptx::Instruction& ins) const { return !ins.has(".ftz") || t_.exactFtzFma; }
 
     // fma from f32 (f64) operations (all NoContraction): the product's exact error by Veltkamp
     // splitting (Dekker's TwoProduct), the sum's by TwoSum, then one final rounding of the
@@ -1378,7 +1425,7 @@ private:
         if (!t.isFloat()) fail(ins, "fma needs a float type");
         compType(t, ins);  // rejects f16
         uint32_t r = fusedMulAdd(t, value(ins, ins.operands[1], t), value(ins, ins.operands[2], t),
-                                 value(ins, ins.operands[3], t));
+                                 value(ins, ins.operands[3], t), exactFma(ins));
         if (ins.has(".sat")) r = saturate(r, t);
         storeReg(ins, dstReg(ins).name, t, r);
     }
@@ -2165,7 +2212,8 @@ private:
             if (op == "add") r = b_.op(spv::OpFAdd, f32, {x[0], x[1]});
             else if (op == "sub") r = b_.op(spv::OpFSub, f32, {x[0], x[1]});
             else if (op == "mul") r = b_.op(spv::OpFMul, f32, {x[0], x[1]});
-            else if (op == "fma" || op == "mad") r = fusedMulAdd({Base::Float, 32}, x[0], x[1], x[2]);
+            // the product of two halves is exact in f32: one rounding even where Fma is unfused
+            else if (op == "fma" || op == "mad") r = fusedMulAdd({Base::Float, 32}, x[0], x[1], x[2], false);
             else if (op == "neg") r = b_.op(spv::OpFNegate, f32, {x[0]});
             else if (op == "abs") r = glsl(f32, GLSLstd450FAbs, {x[0]});
             else if (op == "min") r = glsl(f32, GLSLstd450NMin, {x[0], x[1]});
@@ -2311,11 +2359,13 @@ private:
         return t_.subgroupSize >= 32 && t_.subgroupSize % 32 == 0 && t_.subgroupBallot && t_.subgroupShuffle;
     }
 
+    static bool isWarpOp(std::string_view op) {
+        return op == "shfl" || op == "vote" || op == "activemask" || op == "match" || op == "redux" || op == "mma" ||
+               op == "ldmatrix";
+    }
     bool usesWarpOps() const {
         for (const ptx::Instruction& ins : fn_.instructions)
-            if (ins.opcode == "shfl" || ins.opcode == "vote" || ins.opcode == "activemask" || ins.opcode == "match" ||
-                ins.opcode == "redux" || ins.opcode == "mma" || ins.opcode == "ldmatrix")
-                return true;
+            if (isWarpOp(ins.opcode)) return true;
         return false;
     }
 
@@ -2622,8 +2672,7 @@ private:
         }
         if ((op == "add" || op == "sub") && ins.has(".cc")) emitCarry(ins);
         else if (op == "mov") emitMov(ins);
-        else if (op == "ld") emitLd(ins);
-        else if (op == "st") emitSt(ins);
+        else if (op == "ld" || op == "st" || op == "atom" || op == "red") emitOrdered(ins);
         else if (op == "add" || op == "sub" || op == "div" || op == "rem" || op == "min" || op == "max" ||
                  op == "and" || op == "or" || op == "xor")
             emitBinary(ins);
@@ -2639,7 +2688,6 @@ private:
         else if (op == "cvt") emitCvt(ins);
         else if (op == "cvta") emitCvta(ins);
         else if (op == "isspacep") emitIsspacep(ins);
-        else if (op == "atom" || op == "red") emitAtom(ins);
         else if (op == "sqrt" || op == "rsqrt" || op == "rcp" || op == "ex2" || op == "lg2" || op == "sin" ||
                  op == "cos" || op == "tanh")
             emitMathUnary(ins);
@@ -2677,6 +2725,25 @@ private:
         }
         uint32_t cond = loadReg(ins, ins.guard, {Base::Pred, 1});
         if (ins.guardNegated) cond = b_.op(spv::OpLogicalNot, tBool(), {cond});
+        if (!nativeWarps() && isWarpOp(ins.opcode)) {
+            // Emulated warp operations synchronize the workgroup (barriers around a scratch area),
+            // so every thread must reach them: all run the instruction, and the guard decides whose
+            // destination registers take the result.
+            std::vector<std::pair<const Reg*, uint32_t>> saved;
+            const ptx::Operand& d = ins.operands[0];
+            if (d.kind == ptx::OperandKind::Register)
+                for (std::string_view name : {std::string_view(d.name), std::string_view(d.pairName)})
+                    if (!name.empty()) {
+                        const Reg& r = reg(ins, name);
+                        saved.emplace_back(&r, b_.op(spv::OpLoad, r.storage, {r.var}));
+                    }
+            emitInstruction(ins);
+            for (const auto& [r, old] : saved) {
+                const uint32_t now = b_.op(spv::OpLoad, r->storage, {r->var});
+                b_.opVoid(spv::OpStore, {r->var, b_.op(spv::OpSelect, r->storage, {cond, now, old})});
+            }
+            return;
+        }
         const uint32_t then = b_.newId(), merge = b_.newId();
         b_.opVoid(spv::OpSelectionMerge, {merge, uint32_t(spv::SelectionControlMaskNone)});
         b_.opVoid(spv::OpBranchConditional, {cond, then, merge});
@@ -2941,8 +3008,10 @@ private:
     uint32_t pushVar_ = 0, pushBytes_ = 0;
     std::unordered_map<std::string_view, Symbol> symbols_;
     uint32_t sharedStatic_ = 0, localBytes_ = 0, globalsOffset_ = 0, gridOffset_ = 0;
-    bool paramsInBuffer_ = false, usesGrid_ = false, usesPrintf_ = false;
+    bool paramsInBuffer_ = false, usesGrid_ = false, usesPrintf_ = false, usesWorkspace_ = false;
     uint32_t printfOffset_ = 0;
+    uint32_t workspaceOffset_ = 0;
+    uint32_t addressHigh_ = 0;  // specialization constant 5 (canonical())
     bool usesGlobals_ = false, hasShared_ = false;
     uint32_t sharedVar_ = 0, localVar_ = 0, dynamicWords_ = 0;
     uint32_t localId_ = 0, groupId_ = 0;

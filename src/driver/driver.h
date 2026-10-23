@@ -92,6 +92,7 @@ struct CUgraphNode_st {
     unsigned int grid[3] = {1, 1, 1}, block[3] = {1, 1, 1}, sharedMem = 0;
     std::vector<uint8_t> params;
     std::vector<void*> paramPointers;  // for cuGraphKernelNodeGetParams: into `params`
+    bool cooperative = false;          // grid-wide synchronization (cuLaunchCooperativeKernel)
     // memcpy (device or host addresses, as cuMemcpy takes them)
     CUdeviceptr dst = 0, src = 0;
     size_t bytes = 0;
@@ -175,6 +176,7 @@ struct DeviceSlot {
     std::map<CUdeviceptr, VmReservation> reservations;  // keyed by base address
     std::map<CUdeviceptr, VmMapping> mappings;          // keyed by mapped address
     vk::Buffer printfBuffer;  // device printf records of the current launch
+    vk::Buffer gridWorkspace;  // cooperative launches' {size, barrier} (cooperative groups' grid.sync())
 };
 
 class Driver {
@@ -281,7 +283,7 @@ CUresult toCuResult(VkResult r);
 // launch of packed parameters (cuLaunchKernel, graph replay). Caller holds the driver lock.
 CUresult packParams(const ptx::Entry& e, void** kernelParams, void** extra, std::vector<uint8_t>& out);
 CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const unsigned block[3],
-                      unsigned sharedMemBytes, const std::vector<uint8_t>& params);
+                      unsigned sharedMemBytes, const std::vector<uint8_t>& params, bool cooperative = false);
 
 // Stream capture (api_graph.cpp): `hStream` if it is capturing, else nullptr; captureNode appends
 // a node after the stream's current dependencies (invalidated captures report the error).

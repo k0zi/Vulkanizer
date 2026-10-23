@@ -163,6 +163,30 @@ bool Instance::queryDevice(VkPhysicalDevice pd, PhysicalDeviceInfo& out, std::st
     }
     if (!out.maxBufferSize) out.maxBufferSize = out.maxMemoryAllocationSize;
 
+    // The number of compute units (CUDA's multiprocessor count) and the PCI address, where the
+    // driver tells them.
+    uint32_t extCount = 0;
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &extCount, nullptr);
+    std::vector<VkExtensionProperties> exts(extCount);
+    vkEnumerateDeviceExtensionProperties(pd, nullptr, &extCount, exts.data());
+    for (const VkExtensionProperties& e : exts)
+        if (!std::strcmp(e.extensionName, VK_AMD_SHADER_CORE_PROPERTIES_2_EXTENSION_NAME)) {
+            VkPhysicalDeviceShaderCoreProperties2AMD core2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CORE_PROPERTIES_2_AMD};
+            VkPhysicalDeviceProperties2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            q.pNext = &core2;
+            vkGetPhysicalDeviceProperties2(pd, &q);
+            out.computeUnits = core2.activeComputeUnitCount;
+        } else if (!std::strcmp(e.extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME)) {
+            VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            q.pNext = &pci;
+            vkGetPhysicalDeviceProperties2(pd, &q);
+            out.hasPciInfo = true;
+            out.pciDomain = pci.pciDomain;
+            out.pciBus = pci.pciBus;
+            out.pciDevice = pci.pciDevice;
+        }
+
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f12;

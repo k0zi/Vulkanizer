@@ -1,6 +1,6 @@
 // Host memory the device can use: pinned (cuMemAllocHost/cuMemHostAlloc), registered
 // (cuMemHostRegister) and managed (cuMemAllocManaged) memory. All three are host memory the device
-// uses at device address h | kHostAddressBits, and
+// uses at device address h | hostAddressBits() (vk::Device), and
 // kernels set those bits on every address, so the host pointer h is also the device pointer, as
 // with CUDA's unified addressing. The imported range is an ordinary allocation of the slot
 // (keyed by h), so copies, memsets and pointer queries treat it like device memory.

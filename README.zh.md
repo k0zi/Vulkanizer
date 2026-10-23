@@ -104,8 +104,9 @@ tools/build_llama.sh                  # 克隆 .work/llama.cpp 并以 CUDA 后�
 ./run.sh .work/llama-build/bin/llama-bench -m model.gguf -ngl 99
 ```
 
-在 Vulkan `fma` 不是融合运算的 GPU（例如 AMD GFX9）上，`VULKANIZER_FAST_FMA=1` 可以加快 token 生成：
-默认情况下 Vulkanizer 会在这些 GPU 上模拟精确的 fma，此开关改用驱动更快但精度较低的版本。对 LLM 来说差别可以忽略。
+在 Vulkan `fma` 不是融合运算的 GPU（例如 AMD GFX9）上，Vulkanizer 为 IEEE 代码模拟 CUDA 单次舍入的 `fma`，
+但对以 fast math（`-ftz`）编译的代码（例如 llama.cpp 的 CUDA 后端）使用驱动的快速 `fma`。
+`VULKANIZER_FAST_FMA=1` 处处使用快速版本，`VULKANIZER_EXACT_FMA=1` 处处使用模拟。
 
 ### 4. bitnet.c
 
@@ -203,8 +204,10 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `VULKANIZER_BATCH_MS=<毫秒>` | 一次队列提交的 GPU 时间预算（默认 50；`0` = 不限制）。较长的内核会被拆分，以免触发内核驱动的 GPU 超时（amdgpu：2 秒） |
 | `CUDA_LAUNCH_BLOCKING=1` | 每次内核启动都等待 GPU 完成，这样错误和卡死会在引发它们的那次启动处暴露 |
 | `VULKANIZER_FAST_FMA=1` | 更快但精度较低的 f32 `fma` |
+| `VULKANIZER_EXACT_FMA=1` | 对 fast math（`.ftz`）代码也使用精确的 f32 `fma`（较慢） |
 | `VULKANIZER_GEMM_F32=1` | `COMPUTE_16F` 的 cuBLAS GEMM 也使用 f32 乘法 |
 | `VULKANIZER_CACHE_DIR=<目录>\|off` | 内核缓存的位置，或将其关闭 |
+| `VULKANIZER_CACHE_SIZE=<MiB>` | 内核缓存的大小上限（MiB，默认 256）；最久未使用的条目最先删除 |
 | `VULKANIZER_CC=86` | 报告的 compute capability |
 | `VULKANIZER_DUMP=<目录>` | 输出生成的 SPIR-V（`<kernel>.spv`） |
 
@@ -215,7 +218,9 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - 不执行 SASS：只有包含 PTX 的二进制文件才能运行。
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
   不支持子图、内存节点和条件节点。
-- （尚）不支持：纹理、cuDNN、NCCL、多 GPU。
+- （尚）不支持：纹理、cuDNN、NCCL、CUDA IPC。
+- 多个 GPU 是彼此独立的设备：`cudaMemcpyPeer` 通过主机内存在它们之间复制，但内核永远无法访问另一个 GPU 的内存
+  （没有对等访问）。协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU
   （在集成 GPU 上本来就是同一块内存）。
 - 只要存在已注册的主机内存（`cuMemHostRegister`），每次 GPU 提交都会变慢（内核会重新验证导入的页面，每 256 MB 约 4 ms）；

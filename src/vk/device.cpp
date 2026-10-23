@@ -186,6 +186,21 @@ VkResult Device::init() {
             }
         }
     }
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineStats{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    if (const char* env = std::getenv("VULKANIZER_PIPELINE_STATS"); env && *env && std::strcmp(env, "0") != 0) {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> props(count);
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, props.data());
+        for (const VkExtensionProperties& p : props)
+            if (!std::strcmp(p.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+                extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+                pipelineStats.pipelineExecutableInfo = VK_TRUE;
+                pipelineStats.pNext = en.pNext;
+                en.pNext = &pipelineStats;
+            }
+    }
     if (has13) {
         e13.subgroupSizeControl = s13.subgroupSizeControl;
         e13.computeFullSubgroups = s13.computeFullSubgroups;
@@ -288,13 +303,26 @@ VkResult Device::init() {
     if (const char* env = std::getenv("VULKANIZER_NO_SUBALLOC"); env && *env && std::strcmp(env, "0") != 0)
         subAlloc_ = false;
 
+    // The top address bits, from a buffer's actual address: the pipelines need them from now on.
+    {
+        Buffer probe;
+        if (VkResult r = createBuffer(16, kDeviceBufferUsage, {0}, probe)) return r;
+        VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        bai.buffer = probe.buffer;
+        addressHigh_ = uint32_t(vkGetBufferDeviceAddress(device_, &bai) >> 32) & 0xFFFF8000u;
+        destroyBuffer(probe);
+    }
     features_.fusedFma = probeFusedFma();
     features_.fusedFma64 = features_.shaderFloat64 && probeFusedFma64();
     if (features_.sparseBuffers) probeSparse();
+    if (pipelineStats.pipelineExecutableInfo)
+        getPipelineStats_ = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetPipelineExecutableStatisticsKHR"));
     if (placed.memoryMapPlaced && features_.sparseBuffers) {
         mapMemory2_ = reinterpret_cast<PFN_vkMapMemory2KHR>(vkGetDeviceProcAddr(device_, "vkMapMemory2KHR"));
         unmapMemory2_ = reinterpret_cast<PFN_vkUnmapMemory2KHR>(vkGetDeviceProcAddr(device_, "vkUnmapMemory2KHR"));
-        features_.hostMemoryAlloc = mapMemory2_ && unmapMemory2_;
+        // h | hostAddressBits() must be outside the host's half of the address space
+        features_.hostMemoryAlloc = mapMemory2_ && unmapMemory2_ && (addressHigh_ & 0x8000u);
     }
     if (hostImport && features_.sparseBuffers) {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
@@ -304,7 +332,7 @@ VkResult Device::init() {
         hostImportAlignment_ = std::max<VkDeviceSize>(hp.minImportedHostPointerAlignment, sparsePageSize_);
         getHostPointerProperties_ = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
             vkGetDeviceProcAddr(device_, "vkGetMemoryHostPointerPropertiesEXT"));
-        features_.hostMemoryImport = getHostPointerProperties_ != nullptr;
+        features_.hostMemoryImport = getHostPointerProperties_ != nullptr && (addressHigh_ & 0x8000u);
     }
 
     VULKANIZER_INFO("created Vulkan device '%s' (queue family %u, %s f32 fma, %s f64 fma)", info_.name(),
@@ -603,7 +631,7 @@ VkResult Device::createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, B
 
 VkResult Device::createAtHostAddress(uint64_t h, VkDeviceSize size, bool imported, Buffer& out) {
     out = Buffer{};
-    const uint64_t wanted = h | kHostAddressBits;
+    const uint64_t wanted = h | hostAddressBits();
     VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     VkBufferOpaqueCaptureAddressCreateInfo oci{VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO};
@@ -717,7 +745,7 @@ VkResult Device::allocateHostMemory(VkDeviceSize size, Buffer& out) {
 }
 
 VkResult Device::placeHostMemory(uint64_t h, VkDeviceSize size, bool sparse, Buffer& out) {
-    const uint64_t wanted = h | kHostAddressBits;
+    const uint64_t wanted = h | hostAddressBits();
     VkResult r = VK_SUCCESS;
     if (sparse) {
         r = createAtHostAddress(h, size, false, out);
@@ -1259,8 +1287,10 @@ VkResult Device::createComputePipeline(const uint32_t* code, size_t wordCount, c
         return r;
     }
 
-    const VkSpecializationMapEntry entries[5] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}};
-    VkSpecializationInfo specInfo{5, entries, 5 * sizeof(uint32_t), spec};
+    // 0..4 from the caller, 5: the address bits kernels set (hostAddressBits())
+    const VkSpecializationMapEntry entries[6] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}};
+    const uint32_t values[6] = {spec[0], spec[1], spec[2], spec[3], spec[4], addressHigh_};
+    VkSpecializationInfo specInfo{6, entries, sizeof values, values};
 
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -1270,12 +1300,36 @@ VkResult Device::createComputePipeline(const uint32_t* code, size_t wordCount, c
     cpi.stage.pSpecializationInfo = &specInfo;
     cpi.layout = out.layout;
     cpi.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;  // grids beyond the dispatch limit are split
+    if (getPipelineStats_) cpi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     if ((r = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpi, nullptr, &out.pipeline)) != VK_SUCCESS) {
         destroyComputePipeline(out);
         return r;
     }
+    if (getPipelineStats_) printPipelineStats(out.pipeline, entryPoint, spec);
     out.pushConstantSize = pushConstantSize;
     return VK_SUCCESS;
+}
+
+void Device::printPipelineStats(VkPipeline pipeline, const char* entryPoint, const uint32_t spec[5]) {
+    VkPipelineExecutableInfoKHR exe{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+    exe.pipeline = pipeline;
+    uint32_t count = 0;
+    if (getPipelineStats_(device_, &exe, &count, nullptr) != VK_SUCCESS) return;
+    std::vector<VkPipelineExecutableStatisticKHR> stats(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+    if (getPipelineStats_(device_, &exe, &count, stats.data()) != VK_SUCCESS) return;
+    std::string line;
+    for (const VkPipelineExecutableStatisticKHR& s : stats) {
+        char v[64];
+        switch (s.format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: std::snprintf(v, sizeof v, "%u", s.value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: std::snprintf(v, sizeof v, "%lld", (long long)s.value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: std::snprintf(v, sizeof v, "%llu", (unsigned long long)s.value.u64); break;
+            default: std::snprintf(v, sizeof v, "%g", s.value.f64); break;
+        }
+        line += std::string(line.empty() ? "" : ", ") + s.name + " " + v;
+    }
+    std::fprintf(stderr, "[vulkanizer] pipeline %s (block %ux%ux%u, pack %u): %s\n", displayName(entryPoint).c_str(),
+                 spec[0], spec[1], spec[2], spec[4], line.c_str());
 }
 
 void Device::destroyComputePipeline(ComputePipeline& p) {
@@ -1292,13 +1346,13 @@ void Device::destroyComputePipeline(ComputePipeline& p) {
 
 VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ,
                           const void* pushData, uint32_t pushSize, const char* label, const void* params,
-                          size_t paramsSize) {
+                          size_t paramsSize, bool whole) {
     if (pushSize > p.pushConstantSize || (params && pushSize < sizeof(VkDeviceAddress))) return VK_ERROR_FEATURE_NOT_PRESENT;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<uint8_t> push(static_cast<const uint8_t*>(pushData), static_cast<const uint8_t*>(pushData) + pushSize);
     uint64_t uploaded = 0;
     const uint32_t grid[3] = {groupsX, groupsY, groupsZ};
-    if (!batchBudgetNs_) {
+    if (!batchBudgetNs_ || whole) {
         if (params) {
             if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
         }

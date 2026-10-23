@@ -108,9 +108,9 @@ tools/build_llama.sh                  # klónozza és lefordítja a .work/llama.
 ./run.sh .work/llama-build/bin/llama-bench -m model.gguf -ngl 99
 ```
 
-A `VULKANIZER_FAST_FMA=1` gyorsítja a tokengenerálást azokon a GPU-kon, ahol a Vulkan `fma` nem fúzionált (pl. AMD
-GFX9): ott a Vulkanizer alapból pontos fma-t emulál, ez a kapcsoló helyette a driver gyorsabb, de pontatlanabb
-változatát használja. LLM-eknél a különbség elhanyagolható.
+Azokon a GPU-kon, ahol a Vulkan `fma` nem fúzionált (pl. AMD GFX9), a Vulkanizer IEEE-kódban emulálja a CUDA egyszer
+kerekítő `fma`-ját, a fast mathtal (`-ftz`) fordított kódban viszont – mint a llama.cpp CUDA backendje – a driver gyors
+`fma`-ját használja. A `VULKANIZER_FAST_FMA=1` mindenhol a gyorsat, a `VULKANIZER_EXACT_FMA=1` mindenhol az emulációt adja.
 
 ### 4. bitnet.c
 
@@ -211,8 +211,10 @@ Ezután nyisd meg a <http://127.0.0.1:8188> címet. A modellek a szokott módon 
 | `VULKANIZER_BATCH_MS=<ms>` | Egy queue-beküldés GPU-időkerete (alapból 50; `0` = nincs korlát). A hosszabb kernelek darabokra bomlanak, így nem éri el őket a kernel driver GPU-timeoutja (amdgpu: 2 s) |
 | `CUDA_LAUNCH_BLOCKING=1` | Minden kernelindítás megvárja a GPU-t, így a hibák és lefagyások annál az indításnál jelentkeznek, amelyik okozta őket |
 | `VULKANIZER_FAST_FMA=1` | Gyorsabb, kevésbé pontos f32 `fma` |
+| `VULKANIZER_EXACT_FMA=1` | Pontos f32 `fma` a fast math (`.ftz`) kódban is (lassabb) |
 | `VULKANIZER_GEMM_F32=1` | A `COMPUTE_16F`-es cuBLAS GEMM-ek is f32 szorzással futnak |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | A kernel-gyorsítótár helye, vagy kikapcsolása |
+| `VULKANIZER_CACHE_SIZE=<MiB>` | A kernel-gyorsítótár méretkorlátja MiB-ban (alap: 256); a legrégebben használt bejegyzések törlődnek először |
 | `VULKANIZER_CC=86` | A jelentett compute capability |
 | `VULKANIZER_DUMP=<dir>` | A generált SPIR-V kiírása (`<kernel>.spv`) |
 
@@ -223,7 +225,10 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 - Nincs SASS-futtatás: csak PTX-et tartalmazó binárisok futnak.
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph, memória- és feltételes csomópont nincs.
-- (Még) nem támogatott: textúrák, cuDNN, NCCL, több GPU.
+- (Még) nem támogatott: textúrák, cuDNN, NCCL, CUDA IPC.
+- Több GPU külön eszközként működik: a `cudaMemcpyPeer` host-memórián át másol köztük, de egy kernel sosem éri el egy
+  másik GPU memóriáját (nincs peer access). A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi
+  egyszerre elfér a GPU-n.
 - A managed, a pinned és a regisztrált memória host-memória, amit a GPU helyben, ugyanazon a címen használ; a managed
   memória sosem migrál a GPU-ra (integrált GPU-n ez amúgy is ugyanaz a memória).
 - Amíg regisztrált host-memória (`cuMemHostRegister`) létezik, minden GPU-submit lassabb (a kernel újraellenőrzi az

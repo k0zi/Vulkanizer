@@ -13,7 +13,6 @@
 namespace vulkanizer::vk {
 
 using common::kAddressMask;  // device address conventions: common/device_address.h
-using common::kHostAddressBits;
 
 // A device allocation addressable from shaders through its buffer device address.
 struct Buffer {
@@ -55,7 +54,7 @@ struct Features {
     bool fusedFma64 = false;         // the same for f64 fma()
     bool sparseBuffers = false;      // sparse residency buffers on the compute queue (CUDA VMM)
     bool addressCaptureReplay = false;  // buffers can be placed at a requested device address
-    bool hostMemoryImport = false;  // host memory at device address h | kHostAddressBits (importHostMemory)
+    bool hostMemoryImport = false;  // host memory at device address h | hostAddressBits() (importHostMemory)
     bool hostMemoryAlloc = false;   // the same for memory of our own (allocateHostMemory)
 };
 
@@ -101,13 +100,17 @@ public:
     VkDeviceSize sparsePageSize() const { return sparsePageSize_; }
     VkDeviceSize maxSparseBufferSize() const { return maxSparseBufferSize_; }
     VkDeviceSize hostImportAlignment() const { return hostImportAlignment_; }
-    // Makes [host, host + size) device-accessible at device address host | kHostAddressBits (a
+    // Bits 63..47 of this device's buffer addresses, which kernels set again on every address
+    // (specialization constant 5 of every pipeline, see common/device_address.h): 0xFFFF8000... on
+    // RADV, 0 on llvmpipe (CPU pointers). Host memory used in place sits at h | hostAddressBits().
+    uint64_t hostAddressBits() const { return uint64_t(addressHigh_) << 32; }
+    // Makes [host, host + size) device-accessible at device address host | hostAddressBits() (a
     // sparse buffer placed there, with the host pages imported through VK_EXT_external_memory_host
     // bound to it). `host` and `size` must be multiples of hostImportAlignment(). out.address and
     // out.mapped are `host`. Fails if the device address range is taken.
     VkResult importHostMemory(void* host, VkDeviceSize size, Buffer& out);
     // Host-cached memory of the device, mapped at a host address h of its choosing and usable by
-    // the device at h | kHostAddressBits, like imported memory (out.address = out.mapped = h). Unlike
+    // the device at h | hostAddressBits(), like imported memory (out.address = out.mapped = h). Unlike
     // imported memory (userptr), it costs nothing per submit: the kernel revalidates every
     // imported page on each submission. `size` is rounded up to whole sparsePageSize() units.
     VkResult allocateHostMemory(VkDeviceSize size, Buffer& out);
@@ -138,9 +141,11 @@ public:
     // `label` names the kernel in VULKANIZER_PROFILE=1 reports (must outlive the device).
     // `params` (optional) is uploaded into each batch the dispatch is recorded in, and its address
     // goes into the first 8 bytes of the push constants.
+    // `whole`: one dispatch, never split (all workgroups must be able to run at once: grid-wide
+    // synchronization of cooperative launches).
     VkResult dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ,
                       const void* pushData, uint32_t pushSize, const char* label = nullptr,
-                      const void* params = nullptr, size_t paramsSize = 0);
+                      const void* params = nullptr, size_t paramsSize = 0, bool whole = false);
     // Copies data into memory that stays valid until the work recorded next has executed.
     VkResult upload(const void* data, VkDeviceSize size, VkDeviceAddress& address);
 
@@ -258,12 +263,16 @@ private:
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
     VkDeviceSize hostImportAlignment_ = 0;
+    uint32_t addressHigh_ = 0;  // hostAddressBits() >> 32
     PFN_vkGetMemoryHostPointerPropertiesEXT getHostPointerProperties_ = nullptr;
     PFN_vkMapMemory2KHR mapMemory2_ = nullptr;
+    // VULKANIZER_PIPELINE_STATS=1: the driver's statistics of every pipeline (registers, spills...)
+    PFN_vkGetPipelineExecutableStatisticsKHR getPipelineStats_ = nullptr;
+    void printPipelineStats(VkPipeline pipeline, const char* entryPoint, const uint32_t spec[5]);
     PFN_vkUnmapMemory2KHR unmapMemory2_ = nullptr;
-    // A sparse buffer of `size` at device address h | kHostAddressBits (fails if that is taken).
+    // A sparse buffer of `size` at device address h | hostAddressBits() (fails if that is taken).
     VkResult createAtHostAddress(uint64_t h, VkDeviceSize size, bool imported, Buffer& out);
-    // allocateHostMemory's buffer and host-visible memory at h | kHostAddressBits, not yet mapped:
+    // allocateHostMemory's buffer and host-visible memory at h | hostAddressBits(), not yet mapped:
     // a plain buffer on memory placed there, or a sparse buffer placed there.
     VkResult placeHostMemory(uint64_t h, VkDeviceSize size, bool sparse, Buffer& out);
     std::recursive_mutex mutex_;

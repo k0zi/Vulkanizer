@@ -84,6 +84,18 @@ cudaError_t record(cudaError_t e) {
 }
 cudaError_t record(CUresult r) { return record(toCudaError(r)); }
 
+// The device's primary context, retained on first use (after enter() initialized the driver).
+cudaError_t primaryContext(int device, CUcontext& ctx) {
+    Runtime& rt = Runtime::get();
+    if (device < 0 || device >= rt.deviceCount) return cudaErrorInvalidDevice;
+    std::lock_guard<std::recursive_mutex> lock(rt.mutex);
+    if (!rt.primary[device]) {
+        if (CUresult r = cuDevicePrimaryCtxRetain(&rt.primary[device], device)) return toCudaError(r);
+    }
+    ctx = rt.primary[device];
+    return cudaSuccess;
+}
+
 // Every API call starts here: initialize the driver once and make the current device's
 // primary context current on this thread.
 cudaError_t enter() {
@@ -99,13 +111,7 @@ cudaError_t enter() {
     if (t_device < 0 || t_device >= rt.deviceCount) return cudaErrorInvalidDevice;
 
     CUcontext ctx;
-    {
-        std::lock_guard<std::recursive_mutex> lock(rt.mutex);
-        if (!rt.primary[t_device]) {
-            if (CUresult r = cuDevicePrimaryCtxRetain(&rt.primary[t_device], t_device)) return toCudaError(r);
-        }
-        ctx = rt.primary[t_device];
-    }
+    if (cudaError_t e = primaryContext(t_device, ctx)) return e;
     CUcontext current = nullptr;
     cuCtxGetCurrent(&current);
     if (current != ctx) {
@@ -179,12 +185,22 @@ Kernel* findKernel(const void* hostFun) {
     return it->second;
 }
 
-cudaError_t launch(Kernel* k, dim3 grid, dim3 block, void** args, size_t sharedMem, cudaStream_t stream) {
+// `attrs`: launch attributes (cudaLaunchKernelEx), handed to cuLaunchKernelEx.
+cudaError_t launch(Kernel* k, dim3 grid, dim3 block, void** args, size_t sharedMem, cudaStream_t stream,
+                   const cudaLaunchAttribute* attrs = nullptr, unsigned numAttrs = 0) {
     if (!k) return record(cudaErrorInvalidDeviceFunction);
     CUfunction f;
     if (cudaError_t e = resolve(k, f)) return record(e);
-    const CUresult r = cuLaunchKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z, unsigned(sharedMem),
-                                      stream, args, nullptr);
+    CUresult r;
+    if (numAttrs) {
+        // cudaLaunchAttribute is laid out as CUlaunchAttribute, with the same attribute ids.
+        CUlaunchConfig config{grid.x,  grid.y, grid.z, block.x, block.y, block.z, unsigned(sharedMem), stream,
+                              reinterpret_cast<CUlaunchAttribute*>(const_cast<cudaLaunchAttribute*>(attrs)), numAttrs};
+        r = cuLaunchKernelEx(&config, f, args, nullptr);
+    } else {
+        r = cuLaunchKernel(f, grid.x, grid.y, grid.z, block.x, block.y, block.z, unsigned(sharedMem), stream, args,
+                           nullptr);
+    }
     // The driver reports bad grid/block dimensions as an invalid value.
     return record(r == CUDA_ERROR_INVALID_VALUE ? cudaErrorInvalidConfiguration : toCudaError(r));
 }
@@ -230,6 +246,7 @@ const ErrorText kErrors[] = {
     {cudaErrorIllegalAddress, "cudaErrorIllegalAddress", "an illegal memory access was encountered"},
     {cudaErrorLaunchOutOfResources, "cudaErrorLaunchOutOfResources", "too many resources requested for launch"},
     {cudaErrorLaunchFailure, "cudaErrorLaunchFailure", "unspecified launch failure"},
+    {cudaErrorCooperativeLaunchTooLarge, "cudaErrorCooperativeLaunchTooLarge", "too many blocks in cooperative launch"},
     {cudaErrorNotPermitted, "cudaErrorNotPermitted", "operation not permitted"},
     {cudaErrorNotSupported, "cudaErrorNotSupported", "operation not supported"},
     {cudaErrorUnknown, "cudaErrorUnknown", "unknown error"},
@@ -781,8 +798,11 @@ cudaError_t CUDARTAPI cudaMemcpy2D(void* dst, size_t dpitch, const void* src, si
 cudaError_t CUDARTAPI cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* src, int srcDevice, size_t count,
                                           cudaStream_t stream) {
     ENTER();
-    if (dstDevice != srcDevice) return record(cudaErrorNotSupported);  // single-device only for now
-    return memcpyImpl(dst, src, count, cudaMemcpyDeviceToDevice, stream, true);
+    if (dstDevice == srcDevice) return memcpyImpl(dst, src, count, cudaMemcpyDeviceToDevice, stream, true);
+    CUcontext dstCtx, srcCtx;  // between devices: the driver copies through host memory
+    if (cudaError_t e = primaryContext(dstDevice, dstCtx)) return record(e);
+    if (cudaError_t e = primaryContext(srcDevice, srcCtx)) return record(e);
+    return record(cuMemcpyPeerAsync(CUdeviceptr(dst), dstCtx, CUdeviceptr(src), srcCtx, count, stream));
 }
 
 cudaError_t CUDARTAPI cudaMemcpyPeer(void* dst, int dstDevice, const void* src, int srcDevice, size_t count) {
@@ -888,15 +908,12 @@ cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int
                                                                             int blockSize, size_t dynamicSMemSize,
                                                                             unsigned int flags) {
     ENTER();
-    if (!numBlocks || blockSize <= 0) return record(cudaErrorInvalidValue);
-    cudaFuncAttributes fa;
-    if (cudaError_t e = cudaFuncGetAttributes(&fa, func)) return e;
-    const int threadsPerSm = attr(39, t_device), blocksPerSm = std::max(1, attr(106, t_device));
-    const size_t smemPerSm = size_t(attr(81, t_device)), smem = fa.sharedSizeBytes + dynamicSMemSize;
-    int n = std::min(threadsPerSm / blockSize, blocksPerSm);
-    if (smem) n = std::min<int>(n, int(smemPerSm / smem));
-    *numBlocks = std::max(n, 0);
-    return cudaSuccess;
+    Kernel* k = findKernel(func);
+    if (!k) return record(cudaErrorInvalidDeviceFunction);
+    CUfunction f;
+    if (cudaError_t e = resolve(k, f)) return record(e);
+    // The driver's numbers: cooperative launches are checked against them.
+    return record(cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, f, blockSize, dynamicSMemSize, flags));
 }
 
 cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, const void* func, int blockSize,
@@ -909,19 +926,31 @@ cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBloc
 cudaError_t CUDARTAPI cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args) {
     ENTER();
     if (!config) return record(cudaErrorInvalidValue);
-    if (config->numAttrs) VULKANIZER_WARN_ONCE("cudaLaunchKernelEx: launch attributes are ignored");
-    return launch(findKernel(func), config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream);
+    if (config->numAttrs && !config->attrs) return record(cudaErrorInvalidValue);
+    return launch(findKernel(func), config->gridDim, config->blockDim, args, config->dynamicSmemBytes, config->stream,
+                  config->attrs, config->numAttrs);
 }
 
 cudaError_t CUDARTAPI cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t* config, const void* func, void** args) {
     return cudaLaunchKernelExC(config, func, args);
 }
 
-// Grid-wide synchronization is not available, but a launch that fits on the device works.
+// Grid-wide synchronization (cooperative groups): the driver checks that all blocks fit at once.
 cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void* func, dim3 gridDim, dim3 blockDim, void** args,
                                                   size_t sharedMem, cudaStream_t stream) {
     ENTER();
-    return launch(findKernel(func), gridDim, blockDim, args, sharedMem, stream);
+    Kernel* k = findKernel(func);
+    if (!k) return record(cudaErrorInvalidDeviceFunction);
+    CUfunction f;
+    if (cudaError_t e = resolve(k, f)) return record(e);
+    const CUresult r = cuLaunchCooperativeKernel(f, gridDim.x, gridDim.y, gridDim.z, blockDim.x, blockDim.y, blockDim.z,
+                                                 unsigned(sharedMem), stream, args);
+    return record(r == CUDA_ERROR_INVALID_VALUE ? cudaErrorInvalidConfiguration : toCudaError(r));
+}
+
+cudaError_t CUDARTAPI cudaLaunchCooperativeKernel_ptsz(const void* func, dim3 gridDim, dim3 blockDim, void** args,
+                                                       size_t sharedMem, cudaStream_t stream) {
+    return cudaLaunchCooperativeKernel(func, gridDim, blockDim, args, sharedMem, stream);
 }
 
 cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void* userData) {

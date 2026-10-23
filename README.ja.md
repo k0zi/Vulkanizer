@@ -107,9 +107,9 @@ tools/build_llama.sh                  # .work/llama.cpp を clone し、CUDA バ
 ./run.sh .work/llama-build/bin/llama-bench -m model.gguf -ngl 99
 ```
 
-Vulkan の `fma` が融合演算でない GPU（例：AMD GFX9）では、`VULKANIZER_FAST_FMA=1` でトークン生成が速くなります。
-Vulkanizer は通常そうした GPU で正確な fma をエミュレートしますが、このスイッチを使うと、ドライバの高速だが精度の
-低い版を使います。LLM では差はごくわずかです。
+Vulkan の `fma` が融合演算でない GPU（例：AMD GFX9）では、Vulkanizer は IEEE コードに対して CUDA の 1 回丸めの
+`fma` をエミュレートしますが、fast math（`-ftz`）でビルドされたコード（llama.cpp の CUDA バックエンドなど）にはドライバの
+高速な `fma` を使います。`VULKANIZER_FAST_FMA=1` は常に高速版、`VULKANIZER_EXACT_FMA=1` は常にエミュレーションを使います。
 
 ### 4. bitnet.c
 
@@ -210,8 +210,10 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `VULKANIZER_BATCH_MS=<ミリ秒>` | 1 回のキュー送信の GPU 時間予算（既定 50、`0` で無制限）。長いカーネルは分割され、カーネルドライバの GPU タイムアウト（amdgpu：2 秒）に引っかからないようにする |
 | `CUDA_LAUNCH_BLOCKING=1` | 各カーネル起動で GPU の完了を待つため、エラーやハングが原因となった起動の時点で表面化する |
 | `VULKANIZER_FAST_FMA=1` | 高速だが精度の低い f32 `fma` |
+| `VULKANIZER_EXACT_FMA=1` | fast math（`.ftz`）コードでも正確な f32 `fma`（低速） |
 | `VULKANIZER_GEMM_F32=1` | `COMPUTE_16F` の cuBLAS GEMM も f32 の乗算で実行 |
 | `VULKANIZER_CACHE_DIR=<ディレクトリ>\|off` | カーネルキャッシュの場所、または無効化 |
+| `VULKANIZER_CACHE_SIZE=<MiB>` | カーネルキャッシュのサイズ上限（MiB、既定 256）。最も長く使われていないエントリから削除されます |
 | `VULKANIZER_CC=86` | 報告する compute capability |
 | `VULKANIZER_DUMP=<ディレクトリ>` | 生成した SPIR-V を出力（`<kernel>.spv`） |
 
@@ -222,7 +224,10 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - SASS は実行できません。PTX を含むバイナリのみ動作します。
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフ、メモリノード、条件ノードは未対応です。
-- （まだ）未対応：テクスチャ、cuDNN、NCCL、マルチ GPU。
+- （まだ）未対応：テクスチャ、cuDNN、NCCL、CUDA IPC。
+- 複数の GPU はそれぞれ独立したデバイスです。`cudaMemcpyPeer` はホストメモリ経由でそれらの間をコピーしますが、カーネルが
+  別の GPU のメモリにアクセスすることはできません（ピアアクセスなし）。協調起動（`grid.sync()`）は、GPU に同時に
+  載るブロック数まで動作します。
 - マネージド、ピン留め、登録済みのメモリはホストメモリであり、GPU は同じアドレスでその場で使います。マネージドメモリが
   GPU に移動することはありません（統合 GPU ではいずれにせよ同じメモリです）。
 - 登録済みホストメモリ（`cuMemHostRegister`）が存在する間は、GPU への投入がすべて遅くなります（カーネルがインポートされた

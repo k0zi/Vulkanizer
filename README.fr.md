@@ -109,9 +109,9 @@ tools/build_llama.sh                  # clone et compile .work/llama.cpp avec le
 ./run.sh .work/llama-build/bin/llama-bench -m model.gguf -ngl 99
 ```
 
-`VULKANIZER_FAST_FMA=1` accélère la génération de tokens sur les GPU dont le `fma` Vulkan n’est pas fusionné
-(par ex. AMD GFX9) : par défaut, Vulkanizer y émule un fma exact ; cette option utilise à la place la version plus
-rapide mais moins précise du pilote. Pour les LLM, la différence est négligeable.
+Sur les GPU dont le `fma` Vulkan n’est pas fusionné (p. ex. AMD GFX9), Vulkanizer émule le `fma` à arrondi unique de
+CUDA pour le code IEEE, mais utilise le `fma` rapide du pilote pour le code compilé en fast math (`-ftz`, comme le
+backend CUDA de llama.cpp). `VULKANIZER_FAST_FMA=1` utilise partout le rapide, `VULKANIZER_EXACT_FMA=1` émule partout.
 
 ### 4. bitnet.c
 
@@ -215,8 +215,10 @@ Ouvrez ensuite <http://127.0.0.1:8188>. Les modèles vont dans `models/`, comme 
 | `VULKANIZER_BATCH_MS=<ms>` | Budget de temps GPU d’une soumission à la file (50 par défaut ; `0` = sans limite). Les kernels plus longs sont découpés, pour ne pas déclencher le délai d’attente GPU du pilote noyau (amdgpu : 2 s) |
 | `CUDA_LAUNCH_BLOCKING=1` | Chaque lancement de kernel attend le GPU, si bien que les erreurs et blocages apparaissent au lancement fautif |
 | `VULKANIZER_FAST_FMA=1` | `fma` f32 plus rapide mais moins précis |
+| `VULKANIZER_EXACT_FMA=1` | `fma` f32 exact aussi pour le code fast math (`.ftz`), plus lent |
 | `VULKANIZER_GEMM_F32=1` | Les GEMM cuBLAS en `COMPUTE_16F` multiplient aussi en f32 |
 | `VULKANIZER_CACHE_DIR=<rép>\|off` | Emplacement du cache de kernels, ou sa désactivation |
+| `VULKANIZER_CACHE_SIZE=<MiB>` | Taille maximale du cache de kernels en Mio (256 par défaut) ; les entrées les moins récemment utilisées partent d’abord |
 | `VULKANIZER_CC=86` | La compute capability annoncée |
 | `VULKANIZER_DUMP=<rép>` | Écrit le SPIR-V généré (`<kernel>.spv`) |
 
@@ -227,7 +229,10 @@ Liste complète : [plan.md, section 4](plan.md).
 - Pas d’exécution de SASS : seuls les binaires contenant du PTX fonctionnent.
 - CUDA Graphs : la capture de stream et la relecture fonctionnent (les graphes de llama.cpp, `CUDAGraph` de PyTorch,
   `torch.compile(mode="reduce-overhead")`) ; pas de graphes enfants, de nœuds mémoire ni de nœuds conditionnels.
-- Pas (encore) pris en charge : textures, cuDNN, NCCL, multi-GPU.
+- Pas (encore) pris en charge : textures, cuDNN, NCCL, IPC CUDA.
+- Plusieurs GPU sont des périphériques distincts : `cudaMemcpyPeer` copie entre eux via la mémoire hôte, mais un kernel
+  n’accède jamais à la mémoire d’un autre GPU (pas d’accès pair). Les lancements coopératifs (`grid.sync()`) fonctionnent
+  jusqu’au nombre de blocs qui tiennent simultanément sur le GPU.
 - La mémoire managed, épinglée et enregistrée est de la mémoire hôte que le GPU utilise sur place, à la même adresse ;
   la mémoire managed ne migre jamais vers le GPU (sur un GPU intégré, c’est de toute façon la même mémoire).
 - Tant que de la mémoire hôte enregistrée (`cuMemHostRegister`) existe, chaque soumission au GPU est plus lente (le noyau

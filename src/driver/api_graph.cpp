@@ -97,7 +97,7 @@ void getKernel(CUgraphNode_st& n, P* p) {
 CUresult runNode(ApiScope& s, const CUgraphNode_st& n) {
     switch (n.type) {
         case CU_GRAPH_NODE_TYPE_KERNEL:
-            return launchKernel(s, n.func, n.grid, n.block, n.sharedMem, n.params);
+            return launchKernel(s, n.func, n.grid, n.block, n.sharedMem, n.params, n.cooperative);
         case CU_GRAPH_NODE_TYPE_MEMCPY:
             return cuMemcpy(n.dst, n.src, n.bytes);
         case CU_GRAPH_NODE_TYPE_MEMSET:

@@ -58,7 +58,15 @@ CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned in
     if (!validStream(hStream) || !validHandle(hEvent)) return CUDA_ERROR_INVALID_HANDLE;
     // An event recorded during a capture forks or joins it: the waiting stream captures too.
     if (hEvent->captureGraph) return joinCapture(hStream, hEvent);
-    return CUDA_SUCCESS;  // one queue: everything recorded later already runs after the event
+    // One queue per device: on the event's own device everything recorded later already runs after
+    // it. Another device's event (multi-GPU) is waited for on the host.
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    const bool realStream = hStream && hStream != CU_STREAM_LEGACY && hStream != CU_STREAM_PER_THREAD;
+    const CUdevice waiting = realStream ? hStream->ctx->device : s.ctx->device;
+    if (hEvent->recorded && hEvent->ctx->device != waiting)
+        return toCuResult(Driver::get().slot(hEvent->ctx->device)->vk->wait(hEvent->serial));
+    return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuEventCreate(CUevent* phEvent, unsigned int Flags) {

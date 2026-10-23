@@ -17,9 +17,11 @@ layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ptr
 
 // Device addresses arrive without their top bits (see vk/device.h); the hardware wants them
 // canonical.
-uint64_t canon(uint64_t a) {  // on the high word alone: bits 63..47 set (vk::kHostAddressBits)
+// The device's address bits 63..47 (vk::Device::addressHighBits), specialization constant 5.
+layout(constant_id = 5) const uint kAddressHigh = 0xFFFF8000u;
+uint64_t canon(uint64_t a) {  // on the high word alone
     uvec2 w = unpackUint2x32(a);
-    w.y |= 0xFFFF8000u;
+    w.y |= kAddressHigh;
     return packUint2x32(w);
 }
 

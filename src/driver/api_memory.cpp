@@ -246,6 +246,58 @@ CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevi
     return memcpyAsyncEntry(dstDevice, srcDevice, ByteCount, hStream, true, true);
 }
 
+// Between devices (multi-GPU): through host memory, as separate Vulkan devices share no memory.
+// The read waits for the source device's work so far; the write is queued on the destination
+// device. Within one device it is an ordinary device copy.
+CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice, CUcontext srcContext,
+                              size_t ByteCount) {
+    VULKANIZER_TRACE_API();
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!validHandle(dstContext) || !validHandle(srcContext)) return CUDA_ERROR_INVALID_CONTEXT;
+    if (ByteCount == 0) return CUDA_SUCCESS;
+    DeviceSlot* dstSlot = Driver::get().slot(dstContext->device);
+    DeviceSlot* srcSlot = Driver::get().slot(srcContext->device);
+    std::vector<AllocPiece> dst, src;
+    if (!findPieces(*dstSlot, dstDevice, ByteCount, dst) || !findPieces(*srcSlot, srcDevice, ByteCount, src))
+        return CUDA_ERROR_INVALID_VALUE;
+    if (dstSlot == srcSlot) return copyPieces(*dstSlot->vk, src, dst);
+    std::vector<char> staging(ByteCount);
+    if (CUresult r = readPieces(*srcSlot->vk, src, staging.data())) return r;
+    return writePieces(*dstSlot->vk, dst, staging.data());
+}
+
+CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
+                                   CUcontext srcContext, size_t ByteCount, CUstream hStream) {
+    if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (capturingStream(hStream)) return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
+    return cuMemcpyPeer(dstDevice, dstContext, srcDevice, srcContext, ByteCount);
+}
+
+CUresult CUDAAPI cuMemcpyPeerAsync_ptsz(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
+                                        CUcontext srcContext, size_t ByteCount, CUstream hStream) {
+    return cuMemcpyPeerAsync(dstDevice, dstContext, srcDevice, srcContext, ByteCount, hStream);
+}
+
+CUresult CUDAAPI cuDeviceCanAccessPeer(int* canAccessPeer, CUdevice dev, CUdevice peerDev) {
+    VULKANIZER_TRACE_API();
+    if (!canAccessPeer) return CUDA_ERROR_INVALID_VALUE;
+    if (!Driver::get().slot(dev) || !Driver::get().slot(peerDev)) return CUDA_ERROR_INVALID_DEVICE;
+    *canAccessPeer = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext, unsigned int Flags) {
+    VULKANIZER_TRACE_API();
+    if (!validHandle(peerContext) || Flags) return validHandle(peerContext) ? CUDA_ERROR_INVALID_VALUE : CUDA_ERROR_INVALID_CONTEXT;
+    return CUDA_ERROR_PEER_ACCESS_UNSUPPORTED;
+}
+
+CUresult CUDAAPI cuCtxDisablePeerAccess(CUcontext peerContext) {
+    VULKANIZER_TRACE_API();
+    return validHandle(peerContext) ? CUDA_ERROR_PEER_ACCESS_NOT_ENABLED : CUDA_ERROR_INVALID_CONTEXT;
+}
+
 CUresult CUDAAPI cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
     VULKANIZER_TRACE_API();
     return memset32(dstDevice, uc * 0x01010101u, N, 1);

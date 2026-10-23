@@ -11,8 +11,12 @@
 #include <cstring>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <algorithm>
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <vector>
+
+namespace cg = cooperative_groups;
 
 #define CHECK(call)                                                                            \
     do {                                                                                       \
@@ -824,6 +828,9 @@ __global__ void squarePlusOne(float* data, int n) {
 }
 
 static bool testManaged() {
+    int supported = 0;  // host memory at a device address (llvmpipe has none)
+    CHECK(cudaDeviceGetAttribute(&supported, cudaDevAttrManagedMemory, 0));
+    if (!supported) return true;
     const int n = 50000;
     float* m = nullptr;
     CHECK(cudaMallocManaged(reinterpret_cast<void**>(&m), n * sizeof(float), cudaMemAttachGlobal));
@@ -859,6 +866,141 @@ static bool testManaged() {
     int dummy = 0;
     CHECK(cudaPointerGetAttributes(&a, &dummy));
     if (a.type != cudaMemoryTypeUnregistered) ok = false;
+    if (!ok) ++g_mismatches;
+    return ok;
+}
+
+// ---- cooperative groups: grid-wide synchronization ----------------------------------------------
+
+// Each round every thread reads the element another block wrote in the previous round: wrong
+// without a working grid.sync().
+__global__ void gridRotate(int* a, int* b, int rounds, int* valid) {
+    cg::grid_group grid = cg::this_grid();
+    const int n = int(grid.size());
+    const int i = int(grid.thread_rank());
+    if (i == 0) *valid = grid.is_valid();
+    for (int r = 0; r < rounds; ++r) {
+        b[i] = a[(i + blockDim.x + 1) % n] + 1;
+        grid.sync();
+        int* t = a;
+        a = b;
+        b = t;
+    }
+}
+
+__global__ void gridValid(int* valid) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) *valid = cg::this_grid().is_valid();
+}
+
+static bool testCooperative() {
+    int coop = 0, sms = 0, perSm = 0;
+    CHECK(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, 0));
+    CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+    const int block = 128, rounds = 50;
+    CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&perSm, gridRotate, block, 0));
+    const int blocks = sms * std::min(perSm, 2), n = blocks * block;
+    std::vector<int> host(n);
+    for (int i = 0; i < n; ++i) host[i] = (i * 7919) % 1000;
+    int *a, *b, *valid;
+    CHECK(cudaMalloc(&a, n * sizeof(int)));
+    CHECK(cudaMalloc(&b, n * sizeof(int)));
+    CHECK(cudaMalloc(&valid, sizeof(int)));
+    CHECK(cudaMemcpy(a, host.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+    int roundsArg = rounds;
+    void* args[] = {&a, &b, &roundsArg, &valid};
+    CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<void*>(gridRotate), blocks, block, args, 0, nullptr));
+    std::vector<int> got(n);
+    int isValid = 0;
+    CHECK(cudaMemcpy(got.data(), rounds % 2 ? b : a, n * sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(&isValid, valid, sizeof(int), cudaMemcpyDeviceToHost));
+    std::vector<int> want = host, next(n);
+    for (int r = 0; r < rounds; ++r) {
+        for (int i = 0; i < n; ++i) next[i] = want[(i + block + 1) % n] + 1;
+        want.swap(next);
+    }
+    bool ok = coop == 1 && isValid == 1 && expectEqual("grid.sync", got, want);
+
+    // the same through cudaLaunchKernelEx's cooperative attribute
+    CHECK(cudaMemcpy(a, host.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+    cudaLaunchAttribute attr;
+    attr.id = cudaLaunchAttributeCooperative;
+    attr.val.cooperative = 1;
+    cudaLaunchConfig_t config = {};
+    config.gridDim = blocks;
+    config.blockDim = block;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+    CHECK(cudaLaunchKernelExC(&config, reinterpret_cast<void*>(gridRotate), args));
+    CHECK(cudaMemcpy(got.data(), rounds % 2 ? b : a, n * sizeof(int), cudaMemcpyDeviceToHost));
+    ok = ok && expectEqual("cudaLaunchKernelEx cooperative", got, want);
+
+    gridValid<<<1, 32>>>(valid);  // an ordinary launch has no grid group
+    CHECK(cudaMemcpy(&isValid, valid, sizeof(int), cudaMemcpyDeviceToHost));
+    ok = ok && isValid == 0;
+
+    // more blocks than can be resident at once
+    const cudaError_t e = cudaLaunchCooperativeKernel(reinterpret_cast<void*>(gridRotate), sms * perSm + 1, block,
+                                                      args, 0, nullptr);
+    ok = ok && e == cudaErrorCooperativeLaunchTooLarge;
+    cudaGetLastError();
+    if (!ok) std::fprintf(stderr, "  cooperative: attribute %d, is_valid %d, too large -> %d\n", coop, isValid, int(e));
+    CHECK(cudaFree(a));
+    CHECK(cudaFree(b));
+    CHECK(cudaFree(valid));
+    if (!ok) ++g_mismatches;
+    return ok;
+}
+
+// ---- several devices (VULKANIZER_ALLOW_CPU=1 adds llvmpipe next to the GPU) ----------------------
+
+static bool testMultiGpu() {
+    int count = 0;
+    CHECK(cudaGetDeviceCount(&count));
+    if (count < 2) return true;
+    const int n = 4096;
+    std::vector<float> host(n);
+    for (int i = 0; i < n; ++i) host[i] = float(i % 7);
+    float *d0, *d1;
+    CHECK(cudaSetDevice(0));
+    CHECK(cudaMalloc(&d0, n * sizeof(float)));
+    CHECK(cudaMemcpy(d0, host.data(), n * sizeof(float), cudaMemcpyHostToDevice));
+    squarePlusOne<<<(n + 255) / 256, 256>>>(d0, n);  // x*x+1 on device 0
+    cudaEvent_t done0;
+    CHECK(cudaEventCreateWithFlags(&done0, cudaEventDisableTiming));
+    CHECK(cudaEventRecord(done0, nullptr));
+
+    CHECK(cudaSetDevice(1));
+    cudaStream_t s1;
+    CHECK(cudaStreamCreate(&s1));
+    CHECK(cudaMalloc(&d1, n * sizeof(float)));
+    CHECK(cudaStreamWaitEvent(s1, done0, 0));  // another device's event
+    CHECK(cudaMemcpyPeerAsync(d1, 1, d0, 0, n * sizeof(float), s1));
+    squarePlusOne<<<(n + 255) / 256, 256, 0, s1>>>(d1, n);  // and again on device 1
+    std::vector<float> got(n);
+    CHECK(cudaMemcpyAsync(got.data(), d1, n * sizeof(float), cudaMemcpyDeviceToHost, s1));
+    CHECK(cudaStreamSynchronize(s1));
+    std::vector<float> want(n);
+    for (int i = 0; i < n; ++i) {
+        const float once = host[i] * host[i] + 1.0f;
+        want[i] = once * once + 1.0f;
+    }
+    bool ok = expectEqual("peer copy between devices", got, want);
+
+    CHECK(cudaMemcpyPeer(d0, 0, d1, 1, n * sizeof(float)));  // back to device 0
+    CHECK(cudaSetDevice(0));
+    CHECK(cudaMemcpy(got.data(), d0, n * sizeof(float), cudaMemcpyDeviceToHost));
+    ok = expectEqual("peer copy back", got, want) && ok;
+
+    int access = 1;
+    CHECK(cudaDeviceCanAccessPeer(&access, 0, 1));
+    ok = ok && access == 0 && cudaDeviceEnablePeerAccess(1, 0) == cudaErrorPeerAccessUnsupported;
+    cudaGetLastError();
+    CHECK(cudaFree(d0));
+    CHECK(cudaSetDevice(1));
+    CHECK(cudaFree(d1));
+    CHECK(cudaStreamDestroy(s1));
+    CHECK(cudaSetDevice(0));
+    CHECK(cudaEventDestroy(done0));
     if (!ok) ++g_mismatches;
     return ok;
 }
@@ -1007,7 +1149,7 @@ int main(int argc, char** argv) {
                           {"limits", testLimits}, {"half", testHalf},
                           {"fma", testFma}, {"packing", testPacking},
                           {"graphs", testGraphs}, {"managed", testManaged},
-                          {"halfatomics", testHalfAtomics}};
+                          {"halfatomics", testHalfAtomics}, {"cooperative", testCooperative}, {"multigpu", testMultiGpu}};
     int failed = 0;
     for (const Test& t : tests) {
         bool selected = argc < 2;
