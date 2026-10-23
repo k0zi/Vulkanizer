@@ -1,0 +1,32 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// C = alpha A op(B) + beta C with A sparse CSR (m x k; already transposed by the host side if
+// op(A) was), B and C dense; also SpMV (n = 1). One work item per element of C, batch entries
+// after each other. ptr: 0 row offsets, 1 column indices, 2 values (of A), 3 B, 4 C;
+// stride: 0 A's offsets, 1 A's columns and values, 2 B, 3 C (per batch entry); ld0, ld1: B's
+// and C's leading dimensions; kTrans1: op(B) = B^T.
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const int m = p.m, n = p.n, plane = m * n, b = item / plane, rest = item - b * plane;
+    const bool cRow = (p.flags & kRowMajor1) != 0u, bRow = (p.flags & kRowMajor0) != 0u;
+    // consecutive items run along C's contiguous dimension
+    const int i = cRow ? rest / n : rest % m, j = cRow ? rest % n : rest / m;
+    const bool wideOffsets = (p.flags & kIndex64A) != 0u, wideColumns = (p.flags & kIndex64B) != 0u;
+    const int base = baseOf(0), offsets = b * p.stride[0], entries = b * p.stride[1];
+    const uint64_t B = p.ptr[3] + uint64_t(uint(b * p.stride[2])) * REAL_BYTES;
+    const bool transB = (p.flags & kTrans1) != 0u;
+    const int first = indexAt(p.ptr[0], offsets + i, wideOffsets) - base;
+    const int last = indexAt(p.ptr[0], offsets + i + 1, wideOffsets) - base;
+    real s = real(0);
+    for (int t = first; t < last; ++t) {
+        const int l = indexAt(p.ptr[1], entries + t, wideColumns) - base;
+        const real bv = transB ? realAt(B, denseIndex(j, l, p.ld0, bRow)).v : realAt(B, denseIndex(l, j, p.ld0, bRow)).v;
+        s += realAt(p.ptr[2], entries + t).v * bv;
+    }
+    Real c = realAt(p.ptr[4], b * p.stride[3] + denseIndex(i, j, p.ld1, cRow));
+    c.v = (p.flags & kBetaZero) != 0u ? alpha() * s : alpha() * s + beta() * c.v;
+}

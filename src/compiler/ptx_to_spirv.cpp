@@ -2708,6 +2708,10 @@ private:
         else if (op == "sad" || op == "cnot" || op == "slct") emitMisc(ins);
         else if (op == "dp4a" || op == "dp2a") emitDotProduct(ins);
         else if (op == "brkpt" || op == "pmevent" || op == "nanosleep") {}  // no effect here
+        // Programmatic dependent launch (sm_90): kernels of a stream already run one after the other,
+        // each seeing the previous one's writes, so waiting for the prerequisite grid and releasing
+        // the dependent one are both no-ops.
+        else if (op == "griddepcontrol") {}
         else if (op == "set") emitSet(ins);
         else if (op == "shfl") emitShfl(ins);
         else if (op == "mma") emitMma(ins);

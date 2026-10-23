@@ -228,6 +228,47 @@ endfunction()
 vulkanizer_cufft("" 11 11.4.1 ${CMAKE_BINARY_DIR}/lib)
 vulkanizer_cufft(13 12 12.4.0 ${CMAKE_BINARY_DIR}/lib/cuda13)
 
+# cuSPARSE: libcusparse.so.12 for CUDA 12 and CUDA 13 (in lib/cuda13, with that release's version);
+# GLSL kernels in f32 and f64 (-DDOUBLE).
+set(cusparse_gen ${CMAKE_CURRENT_BINARY_DIR}/cusparse)
+set(cusparse_shaders)
+foreach(shader spmm sddmm spsv csr_util geam)
+  foreach(variant "" _f64)
+    set(defines)
+    if(variant)
+      set(defines -DDOUBLE)
+    endif()
+    add_custom_command(
+      OUTPUT ${cusparse_gen}/${shader}${variant}.comp.inc
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${cusparse_gen}
+      COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num ${defines} -I ${CMAKE_CURRENT_SOURCE_DIR}/cusparse/shaders
+              -o ${cusparse_gen}/${shader}${variant}.comp.inc ${CMAKE_CURRENT_SOURCE_DIR}/cusparse/shaders/${shader}.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cusparse/shaders/${shader}.comp ${CMAKE_CURRENT_SOURCE_DIR}/cusparse/shaders/common.glsl
+      COMMENT "glslc ${shader}${variant}.comp"
+    )
+    list(APPEND cusparse_shaders ${cusparse_gen}/${shader}${variant}.comp.inc)
+  endforeach()
+endforeach()
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cusparse/libcusparse.map.in ${CMAKE_CURRENT_BINARY_DIR}/libcusparse.map COPYONLY)
+function(vulkanizer_cusparse suffix version outdir)
+  set(map ${CMAKE_CURRENT_BINARY_DIR}/libcusparse.map)
+  add_library(vulkanizer_cusparse${suffix} SHARED cusparse/cusparse.cpp cusparse/cusparse_stubs.cpp ${cusparse_shaders})
+  target_link_libraries(vulkanizer_cusparse${suffix} PRIVATE vulkanizer_common vulkanizer_cuda)
+  target_include_directories(vulkanizer_cusparse${suffix} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${cusparse_gen}
+    PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
+  string(REPLACE "." ";" parts ${version})  # cusparseGetVersion: major * 1000 + minor * 100 + patch
+  list(GET parts 0 v0)
+  list(GET parts 1 v1)
+  list(GET parts 2 v2)
+  math(EXPR version_number "${v0} * 1000 + ${v1} * 100 + ${v2}")
+  target_compile_definitions(vulkanizer_cusparse${suffix} PRIVATE VULKANIZER_CUSPARSE_VERSION=${version_number})
+  set_target_properties(vulkanizer_cusparse${suffix} PROPERTIES OUTPUT_NAME cusparse VERSION ${version}
+    SOVERSION 12 LINK_DEPENDS ${map} LIBRARY_OUTPUT_DIRECTORY ${outdir})
+  target_link_options(vulkanizer_cusparse${suffix} PRIVATE -Wl,--version-script=${map} -Wl,--no-undefined)
+endfunction()
+vulkanizer_cusparse("" 12.5.10 ${CMAKE_BINARY_DIR}/lib)
+vulkanizer_cusparse(13 12.8.6 ${CMAKE_BINARY_DIR}/lib/cuda13)
+
 # NVRTC PTX shim, an LD_AUDIT library (run_torch.sh, vulkanizer-run --torch): run-time compiled
 # programs get their PTX instead of a cubin.
 add_library(vulkanizer_nvrtc SHARED nvrtc/nvrtc_ptx.cpp)

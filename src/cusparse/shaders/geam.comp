@@ -1,0 +1,54 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// C = alpha A + beta B for CSR matrices with sorted columns (csrgeam2), 32-bit indices; bases of
+// A, B, C in the flags. By mode, one work item per row (Count, Columns) or per entry of C (Values):
+//   Count:    ptr4[i + 1] = the entries of row i of C (the union of A's and B's columns); ptr4[0] = 0
+//   Columns:  row i of C's columns (ptr5) from the merge, and for each entry where its values come
+//             from: ptr6[t] = A's entry or -1, ptr6[t + extra] = B's entry or -1 (extra: the size bound)
+//   Values:   ptr2[t] = alpha A[ptr6[t]] + beta B[ptr6[t + extra]] (ptr0: A's values, ptr1: B's) for
+//             the entries of C (fewer than items: ptr3[m] - base is C's offsets' end)
+// ptr0, ptr1: A's offsets and columns; ptr2, ptr3: B's (Count, Columns); ptr4: C's offsets.
+
+const uint kCountMode = 0u, kColumnsMode = 1u, kValuesMode = 2u;
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const uint md = mode();
+    if (md == kValuesMode) {
+        if (item >= intAt(p.ptr[3], p.m).v - baseOf(2)) return;
+        const int a = intAt(p.ptr[6], item).v, b = intAt(p.ptr[6], item + p.extra).v;
+        real v = real(0);
+        if (a >= 0) v += alpha() * realAt(p.ptr[0], a).v;
+        if (b >= 0) v += beta() * realAt(p.ptr[1], b).v;
+        realAt(p.ptr[2], item).v = v;
+        return;
+    }
+    const int baseA = baseOf(0), baseB = baseOf(1), baseC = baseOf(2), i = item;
+    int ta = intAt(p.ptr[0], i).v - baseA;
+    const int ea = intAt(p.ptr[0], i + 1).v - baseA;
+    int tb = intAt(p.ptr[2], i).v - baseB;
+    const int eb = intAt(p.ptr[2], i + 1).v - baseB;
+    int pos = md == kColumnsMode ? intAt(p.ptr[4], i).v - baseC : 0;
+    int count = 0;
+    while (ta < ea || tb < eb) {
+        const int ca = ta < ea ? intAt(p.ptr[1], ta).v - baseA : 0x7FFFFFFF;
+        const int cb = tb < eb ? intAt(p.ptr[3], tb).v - baseB : 0x7FFFFFFF;
+        const int c = min(ca, cb);
+        if (md == kColumnsMode) {
+            intAt(p.ptr[5], pos).v = c + baseC;
+            intAt(p.ptr[6], pos).v = ca == c ? ta : -1;
+            intAt(p.ptr[6], pos + p.extra).v = cb == c ? tb : -1;
+            ++pos;
+        }
+        if (ca == c) ++ta;
+        if (cb == c) ++tb;
+        ++count;
+    }
+    if (md == kCountMode) {
+        intAt(p.ptr[4], i + 1).v = count;
+        if (i == 0) intAt(p.ptr[4], 0).v = 0;
+    }
+}

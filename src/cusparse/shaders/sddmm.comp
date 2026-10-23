@@ -1,0 +1,37 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// C = alpha (op(A) op(B)) .* spy(C) + beta C with C sparse CSR (m x n), A and B dense (op(A) m x k,
+// op(B) k x n): one work item per stored element of C (its row found by binary search in the
+// offsets), batch entries after each other. ptr: 0 C's offsets, 1 columns, 2 values, 3 A, 4 B;
+// stride: 0 C's offsets, 1 C's columns and values, 2 A, 3 B; ld0, ld1: A's and B's leading
+// dimensions; extra: C's nnz per batch entry.
+
+void main() {
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const int nnz = p.extra, b = item / nnz, t = item - b * nnz;
+    const bool wideOffsets = (p.flags & kIndex64A) != 0u, wideColumns = (p.flags & kIndex64B) != 0u;
+    const int base = baseOf(0), offsets = b * p.stride[0], entries = b * p.stride[1];
+    // the row: the last i with offsets[i] <= t
+    int lo = 0, hi = p.m;
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if (indexAt(p.ptr[0], offsets + mid, wideOffsets) - base <= t) lo = mid;
+        else hi = mid;
+    }
+    const int i = lo, j = indexAt(p.ptr[1], entries + t, wideColumns) - base;
+    const bool aRow = (p.flags & kRowMajor0) != 0u, bRow = (p.flags & kRowMajor1) != 0u;
+    const bool transA = (p.flags & kTrans0) != 0u, transB = (p.flags & kTrans1) != 0u;
+    const uint64_t A = p.ptr[3] + uint64_t(uint(b * p.stride[2])) * REAL_BYTES;
+    const uint64_t B = p.ptr[4] + uint64_t(uint(b * p.stride[3])) * REAL_BYTES;
+    real s = real(0);
+    for (int l = 0; l < p.k; ++l) {
+        const real av = transA ? realAt(A, denseIndex(l, i, p.ld0, aRow)).v : realAt(A, denseIndex(i, l, p.ld0, aRow)).v;
+        const real bv = transB ? realAt(B, denseIndex(j, l, p.ld1, bRow)).v : realAt(B, denseIndex(l, j, p.ld1, bRow)).v;
+        s += av * bv;
+    }
+    Real c = realAt(p.ptr[2], entries + t);
+    c.v = (p.flags & kBetaZero) != 0u ? alpha() * s : alpha() * s + beta() * c.v;
+}

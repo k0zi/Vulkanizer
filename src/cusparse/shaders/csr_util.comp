@@ -1,0 +1,72 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Index helpers, by mode:
+//   Iota:      ptr0[i] = i (items = n)
+//   CooToCsr:  ptr1[i] = (the number of entries of the sorted COO rows ptr0 below row i) + extra,
+//              i <= m (items = m + 1; kIndex64A: ptr0 is 64-bit; base of ptr0: A)
+//   Scan:      ptr0[0..items) = its inclusive prefix sum, plus extra (one workgroup)
+//   Count:     for each entry t < items: ++ptr1[ptr0[t] - base + 1] (atomic; ptr0: columns)
+//   Transpose: rows i < items of CSR (ptr0 offsets, ptr1 columns, ptr2 values) scattered into the
+//              CSR of the transpose: position atomicAdd(ptr3[column]) into ptr4 (rows) and ptr5
+//              (values)
+//   Nnz:       ptr0[0] = ptr1[m] - extra
+
+const uint kIota = 0u, kCooToCsr = 1u, kScan = 2u, kCount = 3u, kTranspose = 4u, kNnz = 5u;
+
+shared int sums[256];
+
+void main() {
+    const uint md = mode();
+    if (md == kScan) {
+        // each thread a contiguous chunk: its sum, a scan of the sums, then the chunk again
+        const int tid = int(gl_LocalInvocationID.x), count = p.items, chunk = (count + 255) / 256;
+        const int first = min(tid * chunk, count), last = min(first + chunk, count);
+        int s = 0;
+        for (int i = first; i < last; ++i) s += intAt(p.ptr[0], i).v;
+        sums[tid] = s;
+        barrier();
+        for (int w = 1; w < 256; w <<= 1) {
+            const int v = tid >= w ? sums[tid - w] : 0;
+            barrier();
+            sums[tid] += v;
+            barrier();
+        }
+        int running = (tid > 0 ? sums[tid - 1] : 0) + p.extra;
+        for (int i = first; i < last; ++i) {
+            running += intAt(p.ptr[0], i).v;
+            intAt(p.ptr[0], i).v = running;
+        }
+        return;
+    }
+    const int item = itemIndex();
+    if (item >= p.items) return;
+    const bool wideA = (p.flags & kIndex64A) != 0u, wideB = (p.flags & kIndex64B) != 0u;
+    if (md == kIota) {
+        intAt(p.ptr[0], item).v = item;
+    } else if (md == kCooToCsr) {
+        // lower bound of row `item` in the sorted rows
+        const int base = baseOf(0);
+        int lo = 0, hi = p.k;  // k: nnz
+        while (lo < hi) {
+            const int mid = (lo + hi) / 2;
+            if (indexAt(p.ptr[0], mid, wideA) - base < item) lo = mid + 1;
+            else hi = mid;
+        }
+        intAt(p.ptr[1], item).v = lo + p.extra;
+    } else if (md == kCount) {
+        atomicAdd(intAt(p.ptr[1], indexAt(p.ptr[0], item, wideB) - baseOf(0) + 1).v, 1);
+    } else if (md == kTranspose) {
+        const int base = baseOf(0);
+        const int first = indexAt(p.ptr[0], item, wideA) - base, last = indexAt(p.ptr[0], item + 1, wideA) - base;
+        for (int t = first; t < last; ++t) {
+            const int j = indexAt(p.ptr[1], t, wideB) - base;
+            const int at = atomicAdd(intAt(p.ptr[3], j).v, 1);
+            intAt(p.ptr[4], at).v = item;
+            realAt(p.ptr[5], at).v = realAt(p.ptr[2], t).v;
+        }
+    } else if (md == kNnz) {
+        intAt(p.ptr[0], 0).v = intAt(p.ptr[1], p.m).v - p.extra;
+    }
+}

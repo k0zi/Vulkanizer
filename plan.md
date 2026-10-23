@@ -56,7 +56,7 @@ Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
 
 Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
-2. **4.2** További könyvtárak: a `libcusolver` és a `libcufft` kész, hátra a `libcusparse` (ha kell).
+2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
 3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
 4. **5.6** maradéka: IPC (`cudaIpc*`, a PyTorch multiprocessing tenzor-megosztásához), NCCL, eszközök közti UVA.
 5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
@@ -216,7 +216,26 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     - Tesztek: `tests/cufft.cpp` (ctest, 30 eset, RADV és llvmpipe), `torch_fft` (CUDA 12 és 13 – ALL OK).
     - Hátra (ha kell): négylépéses FFT a 2048-nál hosszabb vonalakra (két shared memóriás dispatch a sok globális pass
       helyett), R2C/C2R fél hosszú komplex trükkel, callbackek.
-  - [ ] `libcusparse` (a PyTorch sparse része init hibával áll meg), `libcurand` (a PyTorch nem használja).
+  - [x] `libcusparse.so.12` (CUDA 12 és 13 is `.so.12`; a `lib/cuda13`-ban a 13-as verziószámmal) – a `torch.sparse`
+    (a `cusparseCreate` korábban inicializálási hibával állt meg).
+    - Generikus API: CSR/COO és sűrű leírók (32/64 bites indexek, 0/1 bázis, sor-/oszlopfolytonos, strided batch),
+      SpMV, SpMM (op(A) = A^T: a transzponált CSR-jét a munkaterületen építi, atomikus számlálással), SDDMM,
+      SpSV/SpSM (egy munkacsoport jobb oldalanként, soronként; mindkét háromszög, transzponált, egységátló),
+      SpGEMM; a régi API-ból `csrgeam2` (+`Xcsrgeam2Nnz`), `Xcoo2csr`, `CreateIdentityPermutation`, `Xcoosort`,
+      `Xcsrsort`, mátrixleírók.
+    - Hoston fut (a streamet szinkronizálja): SpGEMM és a két rendezés – ritkán hívottak, a GPU-s változat (hash
+      vagy rendezés) sokkal több munka.
+    - COO bemenetnél a sorok rendezettek (a PyTorch coalesced tenzorai ilyenek): a sor-offseteket bináris
+      kereséssel számolja.
+    - Nincs: BSR (`bsrmm`, `bsrmv`, `bsrsv2`, `bsrsm2`) és komplex típusok – `NOT_SUPPORTED` stubok.
+    - Közben javítva: a PTX `griddepcontrol` (sm_90 programmatic dependent launch, a CUB merge sortjában) no-op
+      (egy stream kernelei amúgy is egymás után, egymás írásait látva futnak). llvmpipe: a csökkenő sorrendű
+      ciklus következő iterációjának betöltését a fordítója előre hozza, a -1. sor címe a bufferen kívül esik –
+      az indexet 0-ra kell vágni.
+    - Tesztek: `tests/cusparse.cpp` (ctest, 43 eset, RADV és llvmpipe), `torch_sparse` (sparse.mm COO/CSR, addmm,
+      mv, backward, dense@CSR, sampled_addmm, CSR+CSR, CSR@CSR, triangular_solve, bmm COO, COO→CSR; CUDA 12 és
+      13 – ALL OK). A batched CSR-t a PyTorch CUDA buildje maga tiltja.
+  - [ ] `libcurand` – a PyTorch nem használja (saját Philox generátora van); csak ha egy alkalmazás kéri.
 - [x] **4.3** Célalkalmazás: a llama.cpp CUDA backendje (`tools/build_llama.sh`).
 - [x] **4.4 Mérföldkő:** a SmolLM2-135M (Q8_0 és Q4_0) szöveget generál a Renoir iGPU-n.
   - `llama-bench`: pp64 ≈ 227 t/s, tg32 ≈ 25 t/s.

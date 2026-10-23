@@ -1,0 +1,89 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// op(A) Y = alpha X for the triangular n x n CSR A (SpSV, SpSM): one workgroup per right-hand side
+// (column of X and Y), the rows one after another. A's lower (or kUpper: upper) triangle is used,
+// the other one ignored; kUnit: unit diagonal. ptr: 0 offsets, 1 columns, 2 values, 3 X, 4 Y;
+// ld0, ld1: X's and Y's leading dimensions; k: the right-hand sides.
+//   op(A) = A:    row i: Y_i = (Y_i - sum_j A_ij Y_j) / A_ii, rows in the direction of the triangle;
+//   op(A) = A^T:  Y_i = Y_i / A_ii, then Y_j -= A_ij Y_i for the row's other entries, rows in the
+//                 opposite direction.
+
+const uint kUpper = 1u << 20, kUnit = 1u << 21;
+
+shared real partial[256];
+shared real diagonals[256];  // the diagonal entry, reduced like the sums
+
+void main() {
+    const int col = groupIndex(), tid = int(gl_LocalInvocationID.x), n = p.n;
+    if (col >= p.k) return;
+    const bool xRow = (p.flags & kRowMajor0) != 0u, yRow = (p.flags & kRowMajor1) != 0u;
+    const bool upper = (p.flags & kUpper) != 0u, unit = (p.flags & kUnit) != 0u, trans = (p.flags & kTrans0) != 0u;
+    const bool wideOffsets = (p.flags & kIndex64A) != 0u, wideColumns = (p.flags & kIndex64B) != 0u;
+    const int base = baseOf(0);
+    for (int i = tid; i < n; i += 256)
+        sharedRealAt(p.ptr[4], denseIndex(i, col, p.ld1, yRow)).v = alpha() * realAt(p.ptr[3], denseIndex(i, col, p.ld0, xRow)).v;
+    memoryBarrier();
+    barrier();
+    // rows ascending for a lower system (A lower, or A^T with A upper). The descending row index is
+    // clamped at 0 although the loop never goes below: llvmpipe's compiler loads the next
+    // iteration's offsets ahead, and at -1 that address is far outside the buffer.
+    const bool ascending = upper == trans;
+    if (!trans) {
+        for (int step = 0; step < n; ++step) {
+            const int i = ascending ? step : max(n - 1 - step, 0);  // clamped: see below
+            const int first = indexAt(p.ptr[0], i, wideOffsets) - base, last = indexAt(p.ptr[0], i + 1, wideOffsets) - base;
+            real s = real(0), d = real(0);
+            for (int t = first + tid; t < last; t += 256) {
+                const int j = indexAt(p.ptr[1], t, wideColumns) - base;
+                const real a = realAt(p.ptr[2], t).v;
+                if (j == i) d = a;
+                else if (upper ? j > i : j < i) s += a * sharedRealAt(p.ptr[4], denseIndex(j, col, p.ld1, yRow)).v;
+            }
+            partial[tid] = s;
+            diagonals[tid] = d;
+            barrier();
+            for (int w = 128; w > 0; w >>= 1) {
+                if (tid < w) {
+                    partial[tid] += partial[tid + w];
+                    diagonals[tid] += diagonals[tid + w];
+                }
+                barrier();
+            }
+            if (tid == 0) {
+                SharedReal y = sharedRealAt(p.ptr[4], denseIndex(i, col, p.ld1, yRow));
+                y.v = (y.v - partial[0]) / (unit ? real(1) : diagonals[0]);
+            }
+            memoryBarrier();
+            barrier();
+        }
+        return;
+    }
+    for (int step = 0; step < n; ++step) {
+        const int i = ascending ? step : max(n - 1 - step, 0);
+        const int first = indexAt(p.ptr[0], i, wideOffsets) - base, last = indexAt(p.ptr[0], i + 1, wideOffsets) - base;
+        real d = real(0);
+        for (int t = first + tid; t < last; t += 256)
+            if (indexAt(p.ptr[1], t, wideColumns) - base == i) d = realAt(p.ptr[2], t).v;
+        diagonals[tid] = d;
+        barrier();
+        for (int w = 128; w > 0; w >>= 1) {
+            if (tid < w) diagonals[tid] += diagonals[tid + w];
+            barrier();
+        }
+        // x_i, then its contribution to the rows still to come
+        const real x = sharedRealAt(p.ptr[4], denseIndex(i, col, p.ld1, yRow)).v / (unit ? real(1) : diagonals[0]);
+        barrier();
+        if (tid == 0) sharedRealAt(p.ptr[4], denseIndex(i, col, p.ld1, yRow)).v = x;
+        for (int t = first + tid; t < last; t += 256) {
+            const int j = indexAt(p.ptr[1], t, wideColumns) - base;
+            if (upper ? j > i : j < i) {
+                SharedReal y = sharedRealAt(p.ptr[4], denseIndex(j, col, p.ld1, yRow));
+                y.v -= realAt(p.ptr[2], t).v * x;
+            }
+        }
+        memoryBarrier();
+        barrier();
+    }
+}
