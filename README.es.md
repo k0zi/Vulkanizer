@@ -49,10 +49,10 @@ build/bin/vulkanizer-info                       # qué dispositivos Vulkan ve Vu
 ```
 
 Las bibliotecas compiladas están en `build/lib/`: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`,
-`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`. `build/lib/cuda13/` contiene las
-versiones CUDA 13 del runtime y de las bibliotecas (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`,
-`libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`), para programas compilados con CUDA 13; usan la misma
-`libcuda.so.1`.
+`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`, `libnccl.so.2`. `build/lib/cuda13/`
+contiene las versiones CUDA 13 del runtime y de las bibliotecas (`libcudart.so.13`, `libcublas.so.13`,
+`libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`), para programas compilados con CUDA
+13; usan la misma `libcuda.so.1`.
 
 #### Instalación (paquete)
 
@@ -234,9 +234,11 @@ Lista completa: [plan.md, sección 4](plan.md).
 - No se ejecuta SASS: solo funcionan los binarios que contienen PTX.
 - CUDA Graphs: la captura de streams y la reproducción funcionan (los grafos de llama.cpp, `CUDAGraph` de PyTorch,
   `torch.compile(mode="reduce-overhead")`); no hay grafos hijos, nodos de memoria ni nodos condicionales.
-- (Aún) no compatible: texturas, cuDNN, NCCL.
+- (Aún) no compatible: texturas, cuDNN.
 - El IPC de CUDA (`cudaIpc*`, `torch.multiprocessing` de PyTorch) funciona entre procesos del mismo usuario; un evento
   entre procesos está completo en cuanto se registra (registrarlo espera al dispositivo).
+- NCCL (`libnccl.so.2`, el backend "nccl" de `torch.distributed`: DDP, FSDP) funciona entre los rangos de una
+  máquina, que pueden compartir una GPU; con más de un rango los datos pasan por la memoria del host.
 - Varias GPU son dispositivos separados: `cudaMemcpyPeer` copia entre ellas a través de la memoria del anfitrión, pero
   un kernel nunca accede a la memoria de otra GPU (sin acceso entre pares). Los lanzamientos cooperativos
   (`grid.sync()`) funcionan hasta el número de bloques que caben a la vez en la GPU.
@@ -246,7 +248,7 @@ Lista completa: [plan.md, sección 4](plan.md).
   revalida las páginas importadas, ~4 ms por 256 MB); la memoria fijada y la managed no se ven afectadas.
 - La flash attention de llama.cpp funciona correctamente (`tools/build_llama.sh --fa`), pero sin tensor cores el
   procesamiento del prompt es más lento con ella, por eso está desactivada por defecto.
-- PyTorch: sin kernels de cuDNN, NCCL ni de atención fusionada; un `assert` fallido en el dispositivo solo detiene el
+- PyTorch: sin kernels de cuDNN ni de atención fusionada; un `assert` fallido en el dispositivo solo detiene el
   hilo (no hay `cudaErrorAssert`).
 - cuSOLVER: solo tipos reales (f32, f64), sin `gesvda`, LDL^T (`sytrf`) ni problemas de valores propios no simétricos
   (`geev`); `eigh` y la SVD usan iteraciones de Jacobi, lentas para matrices grandes (n ≳ 1000). cuFFT: sin callbacks
@@ -292,6 +294,7 @@ src/linalg            factorizaciones densas (LU, Cholesky, QR, eigh/SVD de Jaco
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (FFT de Stockham y de Bluestein en GLSL), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 en GLSL), include/cusparse/cusparse.h
+src/nccl              libnccl.so.2 (colectivas entre los rangos de una máquina), include/nccl/nccl.h
 src/nvrtc             biblioteca LD_AUDIT: NVRTC entrega PTX en lugar de un cubin (jiterator de PyTorch)
 tests/                pruebas de la API Driver + prueba interna de Vulkan
 tests/cuda            programas de la API Runtime compilados con nvcc

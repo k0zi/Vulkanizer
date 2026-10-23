@@ -13,7 +13,7 @@
 #   --profile        per-kernel GPU and per-call host times at exit (VULKANIZER_PROFILE=1)
 #   --gdb            run under gdb
 #
-# Vulkanizer's libcuda, libcudart, libcublas, libcublasLt, libcusolver, libcufft and libcusparse are preloaded, so PyTorch uses
+# Vulkanizer's libcuda, libcudart, libcublas, libcublasLt, libcusolver, libcufft, libcusparse and libnccl are preloaded, so PyTorch uses
 # them instead of the NVIDIA libraries in its environment. What needs NVIDIA hardware or libraries is
 # turned off (cuDNN and fused attention in tools/torch/sitecustomize.py, the rest below);
 # VULKANIZER_TORCH_DEFAULTS=0 keeps PyTorch's own defaults.
@@ -60,7 +60,7 @@ export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libc
 # a CUDA 13 build of PyTorch (tools/setup_torch.sh --cuda13) gets the .so.13 libraries from lib/cuda13
 CUDA_LIB="$LIB" CUDA_MAJOR=12
 if [[ -e "$ENV/lib/libcudart.so.13" ]]; then CUDA_LIB="$LIB/cuda13" CUDA_MAJOR=13; fi
-export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$CUDA_MAJOR:$CUDA_LIB/libcublas.so.$CUDA_MAJOR:$CUDA_LIB/libcublasLt.so.$CUDA_MAJOR:$CUDA_LIB/libcusolver.so.$((CUDA_MAJOR - 1)):$CUDA_LIB/libcufft.so.$((CUDA_MAJOR - 1)):$CUDA_LIB/libcusparse.so.12${LD_PRELOAD:+:$LD_PRELOAD}"
+export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$CUDA_MAJOR:$CUDA_LIB/libcublas.so.$CUDA_MAJOR:$CUDA_LIB/libcublasLt.so.$CUDA_MAJOR:$CUDA_LIB/libcusolver.so.$((CUDA_MAJOR - 1)):$CUDA_LIB/libcufft.so.$((CUDA_MAJOR - 1)):$CUDA_LIB/libcusparse.so.12:$LIB/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
 # run-time compiled kernels (the jiterator) as PTX, not cubins (src/nvrtc/nvrtc_ptx.cpp)
 export LD_AUDIT="$LIB/libvulkanizer_nvrtc.so${LD_AUDIT:+:$LD_AUDIT}"
 # a libtorch test by name (torch_ops, ...) or any other program instead of Python

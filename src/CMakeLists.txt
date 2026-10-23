@@ -270,6 +270,15 @@ endfunction()
 vulkanizer_cusparse("" 12.5.10 ${CMAKE_BINARY_DIR}/lib)
 vulkanizer_cusparse(13 12.8.6 ${CMAKE_BINARY_DIR}/lib/cuda13)
 
+# NCCL: libnccl.so.2, one for CUDA 12 and 13 (it uses only the driver API).
+add_library(vulkanizer_nccl SHARED nccl/nccl.cpp nccl/nccl_stubs.cpp)
+target_link_libraries(vulkanizer_nccl PRIVATE vulkanizer_common vulkanizer_cuda)
+target_include_directories(vulkanizer_nccl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} PUBLIC ${PROJECT_SOURCE_DIR}/include)
+set_target_properties(vulkanizer_nccl PROPERTIES OUTPUT_NAME nccl VERSION 2.32.3 SOVERSION 2
+  LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/nccl/libnccl.map LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+target_link_options(vulkanizer_nccl PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/nccl/libnccl.map
+  -Wl,--no-undefined)
+
 # NVRTC PTX shim, an LD_AUDIT library (run_torch.sh, vulkanizer-run --torch): run-time compiled
 # programs get their PTX instead of a cubin.
 add_library(vulkanizer_nvrtc SHARED nvrtc/nvrtc_ptx.cpp)

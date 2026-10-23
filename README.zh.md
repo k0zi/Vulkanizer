@@ -46,7 +46,7 @@ build/bin/vulkanizer-info                       # Vulkanizer 能看到哪些 Vul
 ```
 
 构建出的库位于 `build/lib/`：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、`libcublasLt.so.12`、
-`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`。`build/lib/cuda13/` 中是运行时和这些库的 CUDA 13 版本（`libcudart.so.13`、
+`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`、`libnccl.so.2`。`build/lib/cuda13/` 中是运行时和这些库的 CUDA 13 版本（`libcudart.so.13`、
 `libcublas.so.13`、`libcublasLt.so.13`、`libcusolver.so.12`、`libcufft.so.12`、`libcusparse.so.12`），
 供用 CUDA 13 构建的程序使用；它们使用同一个 `libcuda.so.1`。
 
@@ -224,8 +224,10 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - 不执行 SASS：只有包含 PTX 的二进制文件才能运行。
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
   不支持子图、内存节点和条件节点。
-- （尚）不支持：纹理、cuDNN、NCCL。
+- （尚）不支持：纹理、cuDNN。
 - CUDA IPC（`cudaIpc*`、PyTorch 的 `torch.multiprocessing`）可在同一用户的进程之间使用；跨进程事件在记录时即完成（记录会等待设备）。
+- NCCL（`libnccl.so.2`，`torch.distributed` 的 "nccl" 后端：DDP、FSDP）可在同一台机器的各 rank 之间使用，它们也可以共用一块 GPU；
+  多于一个 rank 时数据经由主机内存传输。
 - 多个 GPU 是彼此独立的设备：`cudaMemcpyPeer` 通过主机内存在它们之间复制，但内核永远无法访问另一个 GPU 的内存
   （没有对等访问）。协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU
@@ -234,7 +236,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
   锁页内存和托管内存不受影响。
 - llama.cpp 的 flash attention 可以正确运行（`tools/build_llama.sh --fa`），但在没有 tensor core 的情况下，
   它会让提示词处理变慢，因此默认关闭。
-- PyTorch：没有 cuDNN、NCCL 和融合 attention 内核；设备端 `assert` 失败只会停止该线程（没有 `cudaErrorAssert`）。
+- PyTorch：没有 cuDNN 和融合 attention 内核；设备端 `assert` 失败只会停止该线程（没有 `cudaErrorAssert`）。
 - cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；`eigh` 和 SVD
   使用 Jacobi 迭代，对大矩阵（n ≳ 1000）较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换每个基数
   遍历一次内存。cuSPARSE：没有块稀疏（BSR）格式和复数值；SpGEMM 和排序例程在主机上运行。
@@ -277,6 +279,7 @@ src/linalg            GLSL 编写的稠密分解（LU、Cholesky、QR、Jacobi e
 src/cusolver          libcusolver.so.11/.12，include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL 编写的 Stockham 与 Bluestein FFT），include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL 编写的 SpMV/SpMM/SDDMM/SpSV/csrgeam2），include/cusparse/cusparse.h
+src/nccl              libnccl.so.2（同一台机器各 rank 之间的集合通信），include/nccl/nccl.h
 src/nvrtc             LD_AUDIT 库：让 NVRTC 交出 PTX 而不是 cubin（PyTorch 的 jiterator）
 tests/                Driver API 测试 + 内部 Vulkan 测试
 tests/cuda            用 nvcc 编译的 Runtime API 程序

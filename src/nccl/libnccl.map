@@ -1,0 +1,5 @@
+/* Exported from libnccl.so.2 (unversioned, as NCCL's own). */
+{
+  global: nccl*;
+  local: *;
+};

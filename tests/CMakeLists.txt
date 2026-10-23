@@ -47,6 +47,8 @@ vulkanizer_cuda_test(cufft)
 target_link_libraries(cufft PRIVATE vulkanizer_cufft)
 vulkanizer_cuda_test(cusparse)
 target_link_libraries(cusparse PRIVATE vulkanizer_cusparse)
+vulkanizer_cuda_test(nccl)
+target_link_libraries(nccl PRIVATE vulkanizer_nccl)
 
 # Internal tests against Vulkanizer's own building blocks.
 add_executable(vk_dispatch vk_dispatch.cpp)

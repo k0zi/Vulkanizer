@@ -58,7 +58,7 @@ Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
 2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
 3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
-4. **5.6** maradéka: NCCL, eszközök közti UVA (az IPC kész).
+4. **5.6** maradéka: eszközök közti UVA (az IPC és az NCCL kész).
 5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
 6. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
    queue (5.4).
@@ -499,7 +499,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       (subgroup < 32) a predikált `redux`/`shfl` stb. minden szálon fut (a barrierek nem lehetnek divergens ágban), a
       predikátum csak a célregisztert választja.
     - Hátra: eszközök közti UVA (`cudaMemcpyDefault` két eszköz pointerével: a keresés a current context eszközén
-      belül történik), NCCL.
+      belül történik).
     - llama.cpp két eszközön (RADV + llvmpipe) eljut a rétegek szétosztásáig és a peer másolásig, de az llvmpipe-on a
       `rope_norm` kernel (blockDim.x = 1) összeomlik: az llvmpipe a `set_rows_stride != 0` feltétel mögötti
       `row_indices[i]` loadot a feltétel elé emeli (Volatile-lal is), és a null pointerből olvas. A Vulkanizer a loadot a
@@ -519,6 +519,27 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       már sub-allocation blokkot hoznak létre, és a későbbi foglalások abból kapnak.
     - Tesztek: `tests/ipc.cpp` (fork, két folyamat: kis és nagy foglalás, belső pointer, kétszeres megnyitás, GPU-írás
       mindkét irányban, event; RADV és llvmpipe); PyTorch `spawn`: tenzor a gyereknek, helyben módosítva, és vissza.
+  - [x] NCCL (`libnccl.so.2`, egy könyvtár CUDA 12-höz és 13-hoz: csak a driver API-t használja) – a PyTorch
+    `torch.distributed` "nccl" backendje (DDP, FSDP), egy gépen, akár egy GPU-n több ranggal (az NVIDIA NCCL-je ezt
+    nem engedi). Az NVIDIA libnccl-je itt nem futhat: statikusan linkeli a libcudart-ot, ami a driver nem
+    dokumentált `cuGetExportTable` interfészeit kéri.
+    - Egy rang: minden kollektíva egy eszközmásolás a streamen (premultiplikált összeg kivételével).
+    - Több rang: minden művelet post + complete. A post megvárja a streamet, és a rang hozzájárulását egy saját
+      POSIX shm objektumba teszi (neve: a unique id tokenje, a művelet sorszáma és a rang), nem blokkol; a complete
+      megvárja a kellő objektumokat, rang-sorrendben redukál (minden rang ugyanazokat a biteket kapja), és a
+      device-ra másolja. Az objektumot az utolsó olvasója törli. A group (`ncclGroupStart/End`) előbb mindent
+      postol, aztán completel: a send/recv párok és egy folyamat több kommunikátora (`ncclCommInitAll`) sem
+      várnak egymásra. A pont-pont üzenetek rang-páronként sorszámozottak.
+    - Kollektívák: AllReduce, Reduce, Broadcast/Bcast, AllGather, ReduceScatter, AlltoAll, Gather, Send/Recv;
+      sum/prod/max/min/avg és `ncclRedOpCreatePreMulSum` (host vagy device skalár); f16/bf16/f32/f64 és az egész
+      típusok (fp8-ra csak az adatmozgatók). `ncclCommSplit` (a (szín, kulcs) párok allgatherrel), `CommInitAll`,
+      `InitRankScalable`, `MemAlloc`, `CommRegister` (no-op). Nincs: szimmetrikus ablakok, device-kommunikátorok,
+      one-sided signal, shrink/grow – `ncclInvalidUsage` stubok.
+    - Az adat a hoston megy át (lassabb, mint egy GPU-s transzport; a DDP/FSDP egy gépen így is működik).
+    - Tesztek: `tests/nccl.cpp` (3 forkolt folyamat minden kollektívával és splittel, egy rang, egy folyamat 3
+      kommunikátora; RADV és llvmpipe); PyTorch: egyrangú DDP, `torchrun --nproc_per_node 2` DDP (a replikák
+      azonosak maradnak, `all_gather_object`, `barrier`) és FSDP2 (`fully_shard`; az egyfolyamatos referenciától
+      7e-9) CUDA 12-n és 13-on.
 
 ## 3. Ismert korlátok / kockázatok
 

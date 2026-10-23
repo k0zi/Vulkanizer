@@ -47,7 +47,7 @@ build/bin/vulkanizer-info                       # Vulkanizer から見える Vul
 ```
 
 ビルドされたライブラリは `build/lib/` にあります：`libcuda.so.1`、`libcudart.so.12`、`libcublas.so.12`、
-`libcublasLt.so.12`、`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム
+`libcublasLt.so.12`、`libcusolver.so.11`、`libcufft.so.11`、`libcusparse.so.12`、`libnccl.so.2`。`build/lib/cuda13/` には CUDA 13 でビルドされたプログラム
 向けのランタイムとライブラリの CUDA 13 版（`libcudart.so.13`、`libcublas.so.13`、`libcublasLt.so.13`、
 `libcusolver.so.12`、`libcufft.so.12`、`libcusparse.so.12`）があり、同じ `libcuda.so.1` を使います。
 
@@ -230,9 +230,11 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - SASS は実行できません。PTX を含むバイナリのみ動作します。
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフ、メモリノード、条件ノードは未対応です。
-- （まだ）未対応：テクスチャ、cuDNN、NCCL。
+- （まだ）未対応：テクスチャ、cuDNN。
 - CUDA IPC（`cudaIpc*`、PyTorch の `torch.multiprocessing`）は同じユーザーのプロセス間で動作します。プロセス間イベントは
   記録した時点で完了します（記録はデバイスを待ちます）。
+- NCCL（`libnccl.so.2`、`torch.distributed` の "nccl" バックエンド：DDP、FSDP）は 1 台のマシンのランク間で動作し、
+  ランクが 1 つの GPU を共有してもかまいません。ランクが複数のときはデータがホストメモリを経由します。
 - 複数の GPU はそれぞれ独立したデバイスです。`cudaMemcpyPeer` はホストメモリ経由でそれらの間をコピーしますが、カーネルが
   別の GPU のメモリにアクセスすることはできません（ピアアクセスなし）。協調起動（`grid.sync()`）は、GPU に同時に
   載るブロック数まで動作します。
@@ -242,7 +244,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
   ページを毎回再検証するため、256 MB あたり約 4 ms）。ピン留めメモリとマネージドメモリは影響を受けません。
 - llama.cpp の flash attention は正しく動作します（`tools/build_llama.sh --fa`）が、tensor core がない環境では
   プロンプト処理が遅くなるため、既定では無効です。
-- PyTorch：cuDNN、NCCL、融合 attention のカーネルはありません。デバイス側の `assert` が失敗してもそのスレッドが
+- PyTorch：cuDNN と融合 attention のカーネルはありません。デバイス側の `assert` が失敗してもそのスレッドが
   止まるだけです（`cudaErrorAssert` はありません）。
 - cuSOLVER：実数型（f32、f64）のみで、`gesvda`、LDL^T（`sytrf`）、非対称固有値問題（`geev`）はありません。`eigh` と
   SVD は Jacobi 反復を使うため、大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランは
@@ -287,6 +289,7 @@ src/linalg            GLSL による密行列分解（LU、Cholesky、QR、Jacob
 src/cusolver          libcusolver.so.11/.12、include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12（GLSL による Stockham と Bluestein の FFT）、include/cufft/cufft.h
 src/cusparse          libcusparse.so.12（GLSL による SpMV/SpMM/SDDMM/SpSV/csrgeam2）、include/cusparse/cusparse.h
+src/nccl              libnccl.so.2（1 台のマシンのランク間の集合通信）、include/nccl/nccl.h
 src/nvrtc             LD_AUDIT ライブラリ：NVRTC に cubin ではなく PTX を渡させる（PyTorch の jiterator）
 tests/                Driver API のテストと内部 Vulkan テスト
 tests/cuda            nvcc でコンパイルした Runtime API のプログラム

@@ -48,10 +48,10 @@ build/bin/vulkanizer-info                       # milyen Vulkan eszközöket lá
 ```
 
 A lefordított könyvtárak a `build/lib/`-ben vannak: `libcuda.so.1`, `libcudart.so.12`, `libcublas.so.12`,
-`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`. A `build/lib/cuda13/` a runtime és a
-könyvtárak CUDA 13-as változatait tartalmazza (`libcudart.so.13`, `libcublas.so.13`, `libcublasLt.so.13`,
-`libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`) a CUDA 13-mal fordított programokhoz; ezek ugyanazt a
-`libcuda.so.1`-et használják.
+`libcublasLt.so.12`, `libcusolver.so.11`, `libcufft.so.11`, `libcusparse.so.12`, `libnccl.so.2`. A `build/lib/cuda13/`
+a runtime és a könyvtárak CUDA 13-as változatait tartalmazza (`libcudart.so.13`, `libcublas.so.13`,
+`libcublasLt.so.13`, `libcusolver.so.12`, `libcufft.so.12`, `libcusparse.so.12`) a CUDA 13-mal fordított programokhoz;
+ezek ugyanazt a `libcuda.so.1`-et használják.
 
 #### Telepítés (csomag)
 
@@ -233,9 +233,11 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 - Nincs SASS-futtatás: csak PTX-et tartalmazó binárisok futnak.
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph, memória- és feltételes csomópont nincs.
-- (Még) nem támogatott: textúrák, cuDNN, NCCL.
+- (Még) nem támogatott: textúrák, cuDNN.
 - A CUDA IPC (`cudaIpc*`, a PyTorch `torch.multiprocessing`-je) azonos felhasználó folyamatai között működik; egy
   folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).
+- Az NCCL (`libnccl.so.2`, a `torch.distributed` „nccl” backendje: DDP, FSDP) egy gép rangjai között működik, akár
+  egy GPU-n osztozva; egynél több ranggal az adat a host-memórián megy át.
 - Több GPU külön eszközként működik: a `cudaMemcpyPeer` host-memórián át másol köztük, de egy kernel sosem éri el egy
   másik GPU memóriáját (nincs peer access). A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi
   egyszerre elfér a GPU-n.
@@ -245,7 +247,7 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   importált lapokat, ~4 ms / 256 MB); a pinned és a managed memóriát ez nem érinti.
 - A llama.cpp flash attention helyesen fut (`tools/build_llama.sh --fa`), de tensor core-ok nélkül vele lassabb a
   prompt feldolgozása, ezért alapból ki van kapcsolva.
-- PyTorch: nincsenek cuDNN-, NCCL- és fúzionált attention kernelek; egy eszközoldali `assert` hibája csak a szálat
+- PyTorch: nincsenek cuDNN- és fúzionált attention kernelek; egy eszközoldali `assert` hibája csak a szálat
   állítja meg (nincs `cudaErrorAssert`).
 - cuSOLVER: csak valós típusok (f32, f64), nincs `gesvda`, LDL^T (`sytrf`) és nem szimmetrikus sajátérték-feladat
   (`geev`); az `eigh` és az SVD Jacobi-iterációt használ, ami nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek
@@ -290,6 +292,7 @@ src/linalg            sűrű felbontások (LU, Cholesky, QR, Jacobi eigh/SVD) GL
 src/cusolver          libcusolver.so.11/.12, include/cusolver/cusolverDn.h
 src/cufft             libcufft.so.11/.12 (Stockham és Bluestein FFT GLSL-ben), include/cufft/cufft.h
 src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 GLSL-ben), include/cusparse/cusparse.h
+src/nccl              libnccl.so.2 (kollektívák egy gép rangjai között), include/nccl/nccl.h
 src/nvrtc             LD_AUDIT könyvtár: az NVRTC cubin helyett PTX-et ad (a PyTorch jiteratorához)
 tests/                Driver API tesztek + belső Vulkan teszt
 tests/cuda            nvcc-vel fordított Runtime API programok
