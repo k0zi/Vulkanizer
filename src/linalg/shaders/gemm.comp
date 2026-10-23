@@ -1,0 +1,42 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// C = alpha op(A) op(B) + beta C (m x n, k inner) in the element type, for cuBLAS's f64 GEMMs
+// (its own kernels are f32-accumulating): op(A) = A^T with kTrans, op(B) = B^T with kTransB;
+// beta's bits in `info` (as alpha's in alphaBits), C read only for a nonzero beta. 16 x 16 tiles
+// of C per workgroup (x, y) and batch entry (z), op(A) and op(B) staged in shared memory.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+shared real tileA[16][17], tileB[16][17];
+
+real beta() {
+#ifdef DOUBLE
+    return uint64BitsToDouble(p.info);
+#else
+    return uintBitsToFloat(uint(p.info));
+#endif
+}
+
+void main() {
+    const int batch = batchIndex(), tx = int(gl_LocalInvocationID.x), ty = int(gl_LocalInvocationID.y);
+    const int i = int(gl_WorkGroupID.x) * 16 + tx, j = int(gl_WorkGroupID.y) * 16 + ty;
+    const uint64_t A = matrixA(batch), B = matrixB(batch), C = matrixC(batch);
+    const bool transA = (p.flags & kTrans) != 0u, transB = (p.flags & kTransB) != 0u;
+    real sum = real(0);
+    for (int l0 = 0; l0 < p.k; l0 += 16) {
+        // tileA[r][l] = op(A)(row r of the tile, l0 + l), tileB[l][c] = op(B)(l0 + l, column c)
+        const int ra = int(gl_WorkGroupID.x) * 16 + tx, la = l0 + ty;
+        tileA[tx][ty] = ra < p.m && la < p.k ? (transA ? elem(A, la, ra, p.lda).v : elem(A, ra, la, p.lda).v) : real(0);
+        const int lb = l0 + tx, cb = int(gl_WorkGroupID.y) * 16 + ty;
+        tileB[tx][ty] = lb < p.k && cb < p.n ? (transB ? elem(B, cb, lb, p.ldb).v : elem(B, lb, cb, p.ldb).v) : real(0);
+        barrier();
+        for (int l = 0; l < 16; ++l) sum += tileA[tx][l] * tileB[l][ty];
+        barrier();
+    }
+    if (i >= p.m || j >= p.n) return;
+    const real b = beta();
+    Real c = elem(C, i, j, p.ldc);
+    c.v = alpha() * sum + (b != real(0) ? b * c.v : real(0));
+}

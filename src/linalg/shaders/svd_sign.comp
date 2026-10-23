@@ -1,0 +1,25 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The completion of the long side's vectors L (r x c, at A) to an orthonormal basis: geqrf of L
+// gives L = Q R with R(j, j) = +-1 for its unit columns, orgqr then the Q whose first columns
+// are those of L up to that sign. In two passes around orgqr:
+//   default: one workgroup per batch entry: the signs of R's diagonal into the workspace (at B);
+//   kTrans:  one workgroup per column j < c (x): Q(:, j) *= sign(j).
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const int batch = batchIndex(), tid = int(gl_LocalInvocationID.x), r = p.m, c = p.n;
+    const uint64_t L = matrixA(batch), signs = svdNorms(matrixB(batch));
+    if ((p.flags & kTrans) == 0u) {
+        for (int j = tid; j < c; j += 256) elem(signs, j, 0, 1).v = elem(L, j, j, p.lda).v < real(0) ? real(-1) : real(1);
+        return;
+    }
+    const int j = int(gl_WorkGroupID.x);
+    if (j >= c) return;
+    const real s = elem(signs, j, 0, 1).v;
+    if (s > real(0)) return;
+    for (int i = tid; i < r; i += 256) elem(L, i, j, p.lda).v = -elem(L, i, j, p.lda).v;
+}

@@ -1,0 +1,67 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One round (k) of the one-sided (Hestenes) Jacobi SVD on the r x c workspace G, round-robin
+// ordered as jacobi_round.comp: one workgroup per column pair (p, q) (x) and batch entry (z). The
+// rotation that makes columns p and q orthogonal (the 2 x 2 eigenproblem of their Gram matrix
+// [[alpha, gamma], [gamma, beta]]; none where they already are, to working precision) is applied
+// to them and, unless kNoVectors, to the same columns of the accumulated V.
+
+layout(local_size_x = 256) in;
+
+shared real sa[256], sb[256], sg[256];
+
+int player(int pos, int round, int count) { return pos == 0 ? 0 : 1 + (pos - 1 + round) % (count - 1); }
+
+void main() {
+    const int batch = batchIndex(), pairIndex = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    const int r = p.m, c = p.n, count = c + (c & 1);
+    if (pairIndex >= count / 2) return;
+    const int a = player(pairIndex, p.k, count), b = player(count - 1 - pairIndex, p.k, count);
+    const int pp = min(a, b), qq = max(a, b);
+    if (qq >= c) return;  // paired with the dummy
+    const uint64_t G = matrixB(batch), V = svdV(G);
+    real alpha = real(0), beta = real(0), gamma = real(0);
+    for (int i = tid; i < r; i += 256) {
+        const real x = elem(G, i, pp, r).v, y = elem(G, i, qq, r).v;
+        alpha += x * x;
+        beta += y * y;
+        gamma += x * y;
+    }
+    sa[tid] = alpha;
+    sb[tid] = beta;
+    sg[tid] = gamma;
+    barrier();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (tid < w) {
+            sa[tid] += sa[tid + w];
+            sb[tid] += sb[tid + w];
+            sg[tid] += sg[tid + w];
+        }
+        barrier();
+    }
+    alpha = sa[0];
+    beta = sb[0];
+    gamma = sg[0];
+#ifdef DOUBLE
+    const real eps = real(1.1102230246251565e-16);
+#else
+    const real eps = real(5.9604645e-08);
+#endif
+    if (gamma == real(0) || abs(gamma) <= eps * sqrt(alpha * beta)) return;
+    const real zeta = (beta - alpha) / (real(2) * gamma);
+    const real t = (zeta >= real(0) ? real(1) : real(-1)) / (abs(zeta) + sqrt(real(1) + zeta * zeta));
+    const real cs = real(1) / sqrt(real(1) + t * t), sn = t * cs;
+    for (int i = tid; i < r; i += 256) {
+        const real x = elem(G, i, pp, r).v, y = elem(G, i, qq, r).v;
+        elem(G, i, pp, r).v = cs * x - sn * y;
+        elem(G, i, qq, r).v = sn * x + cs * y;
+    }
+    if ((p.flags & kNoVectors) != 0u) return;
+    for (int i = tid; i < c; i += 256) {
+        const real x = elem(V, i, pp, c).v, y = elem(V, i, qq, c).v;
+        elem(V, i, pp, c).v = cs * x - sn * y;
+        elem(V, i, qq, c).v = sn * x + cs * y;
+    }
+}

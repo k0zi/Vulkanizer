@@ -1,0 +1,36 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// After the Jacobi iteration, one workgroup per batch entry: the eigenvalues (the diagonal of the
+// workspace S) in ascending order into W (at tau, n per batch entry), and, unless kNoVectors, the
+// eigenvectors in A permuted to match: each column's rank is kept in the rotation area after S,
+// A is copied into S, and every column goes back to its rank.
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const int batch = batchIndex(), tid = int(gl_LocalInvocationID.x), n = p.n;
+    const uint64_t A = matrixA(batch), S = matrixB(batch);
+    const uint64_t rank = S + uint64_t(n) * uint64_t(n) * REAL_BYTES;  // n entries (the rotation area)
+    for (int i = tid; i < n; i += 256) {
+        const real w = elem(S, i, i, p.ldb).v;
+        int r = 0;
+        for (int j = 0; j < n; ++j) {
+            const real v = elem(S, j, j, p.ldb).v;
+            if (v < w || (v == w && j < i)) ++r;  // ties by index: ranks are a permutation
+        }
+        tauOf(batch, r).v = w;
+        elem(rank, 0, i, 1).v = real(r);
+    }
+    if ((p.flags & kNoVectors) != 0u) return;
+    memoryBarrier();
+    barrier();
+    for (int idx = tid; idx < n * n; idx += 256) elem(S, idx % n, idx / n, p.ldb).v = elem(A, idx % n, idx / n, p.lda).v;
+    memoryBarrier();
+    barrier();
+    for (int idx = tid; idx < n * n; idx += 256) {
+        const int row = idx % n, col = idx / n;
+        elem(A, row, int(elem(rank, 0, col, 1).v), p.lda).v = elem(S, row, col, p.ldb).v;
+    }
+}

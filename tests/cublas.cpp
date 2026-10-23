@@ -260,6 +260,85 @@ void testTrsm(cublasHandle_t h) {
                 }
 }
 
+// cublasDgemm (single, strided and pointer-array batched) against an f64 CPU reference; skipped
+// where the device has no f64.
+void testDgemm(cublasHandle_t h) {
+    struct D {
+        const char* name;
+        cublasOperation_t ta, tb;
+        int m, n, k, batch;  // batch < 0: pointer arrays
+        double alpha, beta;
+    };
+    const cublasOperation_t N = CUBLAS_OP_N, T = CUBLAS_OP_T;
+    const D cases[] = {{"dgemm NN", N, N, 37, 21, 50, 1, 1.0, 0.0},  {"dgemm TN beta", T, N, 16, 33, 17, 1, -0.5, 2.0},
+                       {"dgemm NT", N, T, 5, 1, 40, 1, 1.0, 0.0},     {"dgemm TT", T, T, 1, 30, 9, 1, 2.0, 1.0},
+                       {"dgemm strided", N, T, 12, 14, 8, 4, 1.0, 0.0}, {"dgemm pointers", T, N, 9, 7, 30, -3, 1.0, 0.5}};
+    for (const D& c : cases) {
+        const int batch = std::abs(c.batch), rowsA = c.ta == N ? c.m : c.k, colsA = c.ta == N ? c.k : c.m;
+        const int rowsB = c.tb == N ? c.k : c.n, colsB = c.tb == N ? c.n : c.k;
+        const size_t sa = size_t(rowsA) * colsA, sb = size_t(rowsB) * colsB, sc = size_t(c.m) * c.n;
+        std::vector<double> a(sa * batch), b(sb * batch), cc(sc * batch);
+        uint32_t seed = 99;
+        auto rnd = [&] { return double(int((seed = seed * 1664525u + 1013904223u) >> 8) - (1 << 23)) / (1 << 23); };
+        for (double& x : a) x = rnd();
+        for (double& x : b) x = rnd();
+        for (double& x : cc) x = rnd();
+        CUdeviceptr da, db, dc, ptrs;
+        CHECK_CU(cuMemAlloc(&da, a.size() * 8));
+        CHECK_CU(cuMemAlloc(&db, b.size() * 8));
+        CHECK_CU(cuMemAlloc(&dc, cc.size() * 8));
+        CHECK_CU(cuMemAlloc(&ptrs, 3 * batch * 8));
+        CHECK_CU(cuMemcpyHtoD(da, a.data(), a.size() * 8));
+        CHECK_CU(cuMemcpyHtoD(db, b.data(), b.size() * 8));
+        CHECK_CU(cuMemcpyHtoD(dc, cc.data(), cc.size() * 8));
+        std::vector<uint64_t> p;
+        for (int t = 0; t < batch; ++t) p.push_back(da + t * sa * 8);
+        for (int t = 0; t < batch; ++t) p.push_back(db + t * sb * 8);
+        for (int t = 0; t < batch; ++t) p.push_back(dc + t * sc * 8);
+        CHECK_CU(cuMemcpyHtoD(ptrs, p.data(), p.size() * 8));
+        cublasStatus_t st;
+        if (c.batch < 0) {
+            auto arr = reinterpret_cast<double**>(ptrs);
+            st = cublasDgemmBatched(h, c.ta, c.tb, c.m, c.n, c.k, &c.alpha, (const double* const*)arr, rowsA,
+                                    (const double* const*)arr + batch, rowsB, &c.beta, arr + 2 * batch, c.m, batch);
+        } else if (c.batch > 1) {
+            st = cublasDgemmStridedBatched(h, c.ta, c.tb, c.m, c.n, c.k, &c.alpha, (const double*)da, rowsA, sa,
+                                           (const double*)db, rowsB, sb, &c.beta, (double*)dc, c.m, sc, batch);
+        } else {
+            st = cublasDgemm(h, c.ta, c.tb, c.m, c.n, c.k, &c.alpha, (const double*)da, rowsA, (const double*)db, rowsB,
+                             &c.beta, (double*)dc, c.m);
+        }
+        if (st == CUBLAS_STATUS_NOT_SUPPORTED) {
+            std::printf("%-24s skipped (no f64)\n", c.name);
+        } else {
+            CHECK_BLAS(st);
+            CHECK_CU(cuCtxSynchronize());
+            std::vector<double> got(cc.size());
+            CHECK_CU(cuMemcpyDtoH(got.data(), dc, got.size() * 8));
+            double worst = 0;
+            for (int t = 0; t < batch; ++t)
+                for (int i = 0; i < c.m; ++i)
+                    for (int j = 0; j < c.n; ++j) {
+                        double s = 0;
+                        for (int l = 0; l < c.k; ++l) {
+                            const double x = c.ta == N ? a[t * sa + i + size_t(l) * rowsA] : a[t * sa + l + size_t(i) * rowsA];
+                            const double y = c.tb == N ? b[t * sb + l + size_t(j) * rowsB] : b[t * sb + j + size_t(l) * rowsB];
+                            s += x * y;
+                        }
+                        const double want = c.alpha * s + c.beta * cc[t * sc + i + size_t(j) * c.m];
+                        worst = std::max(worst, std::fabs(want - got[t * sc + i + size_t(j) * c.m]));
+                    }
+            const bool ok = worst < 1e-12;
+            std::printf("%-24s %s\n", c.name, ok ? "ok" : "FAILED");
+            if (!ok) {
+                std::fprintf(stderr, "  max error %g\n", worst);
+                ++g_failures;
+            }
+        }
+        cuMemFree(da), cuMemFree(db), cuMemFree(dc), cuMemFree(ptrs);
+    }
+}
+
 }  // namespace
 
 // cublasSgemv with both transpositions and vector strides.
@@ -522,6 +601,7 @@ int main() {
     };
     for (const Case& c : cases) runCase(h, c);
     testTrsm(h);
+    testDgemm(h);
     testGrouped(h);
     testSgemv(h);
     testLt(h);

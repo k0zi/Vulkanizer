@@ -7,6 +7,7 @@
 #include <vulkanizer/vulkanizer_ext.h>
 
 #include "common/log.h"
+#include "linalg/linalg.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -177,6 +178,40 @@ void* pointerArray(T* const* array) {
     return const_cast<void*>(static_cast<const void*>(array));
 }
 
+// alpha of the handle's pointer mode, as a double.
+template <class T>
+bool readAlpha(cublasHandle_t h, const T* alpha, double& out) {
+    if (!alpha) return false;
+    T v;
+    if (h->pointerMode == CUBLAS_POINTER_MODE_DEVICE) {
+        if (cuMemcpyDtoH(&v, CUdeviceptr(alpha), sizeof v) != CUDA_SUCCESS) return false;
+    } else {
+        v = *alpha;
+    }
+    out = double(v);
+    return true;
+}
+
+// f64 GEMMs (all three matrices f64) on the shared f64 kernel (src/linalg), f64 accumulation.
+cublasStatus_t runF64(cublasHandle_t h, const Gemm& g) {
+    if (g.ta != CUDA_R_64F || g.tb != CUDA_R_64F || g.tc != CUDA_R_64F) {
+        VULKANIZER_WARN("cublas: unsupported GEMM data types (%d, %d, %d)", int(g.ta), int(g.tb), int(g.tc));
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (!vulkanizer::linalg::hasFloat64()) return CUBLAS_STATUS_NOT_SUPPORTED;
+    double alpha, beta;
+    if (!readAlpha(h, static_cast<const double*>(g.alpha), alpha) || !readAlpha(h, static_cast<const double*>(g.beta), beta))
+        return CUBLAS_STATUS_INVALID_VALUE;
+    const auto matrices = [&](const void* base, long long stride, int ld) {
+        return vulkanizer::linalg::Matrices{CUdeviceptr(base), g.pointerArrays, g.pointerArrays ? 0 : stride, ld};
+    };
+    return vulkanizer::linalg::gemm(h->stream, true, g.transa != CUBLAS_OP_N, g.transb != CUBLAS_OP_N, g.m, g.n, g.k, alpha,
+                        matrices(g.a, g.strideA, g.lda), matrices(g.b, g.strideB, g.ldb), beta,
+                        matrices(g.c, g.strideC, g.ldc), g.batch) == CUDA_SUCCESS
+               ? CUBLAS_STATUS_SUCCESS
+               : CUBLAS_STATUS_EXECUTION_FAILED;
+}
+
 cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
     if (g.m < 0 || g.n < 0 || g.k < 0 || g.batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
@@ -186,10 +221,7 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (g.transa > CUBLAS_OP_C || g.transb > CUBLAS_OP_C) return CUBLAS_STATUS_INVALID_VALUE;
     if (g.m == 0 || g.n == 0 || g.batch == 0) return CUBLAS_STATUS_SUCCESS;
     uint32_t ta, tb, tc;
-    if (!typeCode(g.ta, ta) || !typeCode(g.tb, tb) || !typeCode(g.tc, tc)) {
-        VULKANIZER_WARN("cublas: unsupported GEMM data types (%d, %d, %d)", int(g.ta), int(g.tb), int(g.tc));
-        return CUBLAS_STATUS_NOT_SUPPORTED;
-    }
+    if (!typeCode(g.ta, ta) || !typeCode(g.tb, tb) || !typeCode(g.tc, tc)) return runF64(h, g);
     GemmParams p{};
     if (!scalar(h, g.alpha, g.compute, p.alpha) || !scalar(h, g.beta, g.compute, p.beta))
         return CUBLAS_STATUS_INVALID_VALUE;
@@ -450,6 +482,32 @@ cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t h, cublasOperation_t tra
                    CUDA_R_32F, ldc, strideC, batchCount, false, CUBLAS_COMPUTE_32F});
 }
 
+cublasStatus_t cublasDgemm_v2(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m, int n,
+                              int k, const double* alpha, const double* A, int lda, const double* B, int ldb,
+                              const double* beta, double* C, int ldc) {
+    VULKANIZER_TRACE_API();
+    return run(h, {transa, transb, m, n, k, alpha, A, CUDA_R_64F, lda, 0, B, CUDA_R_64F, ldb, 0, beta, C, CUDA_R_64F,
+                   ldc, 0, 1, false, CUBLAS_COMPUTE_64F});
+}
+
+cublasStatus_t cublasDgemmBatched(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m, int n,
+                                  int k, const double* alpha, const double* const A[], int lda,
+                                  const double* const B[], int ldb, const double* beta, double* const C[], int ldc,
+                                  int batchCount) {
+    VULKANIZER_TRACE_API();
+    return run(h, {transa, transb, m, n, k, alpha, A, CUDA_R_64F, lda, 0, B, CUDA_R_64F, ldb, 0, beta,
+                   pointerArray(C), CUDA_R_64F, ldc, 0, batchCount, true, CUBLAS_COMPUTE_64F});
+}
+
+cublasStatus_t cublasDgemmStridedBatched(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m,
+                                         int n, int k, const double* alpha, const double* A, int lda,
+                                         long long strideA, const double* B, int ldb, long long strideB,
+                                         const double* beta, double* C, int ldc, long long strideC, int batchCount) {
+    VULKANIZER_TRACE_API();
+    return run(h, {transa, transb, m, n, k, alpha, A, CUDA_R_64F, lda, strideA, B, CUDA_R_64F, ldb, strideB, beta, C,
+                   CUDA_R_64F, ldc, strideC, batchCount, false, CUBLAS_COMPUTE_64F});
+}
+
 cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
                             const void* alpha, const void* A, cudaDataType Atype, int lda, const void* B,
                             cudaDataType Btype, int ldb, const void* beta, void* C, cudaDataType Ctype, int ldc,
@@ -457,6 +515,15 @@ cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t transa, cublasOp
     VULKANIZER_TRACE_API();
     return run(h, {transa, transb, m, n, k, alpha, A, Atype, lda, 0, B, Btype, ldb, 0, beta, C, Ctype, ldc, 0, 1,
                    false, computeType});
+}
+
+// Half precision GEMM (MAGMA links it): GemmEx with half matrices and half scalars.
+cublasStatus_t cublasHgemm(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m, int n, int k,
+                           const void* alpha, const void* A, int lda, const void* B, int ldb, const void* beta, void* C,
+                           int ldc) {
+    VULKANIZER_TRACE_API();
+    return run(h, {transa, transb, m, n, k, alpha, A, CUDA_R_16F, lda, 0, B, CUDA_R_16F, ldb, 0, beta, C, CUDA_R_16F, ldc,
+                   0, 1, false, CUBLAS_COMPUTE_16F});
 }
 
 cublasStatus_t cublasGemmBatchedEx(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int m, int n,
@@ -511,6 +578,24 @@ cublasStatus_t cublasSgemmStridedBatched_64(cublasHandle_t h, cublasOperation_t 
                                             long long strideC, int64_t batchCount) {
     if (!fitsInt({m, n, k, lda, ldb, ldc, batchCount})) return CUBLAS_STATUS_NOT_SUPPORTED;
     return cublasSgemmStridedBatched(h, transa, transb, int(m), int(n), int(k), alpha, A, int(lda), strideA, B,
+                                     int(ldb), strideB, beta, C, int(ldc), strideC, int(batchCount));
+}
+
+cublasStatus_t cublasDgemm_v2_64(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb, int64_t m,
+                                 int64_t n, int64_t k, const double* alpha, const double* A, int64_t lda,
+                                 const double* B, int64_t ldb, const double* beta, double* C, int64_t ldc) {
+    if (!fitsInt({m, n, k, lda, ldb, ldc})) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return cublasDgemm_v2(h, transa, transb, int(m), int(n), int(k), alpha, A, int(lda), B, int(ldb), beta, C,
+                          int(ldc));
+}
+
+cublasStatus_t cublasDgemmStridedBatched_64(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb,
+                                            int64_t m, int64_t n, int64_t k, const double* alpha, const double* A,
+                                            int64_t lda, long long strideA, const double* B, int64_t ldb,
+                                            long long strideB, const double* beta, double* C, int64_t ldc,
+                                            long long strideC, int64_t batchCount) {
+    if (!fitsInt({m, n, k, lda, ldb, ldc, batchCount})) return CUBLAS_STATUS_NOT_SUPPORTED;
+    return cublasDgemmStridedBatched(h, transa, transb, int(m), int(n), int(k), alpha, A, int(lda), strideA, B,
                                      int(ldb), strideB, beta, C, int(ldc), strideC, int(batchCount));
 }
 
@@ -605,6 +690,140 @@ cublasStatus_t cublasStrsmBatched(cublasHandle_t h, cublasSideMode_t side, cubla
             return CUBLAS_STATUS_EXECUTION_FAILED;
     }
     return CUBLAS_STATUS_SUCCESS;
+}
+
+}  // extern "C"
+
+// ---- batched LU (src/linalg), as PyTorch's torch.linalg uses for batches of small matrices ----
+
+namespace {
+
+cublasStatus_t getrfBatched(cublasHandle_t h, bool f64, int n, const void* A, int lda, int* P, int* info, int batch) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (n < 0 || lda < (n > 1 ? n : 1) || batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
+    if (f64 && !vulkanizer::linalg::hasFloat64()) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const vulkanizer::linalg::Matrices a{CUdeviceptr(A), true, 0, lda};
+    return vulkanizer::linalg::getrf(h->stream, f64, n, n, a, CUdeviceptr(P), n, CUdeviceptr(info), batch)
+               ? CUBLAS_STATUS_EXECUTION_FAILED
+               : CUBLAS_STATUS_SUCCESS;
+}
+
+// `info` is a host pointer here: it reports invalid arguments only.
+cublasStatus_t getrsBatched(cublasHandle_t h, bool f64, cublasOperation_t trans, int n, int nrhs, const void* A,
+                            int lda, const int* P, const void* B, int ldb, int* info, int batch) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    int bad = 0;
+    if (n < 0) bad = -2;
+    else if (nrhs < 0) bad = -3;
+    else if (lda < (n > 1 ? n : 1)) bad = -5;
+    else if (ldb < (n > 1 ? n : 1)) bad = -8;
+    else if (batch < 0) bad = -10;
+    if (info) *info = bad;
+    if (bad) return CUBLAS_STATUS_INVALID_VALUE;
+    if (f64 && !vulkanizer::linalg::hasFloat64()) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const vulkanizer::linalg::Matrices a{CUdeviceptr(A), true, 0, lda}, b{CUdeviceptr(B), true, 0, ldb};
+    return vulkanizer::linalg::getrs(h->stream, f64, trans != CUBLAS_OP_N, n, nrhs, a, CUdeviceptr(P), n, b, batch)
+               ? CUBLAS_STATUS_EXECUTION_FAILED
+               : CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+extern "C" {
+
+cublasStatus_t cublasSgetrfBatched(cublasHandle_t h, int n, float* const A[], int lda, int* P, int* info, int batchSize) {
+    VULKANIZER_TRACE_API();
+    return getrfBatched(h, false, n, A, lda, P, info, batchSize);
+}
+cublasStatus_t cublasDgetrfBatched(cublasHandle_t h, int n, double* const A[], int lda, int* P, int* info, int batchSize) {
+    VULKANIZER_TRACE_API();
+    return getrfBatched(h, true, n, A, lda, P, info, batchSize);
+}
+cublasStatus_t cublasSgetrsBatched(cublasHandle_t h, cublasOperation_t trans, int n, int nrhs, const float* const A[],
+                                   int lda, const int* devIpiv, float* const B[], int ldb, int* info, int batchSize) {
+    VULKANIZER_TRACE_API();
+    return getrsBatched(h, false, trans, n, nrhs, A, lda, devIpiv, B, ldb, info, batchSize);
+}
+cublasStatus_t cublasDgetrsBatched(cublasHandle_t h, cublasOperation_t trans, int n, int nrhs, const double* const A[],
+                                   int lda, const int* devIpiv, double* const B[], int ldb, int* info, int batchSize) {
+    VULKANIZER_TRACE_API();
+    return getrsBatched(h, true, trans, n, nrhs, A, lda, devIpiv, B, ldb, info, batchSize);
+}
+
+}  // extern "C"
+
+// ---- triangular solves and batched QR on the shared kernels (src/linalg) ----------------------
+
+namespace {
+
+template <class T>
+cublasStatus_t trsm(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                    cublasDiagType_t diag, int m, int n, const T* alpha, const void* A, int lda, const void* B, int ldb,
+                    int batch, bool arrays) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    const int order = side == CUBLAS_SIDE_LEFT ? m : n;
+    if (m < 0 || n < 0 || batch < 0 || lda < (order > 1 ? order : 1) || ldb < (m > 1 ? m : 1))
+        return CUBLAS_STATUS_INVALID_VALUE;
+    constexpr bool f64 = sizeof(T) == 8;
+    if (f64 && !vulkanizer::linalg::hasFloat64()) return CUBLAS_STATUS_NOT_SUPPORTED;
+    double a;
+    if (!readAlpha(h, alpha, a)) return CUBLAS_STATUS_INVALID_VALUE;
+    const vulkanizer::linalg::Matrices am{CUdeviceptr(A), arrays, 0, lda}, bm{CUdeviceptr(B), arrays, 0, ldb};
+    return vulkanizer::linalg::trsm(h->stream, f64, side == CUBLAS_SIDE_RIGHT, uplo == CUBLAS_FILL_MODE_UPPER,
+                                    trans != CUBLAS_OP_N, diag == CUBLAS_DIAG_UNIT, m, n, a, am, bm, batch)
+               ? CUBLAS_STATUS_EXECUTION_FAILED
+               : CUBLAS_STATUS_SUCCESS;
+}
+
+// `info` is a host pointer: it reports invalid arguments only.
+cublasStatus_t geqrfBatched(cublasHandle_t h, bool f64, int m, int n, const void* A, int lda, const void* tau,
+                            int* info, int batch) {
+    if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
+    int bad = 0;
+    if (m < 0) bad = -1;
+    else if (n < 0) bad = -2;
+    else if (lda < (m > 1 ? m : 1)) bad = -4;
+    else if (batch < 0) bad = -7;
+    if (info) *info = bad;
+    if (bad) return CUBLAS_STATUS_INVALID_VALUE;
+    if (f64 && !vulkanizer::linalg::hasFloat64()) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const vulkanizer::linalg::Matrices a{CUdeviceptr(A), true, 0, lda};
+    return vulkanizer::linalg::geqrf(h->stream, f64, m, n, a, CUdeviceptr(tau), 0, batch, true)
+               ? CUBLAS_STATUS_EXECUTION_FAILED
+               : CUBLAS_STATUS_SUCCESS;
+}
+
+}  // namespace
+
+extern "C" {
+
+cublasStatus_t cublasStrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                              cublasDiagType_t diag, int m, int n, const float* alpha, const float* A, int lda,
+                              float* B, int ldb) {
+    VULKANIZER_TRACE_API();
+    return trsm(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, 1, false);
+}
+cublasStatus_t cublasDtrsm_v2(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo, cublasOperation_t trans,
+                              cublasDiagType_t diag, int m, int n, const double* alpha, const double* A, int lda,
+                              double* B, int ldb) {
+    VULKANIZER_TRACE_API();
+    return trsm(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, 1, false);
+}
+cublasStatus_t cublasDtrsmBatched(cublasHandle_t h, cublasSideMode_t side, cublasFillMode_t uplo,
+                                  cublasOperation_t trans, cublasDiagType_t diag, int m, int n, const double* alpha,
+                                  const double* const A[], int lda, double* const B[], int ldb, int batchCount) {
+    VULKANIZER_TRACE_API();
+    return trsm(h, side, uplo, trans, diag, m, n, alpha, A, lda, B, ldb, batchCount, true);
+}
+cublasStatus_t cublasSgeqrfBatched(cublasHandle_t h, int m, int n, float* const A[], int lda, float* const tau[],
+                                   int* info, int batchSize) {
+    VULKANIZER_TRACE_API();
+    return geqrfBatched(h, false, m, n, A, lda, tau, info, batchSize);
+}
+cublasStatus_t cublasDgeqrfBatched(cublasHandle_t h, int m, int n, double* const A[], int lda, double* const tau[],
+                                   int* info, int batchSize) {
+    VULKANIZER_TRACE_API();
+    return geqrfBatched(h, true, m, n, A, lda, tau, info, batchSize);
 }
 
 }  // extern "C"

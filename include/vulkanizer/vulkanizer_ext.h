@@ -23,6 +23,7 @@ CUresult CUDAAPI vulkanizerCreateSpirvFunction(CUfunction* function, const uint3
 // Optional device capabilities Vulkanizer's libraries pick kernel variants by.
 typedef enum VulkanizerFeature {
     VULKANIZER_FEATURE_FLOAT16_ARITHMETIC = 1,  // shaderFloat16: f16 math in shaders (not just storage)
+    VULKANIZER_FEATURE_FLOAT64 = 2,             // shaderFloat64: f64 in shaders
 } VulkanizerFeature;
 
 // *value = 1 if the current context's device has the feature, else 0.

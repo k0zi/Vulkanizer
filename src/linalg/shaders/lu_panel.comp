@@ -1,0 +1,59 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One column step k of the LU factorization with partial pivoting (getrf), one workgroup per
+// batch entry: the pivot is the first largest |A(i, k)| for i >= k (as LAPACK's idamax), rows k
+// and the pivot are swapped across the whole matrix, and the column below the diagonal is
+// divided by the pivot. A zero pivot records info = k + 1 (the first one) and leaves the column
+// as it is. lu_update.comp then updates the trailing matrix.
+
+layout(local_size_x = 256) in;
+
+shared real bestValue[256];
+shared int bestRow[256];
+
+void main() {
+    const int batch = batchIndex(), k = p.k, tid = int(gl_LocalInvocationID.x);
+    const uint64_t A = matrixA(batch);
+    int piv = k;
+    if ((p.flags & kNoPivot) == 0u) {
+        real best = real(-1);
+        int row = k;
+        for (int i = k + tid; i < p.m; i += 256) {
+            const real v = abs(elem(A, i, k, p.lda).v);
+            if (v > best) best = v, row = i;
+        }
+        bestValue[tid] = best;
+        bestRow[tid] = row;
+        barrier();
+        for (int s = 128; s > 0; s >>= 1) {
+            if (tid < s) {
+                const real v = bestValue[tid + s];
+                const int r = bestRow[tid + s];
+                if (v > bestValue[tid] || (v == bestValue[tid] && r < bestRow[tid])) bestValue[tid] = v, bestRow[tid] = r;
+            }
+            barrier();
+        }
+        piv = bestRow[0];
+    }
+    const real d = elem(A, piv, k, p.lda).v;
+    if (tid == 0) {
+        if (p.ipiv != 0ul) pivotOf(batch, k).v = piv + 1;
+        if (d == real(0) && p.info != 0ul && infoOf(batch).v == 0) infoOf(batch).v = k + 1;
+    }
+    barrier();  // everyone has read the pivot before the swap moves it
+    if (piv != k) {
+        for (int j = tid; j < p.n; j += 256) {
+            const real t = elem(A, k, j, p.lda).v;
+            elem(A, k, j, p.lda).v = elem(A, piv, j, p.lda).v;
+            elem(A, piv, j, p.lda).v = t;
+        }
+    }
+    memoryBarrier();
+    barrier();
+    if (d != real(0)) {
+        const real r = real(1) / d;
+        for (int i = k + 1 + tid; i < p.m; i += 256) elem(A, i, k, p.lda).v *= r;
+    }
+}

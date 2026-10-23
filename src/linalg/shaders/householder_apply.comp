@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Applies the Householder reflector H = I - tau v v^T stored in column k of A (v(k) = 1 implied,
+// v(k+1:) below the diagonal, tau(k)) to the matrix B (geqrf's trailing columns, orgqr, ormqr):
+//   from the left:  B(k:, j) -= tau v (v^T B(k:, j)) for the columns j = nrhs .. n-1 of B, one
+//                   workgroup each (workgroup x);
+//   kRight:         B(i, k:) -= tau (B(i, k:) v) v^T for the rows i = 0 .. m-1 of B, one workgroup each.
+// The reflector has length m - k from the left (B has m rows) and n - k from the right (n columns).
+// z selects the batch entry.
+
+layout(local_size_x = 256) in;
+
+shared real partial[256];
+
+void main() {
+    const int batch = batchIndex(), k = p.k, tid = int(gl_LocalInvocationID.x);
+    const bool right = (p.flags & kRight) != 0u;
+    const int line = int(gl_WorkGroupID.x) + (right ? 0 : p.nrhs);  // the column (left) or row (right) of B
+    if (line >= (right ? p.m : p.n)) return;
+    const uint64_t A = matrixA(batch), B = matrixB(batch);
+    const real tau = tauOf(batch, k).v;
+    if (tau == real(0)) return;
+    const int len = right ? p.n : p.m;  // v covers k .. len-1
+    real s = real(0);
+    for (int i = k + tid; i < len; i += 256) {
+        const real v = i == k ? real(1) : elem(A, i, k, p.lda).v;
+        s += v * (right ? elem(B, line, i, p.ldb).v : elem(B, i, line, p.ldb).v);
+    }
+    partial[tid] = s;
+    barrier();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (tid < w) partial[tid] += partial[tid + w];
+        barrier();
+    }
+    const real t = tau * partial[0];
+    for (int i = k + tid; i < len; i += 256) {
+        const real v = i == k ? real(1) : elem(A, i, k, p.lda).v;
+        if (right) elem(B, line, i, p.ldb).v -= t * v;
+        else elem(B, i, line, p.ldb).v -= t * v;
+    }
+}

@@ -1,0 +1,29 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// orgqr's column work, as LAPACK's dorg2r (Q = H(0) ... H(kr-1), m x n, overwriting A):
+//   kTrans set (init): columns j = kr .. n-1 (k = kr) become the unit vectors e_j;
+//   otherwise (column i = k, after H(i) was applied to the columns right of it): A(k+1:, k) *=
+//   -tau(k), A(k, k) = 1 - tau(k), A(0:k, k) = 0.
+// One workgroup per column (x, offset by k) and batch entry (z).
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const int batch = batchIndex(), tid = int(gl_LocalInvocationID.x);
+    const uint64_t A = matrixA(batch);
+    if ((p.flags & kTrans) != 0u) {
+        const int j = p.k + int(gl_WorkGroupID.x);
+        if (j >= p.n) return;
+        for (int r = tid; r < p.m; r += 256) elem(A, r, j, p.lda).v = r == j ? real(1) : real(0);
+        return;
+    }
+    const int k = p.k;
+    const real tau = tauOf(batch, k).v;
+    for (int r = tid; r < p.m; r += 256) {
+        if (r < k) elem(A, r, k, p.lda).v = real(0);
+        else if (r == k) elem(A, r, k, p.lda).v = real(1) - tau;
+        else elem(A, r, k, p.lda).v *= -tau;
+    }
+}

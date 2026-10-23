@@ -64,12 +64,16 @@ if [[ $TORCH -eq 1 ]]; then
   fi
   CUDA_LIB="$LIB"
   if [[ $MAJOR == 13 ]]; then CUDA_LIB="$LIB/cuda13"; fi
-  export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$MAJOR:$CUDA_LIB/libcublas.so.$MAJOR:$CUDA_LIB/libcublasLt.so.$MAJOR${LD_PRELOAD:+:$LD_PRELOAD}"
+  export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$MAJOR:$CUDA_LIB/libcublas.so.$MAJOR:$CUDA_LIB/libcublasLt.so.$MAJOR:$CUDA_LIB/libcusolver.so.$((MAJOR - 1))${LD_PRELOAD:+:$LD_PRELOAD}"
+  # run-time compiled kernels (PyTorch's jiterator) as PTX, not cubins
+  export LD_AUDIT="$LIB/libvulkanizer_nvrtc.so${LD_AUDIT:+:$LD_AUDIT}"
   export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda
   if [[ "${VULKANIZER_TORCH_DEFAULTS:-1}" != 0 ]]; then
     export PYTHONPATH="$SHARE/torch${PYTHONPATH:+:$PYTHONPATH}"  # sitecustomize.py: cuDNN, fused attention
     # torch._native's CuTe DSL kernels compile to SASS; the same switch also turns off its (working) Triton ones
     export TORCH_DISABLE_NATIVE_JIT="${TORCH_DISABLE_NATIVE_JIT:-1}"
+    # torch.linalg on Vulkanizer's libcusolver: MAGMA's own kernels and the cuBLAS routines it calls do not run
+    export TORCH_LINALG_PREFER_CUSOLVER="${TORCH_LINALG_PREFER_CUSOLVER:-1}"
     # Triton: PTX is handed through instead of assembled, the launcher is built against our cuda.h
     export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$SHARE/triton/ptxas}"
     export TRITON_PTXAS_BLACKWELL_PATH="${TRITON_PTXAS_BLACKWELL_PATH:-$SHARE/triton/ptxas}"

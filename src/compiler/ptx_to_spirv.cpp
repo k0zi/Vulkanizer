@@ -267,6 +267,10 @@ private:
         case ptx::OperandKind::Symbol: {
             // mov.u64 %rd, globalVar / mov.u32 %r, sharedVar / mov.u64 %SPL, __local_depot0
             if (!t.isInt()) fail(ins, "variable address used with a non-integer type");
+            if (o.name == "WARP_SZ") {  // the predefined constant (NVRTC output uses it)
+                v = t.width == 64 ? cU64(32) : cU32(32);
+                break;
+            }
             const Space own = symbol(ins, o.name).space;
             v = symbolAddress(ins, o.name, own);
             if (t.width == 64 && isWordSpace(own)) v = extendTo64(v, false);

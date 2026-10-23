@@ -491,6 +491,7 @@ CUresult CUDAAPI vulkanizerGetFeature(VulkanizerFeature feature, int* value) {
     if (CUresult r = enterContext(s)) return r;
     switch (feature) {
     case VULKANIZER_FEATURE_FLOAT16_ARITHMETIC: *value = s.slot->vk->features().shaderFloat16; return CUDA_SUCCESS;
+    case VULKANIZER_FEATURE_FLOAT64: *value = s.slot->vk->features().shaderFloat64; return CUDA_SUCCESS;
     }
     return CUDA_ERROR_INVALID_VALUE;
 }

@@ -78,19 +78,11 @@
     X(cublasDdot_v2) \
     X(cublasDgeam_64) \
     X(cublasDgelsBatched) \
-    X(cublasDgemmBatched) \
-    X(cublasDgemmStridedBatched) \
-    X(cublasDgemmStridedBatched_64) \
-    X(cublasDgemm_v2) \
-    X(cublasDgemm_v2_64) \
     X(cublasDgemvStridedBatched_64) \
     X(cublasDgemv_v2) \
     X(cublasDgemv_v2_64) \
-    X(cublasDgeqrfBatched) \
     X(cublasDger_v2) \
     X(cublasDger_v2_64) \
-    X(cublasDgetrfBatched) \
-    X(cublasDgetrsBatched) \
     X(cublasDnrm2_v2) \
     X(cublasDotEx) \
     X(cublasDrot_v2) \
@@ -117,8 +109,6 @@
     X(cublasDtrmm_v2_64) \
     X(cublasDtrmv_v2) \
     X(cublasDtrmv_v2_64) \
-    X(cublasDtrsmBatched) \
-    X(cublasDtrsm_v2) \
     X(cublasDtrsm_v2_64) \
     X(cublasDtrsv_v2) \
     X(cublasDzasum_v2) \
@@ -157,11 +147,8 @@
     X(cublasSgeam_64) \
     X(cublasSgelsBatched) \
     X(cublasSgemvStridedBatched_64) \
-    X(cublasSgeqrfBatched) \
     X(cublasSger_v2) \
     X(cublasSger_v2_64) \
-    X(cublasSgetrfBatched) \
-    X(cublasSgetrsBatched) \
     X(cublasSnrm2_v2) \
     X(cublasSrot_v2) \
     X(cublasSrot_v2_64) \
@@ -187,7 +174,6 @@
     X(cublasStrmm_v2_64) \
     X(cublasStrmv_v2) \
     X(cublasStrmv_v2_64) \
-    X(cublasStrsm_v2) \
     X(cublasStrsm_v2_64) \
     X(cublasStrsv_v2) \
     X(cublasZaxpy_v2) \

@@ -1,0 +1,41 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Householder reflector of column step k of the QR factorization (geqrf), one workgroup per batch
+// entry, as LAPACK's dlarfg: H = I - tau v v^T with v(k) = 1 maps A(k:m, k) to (beta, 0, ...).
+// A(k, k) becomes beta, A(k+1:m, k) the rest of v, tau(k) the scalar; a column that is zero below
+// the diagonal gets tau = 0 (H = I). householder_apply.comp then applies H to the trailing columns.
+
+layout(local_size_x = 256) in;
+
+shared real partial[256];
+
+void main() {
+    const int batch = batchIndex(), k = p.k, tid = int(gl_LocalInvocationID.x);
+    const uint64_t A = matrixA(batch);
+    real s = real(0);
+    for (int i = k + 1 + tid; i < p.m; i += 256) {
+        const real x = elem(A, i, k, p.lda).v;
+        s += x * x;
+    }
+    partial[tid] = s;
+    barrier();
+    for (int w = 128; w > 0; w >>= 1) {
+        if (tid < w) partial[tid] += partial[tid + w];
+        barrier();
+    }
+    const real sigma = partial[0], alpha = elem(A, k, k, p.lda).v;
+    barrier();  // everyone has read A(k, k) before it becomes beta
+    if (sigma == real(0)) {
+        if (tid == 0) tauOf(batch, k).v = real(0);
+        return;
+    }
+    const real beta = -sign(alpha == real(0) ? real(1) : alpha) * sqrt(alpha * alpha + sigma);
+    const real scale = real(1) / (alpha - beta);
+    for (int i = k + 1 + tid; i < p.m; i += 256) elem(A, i, k, p.lda).v *= scale;
+    if (tid == 0) {
+        tauOf(batch, k).v = (beta - alpha) / beta;
+        elem(A, k, k, p.lda).v = beta;
+    }
+}

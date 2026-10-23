@@ -1,0 +1,20 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Before the one-sided Jacobi SVD (svd_round.comp), one workgroup per column j (x) of G and batch
+// entry (z): G(:, j) = A(:, j), or row j of A with kTrans (A is c x r, wide: G = A^T); and, unless
+// kNoVectors, V(:, j) = e_j.
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const int batch = batchIndex(), j = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    const int r = p.m, c = p.n;
+    if (j >= c) return;
+    const uint64_t A = matrixA(batch), G = matrixB(batch), V = svdV(G);
+    const bool trans = (p.flags & kTrans) != 0u;
+    for (int i = tid; i < r; i += 256) elem(G, i, j, r).v = trans ? elem(A, j, i, p.lda).v : elem(A, i, j, p.lda).v;
+    if ((p.flags & kNoVectors) != 0u) return;
+    for (int i = tid; i < c; i += 256) elem(V, i, j, c).v = i == j ? real(1) : real(0);
+}

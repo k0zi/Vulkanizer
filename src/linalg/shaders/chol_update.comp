@@ -1,0 +1,20 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The trailing update after Cholesky column step k (chol_panel.comp), on the lower triangle of
+// the (possibly transposed, kUpper) view: L(i, j) -= L(i, k) L(j, k) for k < j <= i.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+Real L(uint64_t A, int r, int c) { return (p.flags & kUpper) != 0u ? elem(A, c, r, p.lda) : elem(A, r, c, p.lda); }
+
+void main() {
+    const int k = p.k;
+    const int i = k + 1 + int(gl_GlobalInvocationID.x), j = k + 1 + int(gl_GlobalInvocationID.y);
+    if (i >= p.n || j > i) return;
+    const int batch = batchIndex();
+    if (infoOf(batch).v != 0) return;
+    const uint64_t A = matrixA(batch);
+    L(A, i, j).v -= L(A, i, k).v * L(A, j, k).v;
+}

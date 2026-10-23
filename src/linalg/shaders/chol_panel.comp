@@ -1,0 +1,28 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One column step k of the Cholesky factorization A = L L^T (potrf; A = U^T U with kUpper, which
+// is the same computation on the transposed view), one workgroup per batch entry: L(k, k) =
+// sqrt(A(k, k)) and the column below it divided by that. A matrix that is not positive definite
+// records info = k + 1 and stops: later steps return at once (as LAPACK, the rest is left as is).
+
+layout(local_size_x = 256) in;
+
+Real L(uint64_t A, int r, int c) { return (p.flags & kUpper) != 0u ? elem(A, c, r, p.lda) : elem(A, r, c, p.lda); }
+
+void main() {
+    const int batch = batchIndex(), k = p.k, tid = int(gl_LocalInvocationID.x);
+    if (infoOf(batch).v != 0) return;
+    const uint64_t A = matrixA(batch);
+    const real a = L(A, k, k).v;
+    barrier();  // everyone has read A(k, k) before it is replaced
+    if (!(a > real(0))) {  // also NaN
+        if (tid == 0) infoOf(batch).v = k + 1;
+        return;
+    }
+    const real d = sqrt(a);
+    if (tid == 0) L(A, k, k).v = d;
+    const real r = real(1) / d;
+    for (int i = k + 1 + tid; i < p.n; i += 256) L(A, i, k).v *= r;
+}

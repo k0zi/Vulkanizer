@@ -144,11 +144,28 @@ cublasStatus_t CUBLASWINAPI cublasSgemmStridedBatched(cublasHandle_t handle, cub
                                                       long long int strideA, const float* B, int ldb,
                                                       long long int strideB, const float* beta, float* C, int ldc,
                                                       long long int strideC, int batchCount);
+cublasStatus_t CUBLASWINAPI cublasDgemm_v2(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+                                           int m, int n, int k, const double* alpha, const double* A, int lda,
+                                           const double* B, int ldb, const double* beta, double* C, int ldc);
+cublasStatus_t CUBLASWINAPI cublasDgemmBatched(cublasHandle_t handle, cublasOperation_t transa,
+                                               cublasOperation_t transb, int m, int n, int k, const double* alpha,
+                                               const double* const Aarray[], int lda, const double* const Barray[],
+                                               int ldb, const double* beta, double* const Carray[], int ldc,
+                                               int batchCount);
+cublasStatus_t CUBLASWINAPI cublasDgemmStridedBatched(cublasHandle_t handle, cublasOperation_t transa,
+                                                      cublasOperation_t transb, int m, int n, int k,
+                                                      const double* alpha, const double* A, int lda,
+                                                      long long int strideA, const double* B, int ldb,
+                                                      long long int strideB, const double* beta, double* C, int ldc,
+                                                      long long int strideC, int batchCount);
 cublasStatus_t CUBLASWINAPI cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
                                          int m, int n, int k, const void* alpha, const void* A, cudaDataType Atype,
                                          int lda, const void* B, cudaDataType Btype, int ldb, const void* beta,
                                          void* C, cudaDataType Ctype, int ldc, cublasComputeType_t computeType,
                                          cublasGemmAlgo_t algo);
+cublasStatus_t CUBLASWINAPI cublasHgemm(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+                                        int m, int n, int k, const void* alpha, const void* A, int lda, const void* B,
+                                        int ldb, const void* beta, void* C, int ldc);  /* __half operands */
 cublasStatus_t CUBLASWINAPI cublasGemmBatchedEx(cublasHandle_t handle, cublasOperation_t transa,
                                                 cublasOperation_t transb, int m, int n, int k, const void* alpha,
                                                 const void* const Aarray[], cudaDataType Atype, int lda,
@@ -203,6 +220,7 @@ cublasStatus_t CUBLASWINAPI cublasStrsmBatched(cublasHandle_t handle, cublasSide
 #define cublasSetPointerMode cublasSetPointerMode_v2
 #define cublasGetPointerMode cublasGetPointerMode_v2
 #define cublasSgemm cublasSgemm_v2
+#define cublasDgemm cublasDgemm_v2
 #define cublasSgemv cublasSgemv_v2
 
 #ifdef __cplusplus

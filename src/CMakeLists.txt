@@ -121,7 +121,7 @@ function(vulkanizer_cublas suffix major version outdir)
   endforeach()
   add_library(vulkanizer_cublas${suffix} SHARED cublas/cublas.cpp cublas/cublas_stubs.cpp ${cublas_shaders})
   add_library(vulkanizer_cublaslt${suffix} SHARED cublas/cublasLt.cpp ${cublas_gen}/epilogue.comp.inc)
-  target_link_libraries(vulkanizer_cublas${suffix} PRIVATE vulkanizer_common vulkanizer_cuda)
+  target_link_libraries(vulkanizer_cublas${suffix} PRIVATE vulkanizer_common vulkanizer_linalg vulkanizer_cuda)
   target_link_libraries(vulkanizer_cublaslt${suffix} PRIVATE vulkanizer_common vulkanizer_cuda vulkanizer_cublas${suffix})
   foreach(pair "vulkanizer_cublas${suffix};cublas" "vulkanizer_cublaslt${suffix};cublasLt")
     list(GET pair 0 target)
@@ -136,3 +136,56 @@ function(vulkanizer_cublas suffix major version outdir)
 endfunction()
 vulkanizer_cublas("" 12 12.9.0 ${CMAKE_BINARY_DIR}/lib)
 vulkanizer_cublas(13 13 13.8.0 ${CMAKE_BINARY_DIR}/lib/cuda13)
+
+# Dense factorizations (src/linalg): GLSL kernels in f32 and f64 (-DDOUBLE), shared by libcusolver and
+# libcublas's batched factorizations.
+set(linalg_gen ${CMAKE_CURRENT_BINARY_DIR}/linalg)
+set(linalg_shaders)
+foreach(shader lu_panel lu_update tri_solve chol_panel chol_update qr_panel householder_apply orgqr_column
+        eig_setup jacobi_round eig_finish svd_setup svd_round svd_finish svd_sign gemm)
+  foreach(variant "" _f64)
+    set(defines)
+    if(variant)
+      set(defines -DDOUBLE)
+    endif()
+    add_custom_command(
+      OUTPUT ${linalg_gen}/${shader}${variant}.comp.inc
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${linalg_gen}
+      COMMAND ${GLSLC} --target-env=vulkan1.2 -O -mfmt=num ${defines} -I ${CMAKE_CURRENT_SOURCE_DIR}/linalg/shaders
+              -o ${linalg_gen}/${shader}${variant}.comp.inc ${CMAKE_CURRENT_SOURCE_DIR}/linalg/shaders/${shader}.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/linalg/shaders/${shader}.comp ${CMAKE_CURRENT_SOURCE_DIR}/linalg/shaders/common.glsl
+      COMMENT "glslc ${shader}${variant}.comp"
+    )
+    list(APPEND linalg_shaders ${linalg_gen}/${shader}${variant}.comp.inc)
+  endforeach()
+endforeach()
+add_library(vulkanizer_linalg STATIC linalg/linalg.cpp ${linalg_shaders})
+target_include_directories(vulkanizer_linalg PRIVATE ${linalg_gen} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(vulkanizer_linalg PUBLIC vulkanizer_common)
+
+# cuSOLVER: libcusolver.so.11 for CUDA 12 and libcusolver.so.12 (in lib/cuda13) for CUDA 13.
+function(vulkanizer_cusolver suffix major version outdir)
+  set(VULKANIZER_CUSOLVER_MAJOR ${major})  # for the version script template
+  set(map ${CMAKE_CURRENT_BINARY_DIR}/libcusolver${major}.map)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cusolver/libcusolver.map.in ${map} @ONLY)
+  add_library(vulkanizer_cusolver${suffix} SHARED cusolver/cusolver.cpp cusolver/cusolver_stubs.cpp)
+  target_link_libraries(vulkanizer_cusolver${suffix} PRIVATE vulkanizer_linalg vulkanizer_cuda)
+  target_include_directories(vulkanizer_cusolver${suffix} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+    PUBLIC ${PROJECT_SOURCE_DIR}/include/cublas ${PROJECT_SOURCE_DIR}/include)
+  string(REPLACE "." ";" parts ${version})  # cusolverDnGetVersion: major * 1000 + minor * 100 + patch
+  list(GET parts 0 v0)
+  list(GET parts 1 v1)
+  list(GET parts 2 v2)
+  math(EXPR version_number "${v0} * 1000 + ${v1} * 100 + ${v2}")
+  target_compile_definitions(vulkanizer_cusolver${suffix} PRIVATE VULKANIZER_CUSOLVER_VERSION=${version_number})
+  set_target_properties(vulkanizer_cusolver${suffix} PROPERTIES OUTPUT_NAME cusolver VERSION ${version}
+    SOVERSION ${major} LINK_DEPENDS ${map} LIBRARY_OUTPUT_DIRECTORY ${outdir})
+  target_link_options(vulkanizer_cusolver${suffix} PRIVATE -Wl,--version-script=${map} -Wl,--no-undefined)
+endfunction()
+vulkanizer_cusolver("" 11 11.7.5 ${CMAKE_BINARY_DIR}/lib)
+vulkanizer_cusolver(13 12 12.3.5 ${CMAKE_BINARY_DIR}/lib/cuda13)
+
+# NVRTC PTX shim, an LD_AUDIT library (run_torch.sh, vulkanizer-run --torch): run-time compiled
+# programs get their PTX instead of a cubin.
+add_library(vulkanizer_nvrtc SHARED nvrtc/nvrtc_ptx.cpp)
+set_target_properties(vulkanizer_nvrtc PROPERTIES OUTPUT_NAME vulkanizer_nvrtc)

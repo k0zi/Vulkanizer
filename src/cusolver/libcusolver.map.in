@@ -1,0 +1,5 @@
+/* Same symbol version as the official libcusolver.so.@VULKANIZER_CUSOLVER_MAJOR@. */
+libcusolver.so.@VULKANIZER_CUSOLVER_MAJOR@ {
+  global: cusolver*;
+  local: *;
+};

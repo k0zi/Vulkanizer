@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Before the Jacobi eigenvalue iteration (jacobi_round.comp), one workgroup per column j (x) and
+// batch entry (z), in two passes:
+//   default: S(:, j) = column j of the symmetric matrix stored in A's lower (or kUpper: upper)
+//            triangle, into the workspace S (n x n, ld n, at B);
+//   kTrans:  A(:, j) = e_j (A accumulates the eigenvectors), unless kNoVectors.
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const int batch = batchIndex(), j = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    if (j >= p.n) return;
+    const uint64_t A = matrixA(batch), S = matrixB(batch);
+    if ((p.flags & kTrans) != 0u) {
+        if ((p.flags & kNoVectors) != 0u) return;
+        for (int i = tid; i < p.n; i += 256) elem(A, i, j, p.lda).v = i == j ? real(1) : real(0);
+        return;
+    }
+    const bool upper = (p.flags & kUpper) != 0u;
+    for (int i = tid; i < p.n; i += 256) {
+        const bool stored = upper ? i <= j : i >= j;
+        elem(S, i, j, p.ldb).v = stored ? elem(A, i, j, p.lda).v : elem(A, j, i, p.lda).v;
+    }
+}

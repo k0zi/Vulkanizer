@@ -1,0 +1,16 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// The trailing update after column step k of the LU factorization (lu_panel.comp):
+// A(i, j) -= A(i, k) A(k, j) for i, j > k. One invocation per element; z selects the batch entry.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void main() {
+    const int k = p.k;
+    const int i = k + 1 + int(gl_GlobalInvocationID.x), j = k + 1 + int(gl_GlobalInvocationID.y);
+    if (i >= p.m || j >= p.n) return;
+    const uint64_t A = matrixA(batchIndex());
+    elem(A, i, j, p.lda).v -= elem(A, i, k, p.lda).v * elem(A, k, j, p.lda).v;
+}

@@ -1,0 +1,67 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One round (k) of the cyclic Jacobi eigenvalue iteration on the symmetric n x n workspace S (at
+// B, ld n), round-robin ordered: each round rotates n/2 disjoint index pairs (p, q), so the
+// rotations commute, and n - 1 rounds (n even, else n + 1 with a dummy) form a sweep. One
+// workgroup per pair (x) and batch entry (z), in two passes:
+//   default: the rotation J = [[c, s], [-s, c]] that zeroes S(p, q) (Golub and Van Loan's
+//            sym.schur2; none where S(p, q) is negligible), kept after S for the second pass, applied
+//            to columns p and q of S and of the eigenvectors in A (S J, A J);
+//   kRight:  the rotation applied to rows p and q of S (J^T S).
+
+layout(local_size_x = 256) in;
+
+int player(int pos, int round, int count) { return pos == 0 ? 0 : 1 + (pos - 1 + round) % (count - 1); }
+
+void main() {
+    const int batch = batchIndex(), pairIndex = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    const int n = p.n, count = n + (n & 1);
+    if (pairIndex >= count / 2) return;
+    const int a = player(pairIndex, p.k, count), b = player(count - 1 - pairIndex, p.k, count);
+    const int pp = min(a, b), qq = max(a, b);
+    if (qq >= n) return;  // paired with the dummy
+    const uint64_t A = matrixA(batch), S = matrixB(batch);
+    const uint64_t rot = S + uint64_t(n) * uint64_t(n) * REAL_BYTES;
+    if ((p.flags & kRight) != 0u) {
+        const real c = elem(rot, 0, 2 * pairIndex, 1).v, s = elem(rot, 0, 2 * pairIndex + 1, 1).v;
+        if (s == real(0)) return;
+        for (int j = tid; j < n; j += 256) {
+            const real x = elem(S, pp, j, p.ldb).v, y = elem(S, qq, j, p.ldb).v;
+            elem(S, pp, j, p.ldb).v = c * x - s * y;
+            elem(S, qq, j, p.ldb).v = s * x + c * y;
+        }
+        return;
+    }
+    const real app = elem(S, pp, pp, p.ldb).v, aqq = elem(S, qq, qq, p.ldb).v, apq = elem(S, pp, qq, p.ldb).v;
+#ifdef DOUBLE
+    const real eps = real(1.1102230246251565e-16);
+#else
+    const real eps = real(5.9604645e-08);
+#endif
+    real c = real(1), s = real(0);
+    if (apq != real(0) && abs(apq) > eps * sqrt(abs(app) * abs(aqq))) {
+        const real tau = (aqq - app) / (real(2) * apq);
+        const real t = (tau >= real(0) ? real(1) : real(-1)) / (abs(tau) + sqrt(real(1) + tau * tau));
+        c = real(1) / sqrt(real(1) + t * t);
+        s = t * c;
+    }
+    barrier();  // everyone has read the 2 x 2 block before the columns change
+    if (tid == 0) {
+        elem(rot, 0, 2 * pairIndex, 1).v = c;
+        elem(rot, 0, 2 * pairIndex + 1, 1).v = s;
+    }
+    if (s == real(0)) return;
+    const bool vectors = (p.flags & kNoVectors) == 0u;
+    for (int i = tid; i < n; i += 256) {
+        const real x = elem(S, i, pp, p.ldb).v, y = elem(S, i, qq, p.ldb).v;
+        elem(S, i, pp, p.ldb).v = c * x - s * y;
+        elem(S, i, qq, p.ldb).v = s * x + c * y;
+        if (vectors) {
+            const real u = elem(A, i, pp, p.lda).v, v = elem(A, i, qq, p.lda).v;
+            elem(A, i, pp, p.lda).v = c * u - s * v;
+            elem(A, i, qq, p.lda).v = s * u + c * v;
+        }
+    }
+}

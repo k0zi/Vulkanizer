@@ -16,13 +16,14 @@ inline int g_failures = 0;
 
 // What run_torch.sh's sitecustomize.py does for Python programs: cuDNN and the fused attention
 // kernels need NVIDIA hardware, so convolutions and scaled_dot_product_attention use PyTorch's own
-// kernels and the math path.
+// kernels and the math path; torch.linalg goes to cuSOLVER (Vulkanizer's), not MAGMA.
 inline void useVulkanizerDefaults() {
     auto& ctx = at::globalContext();
     ctx.setUserEnabledCuDNN(false);
     ctx.setSDPUseFlash(false);
     ctx.setSDPUseMemEfficient(false);
     ctx.setSDPUseCuDNN(false);
+    ctx.setLinalgPreferredBackend(at::LinalgBackend::Cusolver);  // MAGMA does not run
 }
 
 // Largest absolute difference of `got` (any device) from `want` (CPU), in float.

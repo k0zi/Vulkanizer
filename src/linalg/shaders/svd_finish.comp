@@ -1,0 +1,64 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// After the one-sided Jacobi iteration G = U' diag(sigma) (orthogonal columns), in two passes:
+//   default: one workgroup per batch entry: sigma(j) = |G(:, j)|, the singular values in
+//            descending order into S (at tau, strideP apart), each column's rank kept;
+//   kTrans:  one workgroup per column j (x): column rank(j) of the long side's vectors (r long,
+//            at A) = G(:, j) / sigma(j) (unless kNoLong; zero for a negligible sigma, which the
+//            completion by QR replaces), and of the short side's (c long, at C) = V(:, j) (unless
+//            kNoShort; with kVt into row rank(j) instead: V^T).
+
+layout(local_size_x = 256) in;
+
+void main() {
+    const int batch = batchIndex(), tid = int(gl_LocalInvocationID.x), r = p.m, c = p.n;
+    const uint64_t G = matrixB(batch), rank = svdRotations(G), norms = svdNorms(G);
+    if ((p.flags & kTrans) == 0u) {
+        for (int j = tid; j < c; j += 256) {
+            real s = real(0);
+            for (int i = 0; i < r; ++i) {
+                const real x = elem(G, i, j, r).v;
+                s += x * x;
+            }
+            elem(norms, j, 0, 1).v = sqrt(s);
+        }
+        memoryBarrier();
+        barrier();
+        for (int j = tid; j < c; j += 256) {
+            const real s = elem(norms, j, 0, 1).v;
+            int k = 0;
+            for (int i = 0; i < c; ++i) {
+                const real t = elem(norms, i, 0, 1).v;
+                if (t > s || (t == s && i < j)) ++k;  // ties by index: ranks are a permutation
+            }
+            tauOf(batch, k).v = s;
+            elem(rank, j, 0, 1).v = real(k);
+        }
+        return;
+    }
+    const int j = int(gl_WorkGroupID.x);
+    if (j >= c) return;
+    const int k = int(elem(rank, j, 0, 1).v);
+    if ((p.flags & kNoLong) == 0u) {
+#ifdef DOUBLE
+        const real eps = real(1.1102230246251565e-16);
+#else
+        const real eps = real(5.9604645e-08);
+#endif
+        const real sigma = elem(norms, j, 0, 1).v, largest = tauOf(batch, 0).v;
+        const real scale = sigma > largest * eps * real(r) && sigma > real(0) ? real(1) / sigma : real(0);
+        const uint64_t L = matrixA(batch);
+        for (int i = tid; i < r; i += 256) elem(L, i, k, p.lda).v = elem(G, i, j, r).v * scale;
+    }
+    if ((p.flags & kNoShort) == 0u) {
+        const uint64_t V = svdV(G), S = matrixC(batch);
+        const bool vt = (p.flags & kVt) != 0u;
+        for (int i = tid; i < c; i += 256) {
+            const real x = elem(V, i, j, c).v;
+            if (vt) elem(S, k, i, p.ldc).v = x;
+            else elem(S, i, k, p.ldc).v = x;
+        }
+    }
+}

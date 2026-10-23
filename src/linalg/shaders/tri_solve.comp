@@ -1,0 +1,64 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// op(T) X = B in place on B for a triangular n x n T stored in A (getrs, potrs): one workgroup per
+// right-hand side (column of B, workgroup x) and batch entry (z). op(T) = T, or T^T with kTrans;
+// T is the lower triangle of A, or the upper one with kUpper; kUnit: unit diagonal. Each step
+// solves one unknown and subtracts it from the rows still to come, in parallel.
+// LU's row interchanges (ipiv, 1-based) go through B first (kPivotsBefore: P^T B for A = P L U)
+// or, in reverse order, last (kPivotsAfter: the solve with A^T ends with P z).
+// kRight: the right-hand sides are the rows of B instead of its columns (trsm's X op(A) = B, as
+// op(A)^T X^T = B^T: the caller flips kTrans). kScale: B is multiplied by alpha first.
+
+layout(local_size_x = 256) in;
+
+// Element r of right-hand side `col`.
+Real Bel(uint64_t B, int r, int col) { return (p.flags & kRight) != 0u ? elem(B, col, r, p.ldb) : elem(B, r, col, p.ldb); }
+
+void applyPivots(uint64_t B, int col, bool reverse) {
+    if (gl_LocalInvocationID.x == 0u) {
+        const int batch = batchIndex();
+        for (int s = 0; s < p.n; ++s) {
+            const int r = reverse ? p.n - 1 - s : s;
+            const int q = pivotOf(batch, r).v - 1;
+            if (q != r) {
+                const real t = Bel(B, r, col).v;
+                Bel(B, r, col).v = Bel(B, q, col).v;
+                Bel(B, q, col).v = t;
+            }
+        }
+    }
+    memoryBarrier();
+    barrier();
+}
+
+void main() {
+    const int batch = batchIndex(), col = int(gl_WorkGroupID.x), tid = int(gl_LocalInvocationID.x);
+    if (col >= p.nrhs) return;
+    const uint64_t A = matrixA(batch), B = matrixB(batch);
+    const bool trans = (p.flags & kTrans) != 0u, unit = (p.flags & kUnit) != 0u;
+    const bool lowerSystem = ((p.flags & kUpper) == 0u) != trans;
+    if ((p.flags & kScale) != 0u) {
+        const real a = alpha();
+        for (int r = tid; r < p.n; r += 256) Bel(B, r, col).v *= a;
+        memoryBarrier();
+        barrier();
+    }
+    if ((p.flags & kPivotsBefore) != 0u) applyPivots(B, col, false);
+    for (int step = 0; step < p.n; ++step) {
+        const int i = lowerSystem ? step : p.n - 1 - step;
+        if (tid == 0 && !unit) Bel(B, i, col).v /= elem(A, i, i, p.lda).v;
+        memoryBarrier();
+        barrier();
+        const real x = Bel(B, i, col).v;
+        const int first = lowerSystem ? i + 1 : 0, last = lowerSystem ? p.n : i;
+        for (int r = first + tid; r < last; r += 256) {
+            const real t = trans ? elem(A, i, r, p.lda).v : elem(A, r, i, p.lda).v;  // op(T)(r, i)
+            Bel(B, r, col).v -= t * x;
+        }
+        memoryBarrier();
+        barrier();
+    }
+    if ((p.flags & kPivotsAfter) != 0u) applyPivots(B, col, true);
+}

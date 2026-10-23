@@ -13,8 +13,8 @@
 #   --profile        per-kernel GPU and per-call host times at exit (VULKANIZER_PROFILE=1)
 #   --gdb            run under gdb
 #
-# Vulkanizer's libcuda, libcudart, libcublas and libcublasLt are preloaded, so PyTorch uses them
-# instead of the NVIDIA libraries in its environment. What needs NVIDIA hardware or libraries is
+# Vulkanizer's libcuda, libcudart, libcublas, libcublasLt and libcusolver are preloaded, so PyTorch uses
+# them instead of the NVIDIA libraries in its environment. What needs NVIDIA hardware or libraries is
 # turned off (cuDNN and fused attention in tools/torch/sitecustomize.py, the rest below);
 # VULKANIZER_TORCH_DEFAULTS=0 keeps PyTorch's own defaults.
 set -euo pipefail
@@ -48,6 +48,8 @@ if [[ "${VULKANIZER_TORCH_DEFAULTS:-1}" != 0 ]]; then
   export PYTHONPATH="$ROOT/tools/torch${PYTHONPATH:+:$PYTHONPATH}"  # sitecustomize.py: cuDNN, fused attention
   # torch._native's CuTe DSL kernels compile to SASS; the same switch also turns off its (working) Triton ones
   export TORCH_DISABLE_NATIVE_JIT="${TORCH_DISABLE_NATIVE_JIT:-1}"
+  # torch.linalg on Vulkanizer's libcusolver: MAGMA's own kernels and the cuBLAS routines it calls do not run
+  export TORCH_LINALG_PREFER_CUSOLVER="${TORCH_LINALG_PREFER_CUSOLVER:-1}"
   # Triton: PTX is handed through instead of assembled, the launcher is built against our cuda.h
   export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$ROOT/tools/triton/ptxas}"
   export TRITON_PTXAS_BLACKWELL_PATH="${TRITON_PTXAS_BLACKWELL_PATH:-$ROOT/tools/triton/ptxas}"
@@ -58,7 +60,9 @@ export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libc
 # a CUDA 13 build of PyTorch (tools/setup_torch.sh --cuda13) gets the .so.13 libraries from lib/cuda13
 CUDA_LIB="$LIB" CUDA_MAJOR=12
 if [[ -e "$ENV/lib/libcudart.so.13" ]]; then CUDA_LIB="$LIB/cuda13" CUDA_MAJOR=13; fi
-export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$CUDA_MAJOR:$CUDA_LIB/libcublas.so.$CUDA_MAJOR:$CUDA_LIB/libcublasLt.so.$CUDA_MAJOR${LD_PRELOAD:+:$LD_PRELOAD}"
+export LD_PRELOAD="$LIB/libcuda.so.1:$CUDA_LIB/libcudart.so.$CUDA_MAJOR:$CUDA_LIB/libcublas.so.$CUDA_MAJOR:$CUDA_LIB/libcublasLt.so.$CUDA_MAJOR:$CUDA_LIB/libcusolver.so.$((CUDA_MAJOR - 1))${LD_PRELOAD:+:$LD_PRELOAD}"
+# run-time compiled kernels (the jiterator) as PTX, not cubins (src/nvrtc/nvrtc_ptx.cpp)
+export LD_AUDIT="$LIB/libvulkanizer_nvrtc.so${LD_AUDIT:+:$LD_AUDIT}"
 # a libtorch test by name (torch_ops, ...) or any other program instead of Python
 PROGRAM=("$ENV/bin/python")
 if [[ $# -gt 0 && "$1" != */* && -x "$BUILD/bin/$1" ]]; then
@@ -66,5 +70,5 @@ if [[ $# -gt 0 && "$1" != */* && -x "$BUILD/bin/$1" ]]; then
 elif [[ $# -gt 0 && -x "$1" && ! -d "$1" && "$1" != *.py ]]; then
   PROGRAM=("$1"); shift
 fi
-if [[ $GDB -eq 1 ]]; then exec gdb --args "${PROGRAM[@]}" "$@"; fi
+if [[ $GDB -eq 1 ]]; then exec gdb ${GDB_ARGS:-} --args "${PROGRAM[@]}" "$@"; fi
 exec "${PROGRAM[@]}" "$@"

@@ -47,21 +47,20 @@ Az exportált szimbólumokat version script szabályozza (`src/driver/libcuda.ma
 
 Minden lépésnél a **Kész, ha** sor a lezárás feltétele. A sorrend egyben a javasolt munkasorrend.
 
-### Állapot (2026-10-22)
+### Állapot (2026-10-23)
 
-Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs)
-az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`) és az 5.6-ból a cooperative
-groups és a több GPU alapjai. Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
+Kész: a 0–4. fázis a 3.6 és a 4.2 kivételével, az 5. fázisból az 5.2 (managed/pinned memória), az 5.3 (CUDA Graphs),
+az 5.4 (teljesítmény), az 5.5 csomagolási része (`.deb`, `.tar.gz`, `vulkanizer-run`), az 5.6-ból a cooperative
+groups és a több GPU alapjai, valamint az 5.7 (llama tg ~31 → ~38 t/s). Ami fut: nvcc-vel fordított programok (CUDA 12 és 13), llama.cpp, PyTorch (CUDA 12 és 13,
 Triton, `torch.compile`), ComfyUI (Z-Image Turbo).
 
 Hátra, javasolt sorrendben:
-1. **5.7** llama.cpp tg a natívhoz közel (folyamatban).
-2. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
-3. **4.2** További könyvtárak (`libcurand`, `libcufft`, `libcusparse`, `libcusolver`) – ha egy célalkalmazás kéri.
-4. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
-5. **5.6** maradéka: IPC (`cudaIpc*`, a PyTorch multiprocessing tenzor-megosztásához), NCCL, eszközök közti UVA.
-6. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
-7. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
+1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
+2. **4.2** További könyvtárak: a `libcusolver` kész, következik a `libcufft` (`torch.fft`), majd a `libcusparse`.
+3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
+4. **5.6** maradéka: IPC (`cudaIpc*`, a PyTorch multiprocessing tenzor-megosztásához), NCCL, eszközök közti UVA.
+5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
+6. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
    queue (5.4).
 
 ### Fázis 0 – Váz ✅
@@ -182,6 +181,27 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   Hiányzik: gyors GEMM (cooperative matrix, jobb tiling), `cublasLt`.
 - [ ] **4.2** `libcublasLt` (kész: matmul, batch, bias/ReLU/GELU epilógus), `libcurand`, `libcufft`, `libcusparse`, `libcusolver`.
   Majd ha a PyTorch vagy egy célalkalmazás kéri. A cuBLAS is csak a GEMM/TRSM családot tudja (4.1).
+  - [x] `libcusolver.so.11` / `.so.12` (CUDA 12 / 13) – a PyTorch `torch.linalg` valós (f32, f64) része, saját GLSL
+    kernelekkel (`src/linalg`, közös a cuBLAS batched faktorizációival). Egy munkacsoport oszloponként/párként, a
+    batch a grid z-je; a futás a handle streamjén megy, host-szinkron nélkül.
+    - LU (`getrf/getrs`, batched cuBLAS-ból is), Cholesky (`potrf/potrs`, batched, 64 bites API), QR (`geqrf`,
+      `orgqr`, `ormqr`, `Xgeqrf`, cuBLAS `geqrfBatched`), `trsm` (cuBLAS `S/Dtrsm`, `DtrsmBatched`).
+    - Szimmetrikus sajátérték (`syevd`, `syevj`, `syevjBatched`, `Xsyevd`, `XsyevBatched`): ciklikus Jacobi,
+      round-robin párosítással (egy kör n/2 független forgatás), rögzített 12 (f32) / 16 (f64) sweep.
+    - SVD (`gesvdj`, `gesvdjBatched`, `gesvd`): egyoldali (Hestenes) Jacobi a magas alakon (széles mátrixnál A^T-n);
+      a hosszú oldal vektorait (full módban és nulla szinguláris értékeknél is) QR teszi teljes ortonormált bázissá.
+    - cuBLAS f64 GEMM (`Dgemm`, `DgemmBatched`, `DgemmStridedBatched`, `GemmEx` f64-gyel) – a linalg tesztekhez
+      és a `pinv`-hez kellett.
+    - PyTorch: `TORCH_LINALG_PREFER_CUSOLVER=1` (a MAGMA nem fut); a jiterator NVRTC-je cubint kérne, ezt egy
+      `LD_AUDIT` könyvtár (`libvulkanizer_nvrtc.so`) PTX-re fordítja át (`-arch sm_XX` → `compute_XX`,
+      `nvrtcGetCUBIN*` → `nvrtcGetPTX*`).
+    - Tesztek: `tests/cusolver.cpp` (ctest, RADV és llvmpipe), `torch_linalg` (inv, solve, det, slogdet, lu,
+      cholesky, qr, householder, ormqr, lstsq, solve_triangular, eigh, eigvalsh, svd, svdvals, pinv, matrix_rank,
+      matrix_norm; CUDA 12 és 13 – ALL OK).
+    - Nincs: komplex típusok, `gesvdaStridedBatched`, LDL^T (`sytrf`), nem szimmetrikus sajátérték (`Xgeev`);
+      ezek `CUSOLVER_STATUS_NOT_SUPPORTED`-et adnak. Nagy mátrixokra (n ≳ 1000) a Jacobi lassú (n²·sweep dispatch).
+  - [ ] `libcufft` (`torch.fft`): plan + C2C/R2C/C2R, Stockham radix-2/3/5 és Bluestein a többi hosszra.
+  - [ ] `libcusparse` (a PyTorch sparse része init hibával áll meg), `libcurand` (a PyTorch nem használja).
 - [x] **4.3** Célalkalmazás: a llama.cpp CUDA backendje (`tools/build_llama.sh`).
 - [x] **4.4 Mérföldkő:** a SmolLM2-135M (Q8_0 és Q4_0) szöveget generál a Renoir iGPU-n.
   - `llama-bench`: pp64 ≈ 227 t/s, tg32 ≈ 25 t/s.
@@ -372,7 +392,9 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - Hátra (halasztva): külön transfer queue a másolásoknak. A másolások már most sem blokkolnak (a compute queue-n,
     sorban futnak); a külön queue a kernelekkel való átfedést hozná, integrált GPU-n (közös memória-sávszélesség)
     kevés haszonnal.
-- [ ] **5.7** llama.cpp tokengenerálás (tg) a natív Vulkan backendhez közel.
+- [x] **5.7** llama.cpp tokengenerálás (tg) a natív Vulkan backendhez közel – lezárva (2026-10-23) ~31 → ~38 t/s-nál;
+  a maradék különbség a llama.cpp mmvq kernelének felépítéséből jön (lásd lent), általános fordítóoptimalizálással
+  nem csökkenthető tovább.
   - Kiinduló helyzet (2026-10-23, TinyLlama Q4_0, Renoir, felváltva mérve): Vulkanizer tg64 ~31 t/s, natív ~60–65.
     A gép teljesítményállapota (memóriaórajel) futásról futásra 20%-ot is mozdít: csak felváltott A/B mérés számít.
   - [x] `.ftz` fma natívan: a ggml-cuda `--use_fast_math`-tal fordul, a forró `fma.rn.ftz.f32` utasításokra nem kell
@@ -393,7 +415,15 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - Kipróbálva, nem segít (felváltott A/B): `shfl.bfly` → `OpGroupNonUniformShuffleXor` (az ACO már swizzle-t ad);
     nagyobb batch (256/1024 parancs; zajon belül); korai flush üres GPU-nál (8 parancs után; zajon belül); a dp4a
     mezőkivonásos változata (−15%, az ACO nem fűzi SDWA-ba; a csomagolt 16 bites marad).
-  - Hátra: a címszámítás 32 bites offsetre + skalár bázisra (`global_load v, voffset, s[base]`), olcsóbb dp4a;
+  - A 64 bites címszámítás szűkítése (vizsgálva, 2026-10-23): a kernelben nincs negyed sebességű vektoros szorzás (a
+    konstans szorzásokat a driver eltolásra bontja vagy skalárban végzi); a ~300 VALU-utasításból ~60 a 64 bites
+    cím (`v_add_co/addc`, `v_lshlrev_b64`, előjel-kiterjesztés). Ezt maga a PTX írja elő (`mul.wide.s32 sor, 18`,
+    `mul.lo.s64 index, 36`, paraméterekből jövő indexekkel), így a gyors címzés (skalár bázis + 32 bites offset)
+    csak akkor volna helyes, ha az offset bizonyítottan elfér 32 biten; ez paraméterfüggő értékekre nem bizonyítható.
+    A konstans offsetek (`+4`, `-2`) beolvasztását a felső bitek OR-ja akadályozza, amit a forrásra (paraméter-
+    betöltésre) áttenni nem biztonságos: a null-ellenőrzés (`setp.eq.s64 p, ptr, 0`) és a memóriába írt pointerek
+    értéke megváltozna. Elvetve: biztonságosan kevés nyerhető (felső becslés ~10% a kernelen).
+  - Nem készült el (llama-specifikus, ezért elvetve): kernelcsere a llama.cpp mmvq-jére (soronként több sor, újrahasznált aktiváció) – llama-specifikus;
     a KV-cache másolás (`cpy_scalar` f16, 5004 utasítás, ~1 ms/token: a 64 bites div/rem gyors útja mellett a
     lassú út is beinline-olódik).
 - [ ] **5.5** Csomagolás: install target, `.deb`, dokumentáció. Jogi átnézés publikálás előtt.
