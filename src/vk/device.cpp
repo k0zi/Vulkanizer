@@ -48,9 +48,11 @@ std::mutex& profileMutex() {
     return *m;
 }
 // Per batch: from the first command's start to the last one's end, and the gaps in between.
+// Also every batch's first start and last end (GPU ticks in ns), for the idle time between batches.
 struct ProfileSpan {
     double busyNs = 0, gapNs = 0;
     uint64_t batches = 0;
+    std::vector<std::pair<double, double>> spans;
 };
 ProfileSpan& profileSpan() {
     static ProfileSpan span;
@@ -74,6 +76,24 @@ void printProfile() {
     const ProfileSpan& span = profileSpan();
     std::fprintf(stderr, "[vulkanizer] %llu batches: %.3f ms from first start to last end, %.3f ms of it between commands\n",
                  (unsigned long long)span.batches, span.busyNs * 1e-6, span.gapNs * 1e-6);
+    // The GPU's idle time between consecutive batches: short gaps are submission latency, long ones
+    // the host (synchronizing, preparing the next work).
+    std::vector<std::pair<double, double>> spans = span.spans;
+    std::sort(spans.begin(), spans.end());
+    double idle[3] = {}, prevEnd = 0;
+    uint64_t gaps[3] = {};
+    for (const auto& [start, end] : spans) {
+        if (prevEnd > 0 && start > prevEnd) {
+            const double g = start - prevEnd;
+            const int k = g < 50e3 ? 0 : g < 1e6 ? 1 : 2;
+            idle[k] += g;
+            ++gaps[k];
+        }
+        prevEnd = std::max(prevEnd, end);
+    }
+    std::fprintf(stderr, "[vulkanizer] GPU idle between batches: %.3f ms in %llu gaps < 50 us, %.3f ms in %llu of 50 us - 1 ms, "
+                         "%.3f ms in %llu longer\n", idle[0] * 1e-6, (unsigned long long)gaps[0], idle[1] * 1e-6,
+                 (unsigned long long)gaps[1], idle[2] * 1e-6, (unsigned long long)gaps[2]);
     std::fprintf(stderr, "  %10s %8s %10s %6s  %s\n", "total ms", "count", "avg us", "%", "kernel");
     for (size_t i = 0; i < rows.size() && i < 40; ++i) {
         const auto& [name, e] = rows[i];
@@ -959,6 +979,7 @@ void Device::collectTimings(Batch& b) {
             }
             ++profileSpan().batches;
             profileSpan().busyNs += double(ticks.back() - ticks.front()) * timestampPeriodNs_;
+            profileSpan().spans.emplace_back(double(ticks.front()) * timestampPeriodNs_, double(ticks.back()) * timestampPeriodNs_);
         }
     }
     b.timed.clear();
@@ -1052,6 +1073,11 @@ bool Device::idleLocked() {
         completedSerial_ = std::max(completedSerial_, b.serial);
     }
     return true;
+}
+
+bool Device::idle() {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return idleLocked();
 }
 
 bool Device::isComplete(uint64_t serial) {

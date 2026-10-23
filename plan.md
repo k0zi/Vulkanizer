@@ -385,7 +385,14 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     iterációban (~500 utasítás/szál); tokenenként ~264 ezer sor ≈ 280 millió wave-utasítás ≈ 20 ms a Vega 8-on.
     Occupancy rendben (6–7 wave/SIMD, nincs spill). A kód nagyobb tételei: 64 bites címszámítás (~55 utasítás,
     `v_add_co/addc` párok, minden betöltéshez külön), dp4a emuláció (~12 utasítás/dp4a, nincs hardveres dot4).
-  - Kipróbálva, nem segít: `shfl.bfly` → `OpGroupNonUniformShuffleXor` (az ACO már swizzle-t ad).
+  - [x] Tokenek közti üresjárat: a `VULKANIZER_PROFILE` most a batch-ek közti GPU-tétlenséget is méri (rövid =
+    submit-késleltetés, hosszú = a host). Tokenenként ~2,6 ms tétlenség volt: a ggml-cuda a bemeneteket (tokenek,
+    pozíciók, maszk) pinned host-bufferből tölti fel, ~20 `cudaMemcpyAsync` + `cudaStreamSynchronize` párral, és a
+    pinned forrás GPU-másolást jelentett, így mindegyik egy GPU-oda-vissza út volt (~120 µs). Most a pinned/managed →
+    device másolás üres GPU mellett host-memcpy (mint pageable forrásnál): a tétlenség ~0,6 ms, tg +2–3%.
+  - Kipróbálva, nem segít (felváltott A/B): `shfl.bfly` → `OpGroupNonUniformShuffleXor` (az ACO már swizzle-t ad);
+    nagyobb batch (256/1024 parancs; zajon belül); korai flush üres GPU-nál (8 parancs után; zajon belül); a dp4a
+    mezőkivonásos változata (−15%, az ACO nem fűzi SDWA-ba; a csomagolt 16 bites marad).
   - Hátra: a címszámítás 32 bites offsetre + skalár bázisra (`global_load v, voffset, s[base]`), olcsóbb dp4a;
     a KV-cache másolás (`cpy_scalar` f16, 5004 utasítás, ~1 ms/token: a 64 bites div/rem gyors útja mellett a
     lassú út is beinline-olódik).

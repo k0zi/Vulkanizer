@@ -155,6 +155,7 @@ public:
     VkResult wait(uint64_t serial);       // flushes if needed and waits for that serial
     VkResult finish();                    // waits for everything recorded
     bool isComplete(uint64_t serial);
+    bool idle();                          // nothing recorded or running
 
     // GPU timestamps (for CUDA events). Slots come from a fixed pool; -1 if unsupported.
     int32_t allocateTimestamp();

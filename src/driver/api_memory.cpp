@@ -102,7 +102,20 @@ static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_
     const bool dstDev = findPieces(*s.slot, dst, bytes, d);
     const bool srcDev = findPieces(*s.slot, src, bytes, sr);
     if ((dstDevice && !dstDev) || (srcDevice && !srcDev)) return CUDA_ERROR_INVALID_VALUE;
-    if (dstDev && srcDev) return copyPieces(*s.dev, sr, d, sync);
+    if (dstDev && srcDev) {
+        // From pinned or managed memory into device memory while the device is idle (inputs uploaded
+        // between two steps, e.g. per LLM token): a host copy, like from any host memory, instead of
+        // a GPU copy that the synchronous call or the next synchronize has to wait a round trip for.
+        auto hostMemory = [](const std::vector<AllocPiece>& p) {
+            return std::all_of(p.begin(), p.end(), [](const AllocPiece& x) { return x.ref.buffer->hostAddressed; });
+        };
+        auto deviceMemory = [](const std::vector<AllocPiece>& p) {
+            return std::none_of(p.begin(), p.end(), [](const AllocPiece& x) { return x.ref.buffer->hostAddressed; });
+        };
+        if (hostMemory(sr) && deviceMemory(d) && s.dev->idle())
+            return writePieces(*s.dev, d, reinterpret_cast<const void*>(src));
+        return copyPieces(*s.dev, sr, d, sync);
+    }
     if (dstDev) return writePieces(*s.dev, d, reinterpret_cast<const void*>(src));
     if (srcDev) return readPieces(*s.dev, sr, reinterpret_cast<void*>(dst));
     std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
