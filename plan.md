@@ -58,7 +58,7 @@ Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
 2. **4.2** További könyvtárak: a `libcusolver`, `libcufft` és `libcusparse` kész; a `libcurand` csak ha kell.
 3. **3.6** Textúrák / surface-ek – ha egy célalkalmazás kéri.
-4. **5.6** maradéka: IPC (`cudaIpc*`, a PyTorch multiprocessing tenzor-megosztásához), NCCL, eszközök közti UVA.
+4. **5.6** maradéka: NCCL, eszközök közti UVA (az IPC kész).
 5. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész).
 6. Nyitott részfeladatok: rögzített Vulkan command bufferek, child graph, memória-csomópontok (5.3); külön copy
    queue (5.4).
@@ -499,11 +499,26 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
       (subgroup < 32) a predikált `redux`/`shfl` stb. minden szálon fut (a barrierek nem lehetnek divergens ágban), a
       predikátum csak a célregisztert választja.
     - Hátra: eszközök közti UVA (`cudaMemcpyDefault` két eszköz pointerével: a keresés a current context eszközén
-      belül történik), NCCL, IPC.
+      belül történik), NCCL.
     - llama.cpp két eszközön (RADV + llvmpipe) eljut a rétegek szétosztásáig és a peer másolásig, de az llvmpipe-on a
       `rope_norm` kernel (blockDim.x = 1) összeomlik: az llvmpipe a `set_rows_stride != 0` feltétel mögötti
       `row_indices[i]` loadot a feltétel elé emeli (Volatile-lal is), és a null pointerből olvas. A Vulkanizer a loadot a
       feltételen belül adja (Mesa-oldali viselkedés); RADV-n ugyanez nem fordul elő.
+  - [x] IPC (`cuIpc*`/`cudaIpc*`, a PyTorch `torch.multiprocessing` CUDA-tenzor megosztása; CUDA 12 és 13):
+    - Minden eszközfoglalás exportálható Vulkan-memória (`VK_KHR_external_memory_fd`, opaque fd; a sub-allocation
+      blokkok is). A 64 bájtos handle adat: az exportáló pid-je, a memória azonosítója, a pozíció benne, a buffer és a
+      memória létrehozási paraméterei és az eszköz UUID-ja. Fd-t nem visz: az exportáló folyamat az első
+      `cuIpcGetMemHandle`-nél egy absztrakt Unix socketet indít (`vulkanizer-ipc-<uid>-<pid>`, `SO_PEERCRED`: csak
+      azonos usernek), amin SCM_RIGHTS-szal ad fd-t; ez a Yama ptrace-korláttal is működik (a `pidfd_getfd`-vel
+      szemben, ami gyerek→szülő irányban nem). Az importáló egyszer importálja az egész memóriát, a további
+      megnyitások (ugyanabba a memóriába) refcounttal osztoznak rajta.
+    - Interprocess event: a rögzítése megvárja az eszközt (`cuEventRecord`), így a másik folyamatban megnyitott event
+      mindig kész – a PyTorch a megosztásnál így használja (record, utána handle).
+    - Az exportálható memória nem lassít (llama tg/pp felváltott A/B-vel a zajon belül); `VULKANIZER_IPC=0`
+      kikapcsolja. Közben: az export jelzőjét az eszköz létrehozása után rögtön be kell állítani – az init-próbák
+      már sub-allocation blokkot hoznak létre, és a későbbi foglalások abból kapnak.
+    - Tesztek: `tests/ipc.cpp` (fork, két folyamat: kis és nagy foglalás, belső pointer, kétszeres megnyitás, GPU-írás
+      mindkét irányban, event; RADV és llvmpipe); PyTorch `spawn`: tenzor a gyereknek, helyben módosítva, és vissza.
 
 ## 3. Ismert korlátok / kockázatok
 

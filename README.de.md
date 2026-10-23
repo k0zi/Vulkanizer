@@ -221,6 +221,7 @@ Dann <http://127.0.0.1:8188> öffnen. Modelle kommen wie gewohnt nach `models/`.
 | `VULKANIZER_FAST_FMA=1` | Schnelleres, ungenaueres f32-`fma` |
 | `VULKANIZER_EXACT_FMA=1` | Exaktes f32-`fma` auch für Fast-Math-Code (`.ftz`), langsamer |
 | `VULKANIZER_GEMM_F32=1` | cuBLAS-GEMMs mit `COMPUTE_16F` rechnen ebenfalls mit f32-Multiplikation |
+| `VULKANIZER_IPC=0` | Gerätespeicher ist nicht an andere Prozesse exportierbar (kein CUDA-IPC) |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | Ort des Kernel-Caches oder ihn abschalten |
 | `VULKANIZER_CACHE_SIZE=<MiB>` | Größenlimit des Kernel-Caches in MiB (Standard 256); die am längsten unbenutzten Einträge fallen zuerst weg |
 | `VULKANIZER_CC=86` | Die gemeldete Compute Capability |
@@ -233,7 +234,9 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
 - Keine SASS-Ausführung: Nur Binaries mit PTX laufen.
 - CUDA Graphs: Stream Capture und Wiedergabe funktionieren (die Graphen von llama.cpp, PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); keine Child-Graphen, Speicher- oder bedingten Knoten.
-- (Noch) nicht unterstützt: Texturen, cuDNN, NCCL, CUDA-IPC.
+- (Noch) nicht unterstützt: Texturen, cuDNN, NCCL.
+- CUDA-IPC (`cudaIpc*`, `torch.multiprocessing` von PyTorch) funktioniert zwischen Prozessen desselben Benutzers; ein
+  Interprozess-Event ist fertig, sobald es aufgezeichnet ist (das Aufzeichnen wartet auf das Gerät).
 - Mehrere GPUs sind getrennte Geräte: `cudaMemcpyPeer` kopiert zwischen ihnen über den Host-Speicher, aber ein Kernel
   erreicht nie den Speicher einer anderen GPU (kein Peer-Zugriff). Kooperative Starts (`grid.sync()`) funktionieren bis
   zu der Anzahl Blöcke, die gleichzeitig auf die GPU passen.

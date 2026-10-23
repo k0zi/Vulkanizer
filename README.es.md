@@ -221,6 +221,7 @@ Después abra <http://127.0.0.1:8188>. Los modelos van en `models/`, como siempr
 | `VULKANIZER_FAST_FMA=1` | `fma` f32 más rápido y menos preciso |
 | `VULKANIZER_EXACT_FMA=1` | `fma` f32 exacto también para código fast math (`.ftz`), más lento |
 | `VULKANIZER_GEMM_F32=1` | Los GEMM de cuBLAS con `COMPUTE_16F` también multiplican en f32 |
+| `VULKANIZER_IPC=0` | La memoria del dispositivo no se puede exportar a otros procesos (sin IPC de CUDA) |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | Ubicación de la caché de kernels, o desactivarla |
 | `VULKANIZER_CACHE_SIZE=<MiB>` | Límite de tamaño de la caché de kernels en MiB (256 por defecto); primero se eliminan las entradas usadas hace más tiempo |
 | `VULKANIZER_CC=86` | La compute capability que se informa |
@@ -233,7 +234,9 @@ Lista completa: [plan.md, sección 4](plan.md).
 - No se ejecuta SASS: solo funcionan los binarios que contienen PTX.
 - CUDA Graphs: la captura de streams y la reproducción funcionan (los grafos de llama.cpp, `CUDAGraph` de PyTorch,
   `torch.compile(mode="reduce-overhead")`); no hay grafos hijos, nodos de memoria ni nodos condicionales.
-- (Aún) no compatible: texturas, cuDNN, NCCL, IPC de CUDA.
+- (Aún) no compatible: texturas, cuDNN, NCCL.
+- El IPC de CUDA (`cudaIpc*`, `torch.multiprocessing` de PyTorch) funciona entre procesos del mismo usuario; un evento
+  entre procesos está completo en cuanto se registra (registrarlo espera al dispositivo).
 - Varias GPU son dispositivos separados: `cudaMemcpyPeer` copia entre ellas a través de la memoria del anfitrión, pero
   un kernel nunca accede a la memoria de otra GPU (sin acceso entre pares). Los lanzamientos cooperativos
   (`grid.sync()`) funcionan hasta el número de bloques que caben a la vez en la GPU.

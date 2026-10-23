@@ -1280,25 +1280,44 @@ cudaError_t CUDARTAPI cudaGetDriverEntryPoint(const char* symbol, void** funcPtr
 cudaError_t CUDARTAPI cudaProfilerStart(void) { return cudaSuccess; }
 cudaError_t CUDARTAPI cudaProfilerStop(void) { return cudaSuccess; }
 
+// Interprocess sharing: the driver's (api_ipc.cpp); the runtime's handles have the same 64 bytes.
+static_assert(sizeof(cudaIpcMemHandle_t) == sizeof(CUipcMemHandle) && sizeof(cudaIpcEventHandle_t) == sizeof(CUipcEventHandle));
+
 cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t* handle, void* devPtr) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    if (!handle) return record(cudaErrorInvalidValue);
+    CUipcMemHandle h;
+    if (CUresult r = cuIpcGetMemHandle(&h, reinterpret_cast<CUdeviceptr>(devPtr))) return record(r);
+    std::memcpy(handle, &h, sizeof h);
+    return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaIpcOpenMemHandle(void** devPtr, cudaIpcMemHandle_t handle, unsigned int flags) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    if (!devPtr) return record(cudaErrorInvalidValue);
+    CUipcMemHandle h;
+    std::memcpy(&h, &handle, sizeof h);
+    CUdeviceptr p = 0;
+    if (CUresult r = cuIpcOpenMemHandle_v2(&p, h, flags)) return record(r);
+    *devPtr = reinterpret_cast<void*>(p);
+    return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void* devPtr) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    return record(cuIpcCloseMemHandle(reinterpret_cast<CUdeviceptr>(devPtr)));
 }
 cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t* handle, cudaEvent_t event) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    if (!handle) return record(cudaErrorInvalidValue);
+    CUipcEventHandle h;
+    if (CUresult r = cuIpcGetEventHandle(&h, event)) return record(r);
+    std::memcpy(handle, &h, sizeof h);
+    return cudaSuccess;
 }
 cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t* event, cudaIpcEventHandle_t handle) {
     ENTER();
-    return record(cudaErrorNotSupported);
+    CUipcEventHandle h;
+    std::memcpy(&h, &handle, sizeof h);
+    return record(cuIpcOpenEventHandle(event, h));
 }
 
 // ---- memory pools (the driver's; the runtime types share the driver's layouts) --------------------

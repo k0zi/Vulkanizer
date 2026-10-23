@@ -211,6 +211,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `VULKANIZER_FAST_FMA=1` | 更快但精度较低的 f32 `fma` |
 | `VULKANIZER_EXACT_FMA=1` | 对 fast math（`.ftz`）代码也使用精确的 f32 `fma`（较慢） |
 | `VULKANIZER_GEMM_F32=1` | `COMPUTE_16F` 的 cuBLAS GEMM 也使用 f32 乘法 |
+| `VULKANIZER_IPC=0` | 设备内存不可导出给其他进程（无 CUDA IPC） |
 | `VULKANIZER_CACHE_DIR=<目录>\|off` | 内核缓存的位置，或将其关闭 |
 | `VULKANIZER_CACHE_SIZE=<MiB>` | 内核缓存的大小上限（MiB，默认 256）；最久未使用的条目最先删除 |
 | `VULKANIZER_CC=86` | 报告的 compute capability |
@@ -223,7 +224,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - 不执行 SASS：只有包含 PTX 的二进制文件才能运行。
 - CUDA Graphs：流捕获和重放可以工作（llama.cpp 的图、PyTorch 的 `CUDAGraph`、`torch.compile(mode="reduce-overhead")`）；
   不支持子图、内存节点和条件节点。
-- （尚）不支持：纹理、cuDNN、NCCL、CUDA IPC。
+- （尚）不支持：纹理、cuDNN、NCCL。
+- CUDA IPC（`cudaIpc*`、PyTorch 的 `torch.multiprocessing`）可在同一用户的进程之间使用；跨进程事件在记录时即完成（记录会等待设备）。
 - 多个 GPU 是彼此独立的设备：`cudaMemcpyPeer` 通过主机内存在它们之间复制，但内核永远无法访问另一个 GPU 的内存
   （没有对等访问）。协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU

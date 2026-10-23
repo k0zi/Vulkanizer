@@ -220,6 +220,7 @@ Ezután nyisd meg a <http://127.0.0.1:8188> címet. A modellek a szokott módon 
 | `VULKANIZER_FAST_FMA=1` | Gyorsabb, kevésbé pontos f32 `fma` |
 | `VULKANIZER_EXACT_FMA=1` | Pontos f32 `fma` a fast math (`.ftz`) kódban is (lassabb) |
 | `VULKANIZER_GEMM_F32=1` | A `COMPUTE_16F`-es cuBLAS GEMM-ek is f32 szorzással futnak |
+| `VULKANIZER_IPC=0` | Az eszközmemória nem exportálható más folyamatoknak (nincs CUDA IPC) |
 | `VULKANIZER_CACHE_DIR=<dir>\|off` | A kernel-gyorsítótár helye, vagy kikapcsolása |
 | `VULKANIZER_CACHE_SIZE=<MiB>` | A kernel-gyorsítótár méretkorlátja MiB-ban (alap: 256); a legrégebben használt bejegyzések törlődnek először |
 | `VULKANIZER_CC=86` | A jelentett compute capability |
@@ -232,7 +233,9 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 - Nincs SASS-futtatás: csak PTX-et tartalmazó binárisok futnak.
 - CUDA Graphs: a stream capture és a visszajátszás működik (a llama.cpp gráfjai, a PyTorch `CUDAGraph`,
   `torch.compile(mode="reduce-overhead")`); child graph, memória- és feltételes csomópont nincs.
-- (Még) nem támogatott: textúrák, cuDNN, NCCL, CUDA IPC.
+- (Még) nem támogatott: textúrák, cuDNN, NCCL.
+- A CUDA IPC (`cudaIpc*`, a PyTorch `torch.multiprocessing`-je) azonos felhasználó folyamatai között működik; egy
+  folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).
 - Több GPU külön eszközként működik: a `cudaMemcpyPeer` host-memórián át másol köztük, de egy kernel sosem éri el egy
   másik GPU memóriáját (nincs peer access). A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi
   egyszerre elfér a GPU-n.

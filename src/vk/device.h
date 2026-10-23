@@ -26,6 +26,11 @@ struct Buffer {
     bool hostCached = false;  // host reads of `mapped` are cached (otherwise write-combined: very slow)
     bool hostAddressed = false;  // host memory at its own address (address == mapped)
     bool placedMapping = false;  // our memory, mapped at a chosen address (allocateHostMemory)
+    // Memory that other processes can import (exportMemory, importMemory: CUDA IPC). The buffer's
+    // and memory's creation parameters, which the importer has to repeat.
+    bool exportable = false;
+    VkDeviceSize bufferSize = 0, memorySize = 0;
+    uint32_t memoryType = 0;
 };
 
 struct ComputePipeline {
@@ -56,6 +61,7 @@ struct Features {
     bool addressCaptureReplay = false;  // buffers can be placed at a requested device address
     bool hostMemoryImport = false;  // host memory at device address h | hostAddressBits() (importHostMemory)
     bool hostMemoryAlloc = false;   // the same for memory of our own (allocateHostMemory)
+    bool memoryExport = false;      // device allocations are exportable as opaque fds (CUDA IPC)
 };
 
 // One page range of a sparse buffer bound to `memory` (or unbound if VK_NULL_HANDLE).
@@ -119,6 +125,14 @@ public:
     void freeMemory(VkDeviceMemory memory);
     // Takes effect for the work recorded afterwards; unbinding first waits for the recorded work.
     VkResult bindSparse(const std::vector<SparseBind>& binds);
+
+    // CUDA IPC. exportId names an exportable buffer's memory (the same id for every buffer of one
+    // memory, valid until that memory is freed); exportMemory gives a new fd of it, for another
+    // process to import with the creation parameters of the buffer (Buffer::exportable). The imported
+    // buffer covers the whole memory; it is freed with freeBuffer.
+    VkResult exportId(const Buffer& buf, uint64_t& id);
+    VkResult exportMemory(uint64_t id, int& fd);
+    VkResult importMemory(int fd, VkDeviceSize bufferSize, VkDeviceSize memorySize, uint32_t memoryType, Buffer& out);
 
     // All of these run in queue order with the recorded work. read waits for it and returns the
     // data; write returns once `src` was consumed (small writes are staged and recorded, large
@@ -197,7 +211,8 @@ private:
     explicit Device(const PhysicalDeviceInfo& info) : info_(info) {}
     VkResult init();
     VkResult createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                          std::initializer_list<VkMemoryPropertyFlags> preferences, Buffer& out);
+                          std::initializer_list<VkMemoryPropertyFlags> preferences, Buffer& out,
+                          bool exportable = false);
     int32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) const;
     // Runs commands immediately and waits (after all recorded work).
     VkResult submit(const std::function<void(VkCommandBuffer)>& record);
@@ -271,6 +286,10 @@ private:
     PFN_vkGetPipelineExecutableStatisticsKHR getPipelineStats_ = nullptr;
     void printPipelineStats(VkPipeline pipeline, const char* entryPoint, const uint32_t spec[5]);
     PFN_vkUnmapMemory2KHR unmapMemory2_ = nullptr;
+    PFN_vkGetMemoryFdKHR getMemoryFd_ = nullptr;
+    std::unordered_map<VkDeviceMemory, uint64_t> exportIds_;  // exported memory -> id (exportId)
+    std::unordered_map<uint64_t, VkDeviceMemory> exported_;
+    uint64_t nextExportId_ = 1;
     // A sparse buffer of `size` at device address h | hostAddressBits() (fails if that is taken).
     VkResult createAtHostAddress(uint64_t h, VkDeviceSize size, bool imported, Buffer& out);
     // allocateHostMemory's buffer and host-visible memory at h | hostAddressBits(), not yet mapped:

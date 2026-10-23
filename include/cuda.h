@@ -668,6 +668,7 @@ typedef enum CUtensorMapFloatOOBfill_enum {
 #define cuMemHostGetDevicePointer cuMemHostGetDevicePointer_v2
 #define cuStreamDestroy cuStreamDestroy_v2
 #define cuEventDestroy cuEventDestroy_v2
+#define cuIpcOpenMemHandle cuIpcOpenMemHandle_v2
 #define cuStreamBeginCapture cuStreamBeginCapture_v2
 #define cuStreamGetCaptureInfo cuStreamGetCaptureInfo_v2
 #define cuGraphInstantiate cuGraphInstantiateWithFlags
@@ -895,6 +896,22 @@ CUresult CUDAAPI cuEventSynchronize(CUevent hEvent);
 CUresult CUDAAPI cuEventQuery(CUevent hEvent);
 CUresult CUDAAPI cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUevent hEnd);
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent);
+
+/* Interprocess sharing of device memory and events: the handles are plain data, sent to the other
+   process by any means. */
+#define CU_IPC_HANDLE_SIZE 64
+typedef struct CUipcMemHandle_st {
+    char reserved[CU_IPC_HANDLE_SIZE];
+} CUipcMemHandle;
+typedef struct CUipcEventHandle_st {
+    char reserved[CU_IPC_HANDLE_SIZE];
+} CUipcEventHandle;
+typedef enum CUipcMem_flags_enum { CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1 } CUipcMem_flags;
+CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle* pHandle, CUdeviceptr dptr);
+CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr* pdptr, CUipcMemHandle handle, unsigned int Flags);
+CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr);
+CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle* pHandle, CUevent event);
+CUresult CUDAAPI cuIpcOpenEventHandle(CUevent* phEvent, CUipcEventHandle handle);
 
 /* Stream capture and graphs. Captured work is recorded in order and replayed in that order on
    the launch stream (a valid topological order: capture follows the streams' order). */

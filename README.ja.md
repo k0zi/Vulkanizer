@@ -217,6 +217,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 | `VULKANIZER_FAST_FMA=1` | 高速だが精度の低い f32 `fma` |
 | `VULKANIZER_EXACT_FMA=1` | fast math（`.ftz`）コードでも正確な f32 `fma`（低速） |
 | `VULKANIZER_GEMM_F32=1` | `COMPUTE_16F` の cuBLAS GEMM も f32 の乗算で実行 |
+| `VULKANIZER_IPC=0` | デバイスメモリを他のプロセスへエクスポートしない（CUDA IPC なし） |
 | `VULKANIZER_CACHE_DIR=<ディレクトリ>\|off` | カーネルキャッシュの場所、または無効化 |
 | `VULKANIZER_CACHE_SIZE=<MiB>` | カーネルキャッシュのサイズ上限（MiB、既定 256）。最も長く使われていないエントリから削除されます |
 | `VULKANIZER_CC=86` | 報告する compute capability |
@@ -229,7 +230,9 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - SASS は実行できません。PTX を含むバイナリのみ動作します。
 - CUDA Graphs：ストリームキャプチャと再生は動作します（llama.cpp のグラフ、PyTorch の `CUDAGraph`、
   `torch.compile(mode="reduce-overhead")`）。子グラフ、メモリノード、条件ノードは未対応です。
-- （まだ）未対応：テクスチャ、cuDNN、NCCL、CUDA IPC。
+- （まだ）未対応：テクスチャ、cuDNN、NCCL。
+- CUDA IPC（`cudaIpc*`、PyTorch の `torch.multiprocessing`）は同じユーザーのプロセス間で動作します。プロセス間イベントは
+  記録した時点で完了します（記録はデバイスを待ちます）。
 - 複数の GPU はそれぞれ独立したデバイスです。`cudaMemcpyPeer` はホストメモリ経由でそれらの間をコピーしますが、カーネルが
   別の GPU のメモリにアクセスすることはできません（ピアアクセスなし）。協調起動（`grid.sync()`）は、GPU に同時に
   載るブロック数まで動作します。

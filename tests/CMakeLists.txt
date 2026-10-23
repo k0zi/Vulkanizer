@@ -30,6 +30,7 @@ endfunction()
 
 vulkanizer_cuda_test(device_query)
 vulkanizer_cuda_test(memory)
+vulkanizer_cuda_test(ipc)
 vulkanizer_cuda_test(ptx_module)
 vulkanizer_cuda_test(vector_add)
 vulkanizer_cuda_test(kernels)

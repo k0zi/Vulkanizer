@@ -101,6 +101,9 @@ CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
         hEvent->serial = dev->currentSerial();
     }
     hEvent->recorded = true;
+    // Other processes wait for an interprocess event without seeing this device's progress
+    // (api_ipc.cpp): it completes here.
+    if (hEvent->flags & CU_EVENT_INTERPROCESS) return toCuResult(dev->wait(hEvent->serial));
     return CUDA_SUCCESS;
 }
 

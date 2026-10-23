@@ -206,6 +206,27 @@ VkResult Device::init() {
             }
         }
     }
+    // CUDA IPC: device allocations exportable as opaque fds (VULKANIZER_IPC=0 turns it off).
+    bool externalFd = false;
+    if (const char* env = std::getenv("VULKANIZER_IPC"); !env || std::strcmp(env, "0") != 0) {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> props(count);
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, props.data());
+        for (const VkExtensionProperties& p : props)
+            if (!std::strcmp(p.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) externalFd = true;
+        if (externalFd) {
+            VkPhysicalDeviceExternalBufferInfo ebi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+            ebi.usage = kDeviceBufferUsage;
+            ebi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+            VkExternalBufferProperties ebp{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+            vkGetPhysicalDeviceExternalBufferProperties(info_.handle, &ebi, &ebp);
+            const VkExternalMemoryFeatureFlags need =
+                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+            externalFd = (ebp.externalMemoryProperties.externalMemoryFeatures & need) == need;
+        }
+        if (externalFd) extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    }
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipelineStats{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     if (const char* env = std::getenv("VULKANIZER_PIPELINE_STATS"); env && *env && std::strcmp(env, "0") != 0) {
@@ -264,6 +285,10 @@ VkResult Device::init() {
         return r;
     }
     vkGetDeviceQueue(device_, info_.computeQueueFamily, 0, &queue_);
+    if (externalFd) {  // before the first allocation: every device allocation is exportable
+        getMemoryFd_ = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR"));
+        features_.memoryExport = getMemoryFd_ != nullptr;
+    }
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -393,7 +418,9 @@ int32_t Device::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required
 }
 
 VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                              std::initializer_list<VkMemoryPropertyFlags> preferences, Buffer& out) {
+                              std::initializer_list<VkMemoryPropertyFlags> preferences, Buffer& out,
+                              bool exportable) {
+    exportable = exportable && features_.memoryExport;
     if (info_.maxMemoryAllocationSize && size > info_.maxMemoryAllocationSize) {
         VULKANIZER_WARN("allocation of %llu bytes exceeds maxMemoryAllocationSize (%llu)",
                    static_cast<unsigned long long>(size),
@@ -405,6 +432,9 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     bci.size = size;
     bci.usage = usage;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    if (exportable) bci.pNext = &external;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkResult r = vkCreateBuffer(device_, &bci, nullptr, &buffer);
     if (r != VK_SUCCESS) return r;
@@ -415,12 +445,16 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     const bool wantAddress = usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
     dedicated.buffer = buffer;
+    VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    if (exportable) dedicated.pNext = &exportInfo;
     VkMemoryAllocateFlagsInfo flagsInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
     flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     flagsInfo.pNext = &dedicated;
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkMemoryPropertyFlags chosen = 0;
+    int32_t chosenType = -1;
     r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     // Try each preference in order; a heap can be full even if the type exists (e.g. small BAR).
     for (VkMemoryPropertyFlags pref : preferences) {
@@ -433,6 +467,7 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
         r = vkAllocateMemory(device_, &mai, nullptr, &memory);
         if (r == VK_SUCCESS) {
             chosen = info_.memProps.memoryTypes[type].propertyFlags;
+            chosenType = type;
             break;
         }
     }
@@ -451,6 +486,10 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     out.buffer = buffer;
     out.memory = memory;
     out.size = size;
+    out.exportable = exportable;
+    out.bufferSize = size;
+    out.memorySize = req.size;
+    out.memoryType = uint32_t(chosenType);
     constexpr VkMemoryPropertyFlags kMappable = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     if ((chosen & kMappable) == kMappable) {
         if (vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &out.mapped) != VK_SUCCESS) out.mapped = nullptr;
@@ -476,7 +515,7 @@ VkResult Device::allocateDedicated(VkDeviceSize size, Buffer& out) {
                             {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0},
-                            out);
+                            out, true);
     };
     reapDeferredFrees();
     VkResult r = attempt();
@@ -502,8 +541,95 @@ void Device::destroyBuffer(Buffer& buf) {
         vkUnmapMemory(device_, buf.memory);
     }
     if (buf.buffer) vkDestroyBuffer(device_, buf.buffer, nullptr);
-    if (buf.memory) vkFreeMemory(device_, buf.memory, nullptr);
+    if (buf.memory) {
+        if (buf.exportable) {
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
+            if (auto it = exportIds_.find(buf.memory); it != exportIds_.end()) {
+                exported_.erase(it->second);
+                exportIds_.erase(it);
+            }
+        }
+        vkFreeMemory(device_, buf.memory, nullptr);
+    }
     buf = Buffer{};
+}
+
+VkResult Device::exportId(const Buffer& buf, uint64_t& id) {
+    if (!buf.exportable || !buf.memory) return VK_ERROR_FEATURE_NOT_PRESENT;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto [it, added] = exportIds_.try_emplace(buf.memory, nextExportId_);
+    if (added) exported_[nextExportId_++] = buf.memory;
+    id = it->second;
+    return VK_SUCCESS;
+}
+
+VkResult Device::exportMemory(uint64_t id, int& fd) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    auto it = exported_.find(id);
+    if (it == exported_.end()) return VK_ERROR_INVALID_EXTERNAL_HANDLE;  // freed meanwhile
+    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+    gi.memory = it->second;
+    gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    return getMemoryFd_(device_, &gi, &fd);
+}
+
+VkResult Device::importMemory(int fd, VkDeviceSize bufferSize, VkDeviceSize memorySize, uint32_t memoryType,
+                              Buffer& out) {
+    out = Buffer{};
+    if (!features_.memoryExport) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (memoryType >= info_.memProps.memoryTypeCount) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    // the exporter's buffer and memory again (a dedicated allocation of a buffer like its own)
+    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.pNext = &external;
+    bci.size = bufferSize;
+    bci.usage = kDeviceBufferUsage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &buffer)) return r;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, buffer, &req);
+    if (!(req.memoryTypeBits & (1u << memoryType)) || req.size != memorySize) {
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    }
+    VkImportMemoryFdInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+    import.fd = fd;  // owned by the memory once imported
+    VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated.pNext = &import;
+    dedicated.buffer = buffer;
+    VkMemoryAllocateFlagsInfo flagsInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    flagsInfo.pNext = &dedicated;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.pNext = &flagsInfo;
+    mai.allocationSize = memorySize;
+    mai.memoryTypeIndex = memoryType;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    if (VkResult r = vkAllocateMemory(device_, &mai, nullptr, &memory)) {
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return r;
+    }
+    if (VkResult r = vkBindBufferMemory(device_, buffer, memory, 0)) {
+        vkFreeMemory(device_, memory, nullptr);
+        vkDestroyBuffer(device_, buffer, nullptr);
+        return r;
+    }
+    out.buffer = buffer;
+    out.memory = memory;
+    out.size = bufferSize;
+    const VkMemoryPropertyFlags flags = info_.memProps.memoryTypes[memoryType].propertyFlags;
+    constexpr VkMemoryPropertyFlags kMappable = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if ((flags & kMappable) == kMappable) {
+        if (vkMapMemory(device_, memory, 0, VK_WHOLE_SIZE, 0, &out.mapped) != VK_SUCCESS) out.mapped = nullptr;
+        out.hostCached = (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buffer;
+    out.address = vkGetBufferDeviceAddress(device_, &bai) & kAddressMask;
+    return VK_SUCCESS;
 }
 
 void Device::freeBuffer(Buffer& buf) {

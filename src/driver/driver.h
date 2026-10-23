@@ -175,6 +175,13 @@ struct DeviceSlot {
     CUmemPoolHandle_st* currentPool = &defaultPool;
     std::map<CUdeviceptr, VmReservation> reservations;  // keyed by base address
     std::map<CUdeviceptr, VmMapping> mappings;          // keyed by mapped address
+    // Device memory of other processes (cuIpcOpenMemHandle), by (exporter pid, memory id): the base
+    // of the imported buffer (in `allocations`) and the number of opens.
+    struct IpcImport {
+        CUdeviceptr base = 0;
+        int refs = 0;
+    };
+    std::map<std::pair<int32_t, uint64_t>, IpcImport> ipcImports;
     vk::Buffer printfBuffer;  // device printf records of the current launch
     vk::Buffer gridWorkspace;  // cooperative launches' {size, barrier} (cooperative groups' grid.sync())
 };
