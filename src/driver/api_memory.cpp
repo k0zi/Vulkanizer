@@ -206,7 +206,8 @@ CUresult CUDAAPI cuMemGetAddressRange_v2(CUdeviceptr* pbase, size_t* psize, CUde
 static CUresult memcpyEntry(CUdeviceptr dst, CUdeviceptr src, size_t bytes, bool sync, bool dstDevice, bool srcDevice) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
-    return copyUnified(s, dst, src, bytes, sync, dstDevice, srcDevice);
+    if (CUresult r = copyUnified(s, dst, src, bytes, sync, dstDevice, srcDevice)) return r;
+    return sync ? checkDeviceAssert(*s.slot, false) : CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) {

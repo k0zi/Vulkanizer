@@ -54,6 +54,9 @@ if [[ "${VULKANIZER_TORCH_DEFAULTS:-1}" != 0 ]]; then
   export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$ROOT/tools/triton/ptxas}"
   export TRITON_PTXAS_BLACKWELL_PATH="${TRITON_PTXAS_BLACKWELL_PATH:-$ROOT/tools/triton/ptxas}"
   export C_INCLUDE_PATH="$ROOT/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+  # fused attention kernels (sitecustomize.py, VULKANIZER_TORCH_SDPA=mem_efficient,flash): PyTorch has
+  # them only for sm_80 and later, so that is the compute capability reported then
+  if [[ -n "${VULKANIZER_TORCH_SDPA:-}" ]]; then export VULKANIZER_CC="${VULKANIZER_CC:-80}"; fi
 fi
 export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export TRITON_LIBCUDA_PATH="$LIB"  # Triton links its launcher against this libcuda

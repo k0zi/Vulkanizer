@@ -73,6 +73,7 @@ Vulkanizer は本物の NVIDIA ライブラリの代わりになります。動�
 LD_LIBRARY_PATH=$PWD/build/lib ./my_cuda_app args... # 同じことを手動で
 ./run.sh --log info ./my_cuda_app                    # どの GPU で動いているかを表示
 ./run.sh --device llvmpipe ./my_cuda_app             # 特定のデバイス（CPU デバイスには VULKANIZER_ALLOW_CPU=1 が必要）
+./run.sh --check ./my_cuda_app                       # 実行できるか（PTX、共有 CUDA ランタイム。ディレクトリや Python 環境も可）
 ```
 
 プログラムは次の 2 つの条件を満たす必要があります：
@@ -275,8 +276,7 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
   ページを毎回再検証するため、256 MB あたり約 4 ms）。ピン留めメモリとマネージドメモリは影響を受けません。
 - llama.cpp の flash attention は正しく動作します（`tools/build_llama.sh --fa`）が、tensor core がない環境では
   プロンプト処理が遅くなるため、既定では無効です。
-- PyTorch：cuDNN と融合 attention のカーネルはありません。デバイス側の `assert` が失敗してもそのスレッドが
-  止まるだけです（`cudaErrorAssert` はありません）。
+- PyTorch：cuDNN と融合 attention のカーネルはありません。
 - cuSOLVER：実数型（f32、f64）のみで、`gesvda`、LDL^T（`sytrf`）、非対称固有値問題（`geev`）はありません。`eigh` と
   SVD は Jacobi 反復を使うため、大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランは
   ありません。長さが 2048（f64：1024）を超える変換は基数ごとにメモリを 1 回走査します。cuSPARSE：ブロック疎行列（BSR）

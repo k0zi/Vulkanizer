@@ -75,6 +75,7 @@ A Vulkanizer a valódi NVIDIA-könyvtárak helyére lép; a dinamikus linkernek 
 LD_LIBRARY_PATH=$PWD/build/lib ./my_cuda_app args... # ugyanez kézzel
 ./run.sh --log info ./my_cuda_app                    # kiírja, melyik GPU-n fut
 ./run.sh --device llvmpipe ./my_cuda_app             # adott eszközön (CPU-s eszközhöz VULKANIZER_ALLOW_CPU=1 kell)
+./run.sh --check ./my_cuda_app                       # futhat-e? (PTX, megosztott CUDA runtime; könyvtár vagy Python env is lehet)
 ```
 
 A programnak két feltételt kell teljesítenie:
@@ -277,8 +278,7 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   importált lapokat, ~4 ms / 256 MB); a pinned és a managed memóriát ez nem érinti.
 - A llama.cpp flash attention helyesen fut (`tools/build_llama.sh --fa`), de tensor core-ok nélkül vele lassabb a
   prompt feldolgozása, ezért alapból ki van kapcsolva.
-- PyTorch: nincsenek cuDNN- és fúzionált attention kernelek; egy eszközoldali `assert` hibája csak a szálat
-  állítja meg (nincs `cudaErrorAssert`).
+- PyTorch: nincsenek cuDNN- és fúzionált attention kernelek.
 - cuSOLVER: csak valós típusok (f32, f64), nincs `gesvda`, LDL^T (`sytrf`) és nem szimmetrikus sajátérték-feladat
   (`geev`); az `eigh` és az SVD Jacobi-iterációt használ, ami nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek
   callbackek és több GPU-s tervek; a 2048-nál (f64: 1024) hosszabb transzformációk radixonként egyszer bejárják a

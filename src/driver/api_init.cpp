@@ -89,6 +89,7 @@ static const ErrorInfo kErrors[] = {
     {CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED, "CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED",
      "pointer does not correspond to a registered memory region"},
     {CUDA_ERROR_LAUNCH_FAILED, "CUDA_ERROR_LAUNCH_FAILED", "unspecified launch failure"},
+    {CUDA_ERROR_ASSERT, "CUDA_ERROR_ASSERT", "device-side assert triggered"},
     {CUDA_ERROR_PEER_ACCESS_UNSUPPORTED, "CUDA_ERROR_PEER_ACCESS_UNSUPPORTED", "peer access is not supported between these two devices"},
     {CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE, "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE",
      "too many blocks in cooperative launch"},
@@ -201,11 +202,17 @@ CUresult CUDAAPI cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVer
     return CUDA_SUCCESS;
 }
 
-// Private interfaces the CUDA runtime requests by UUID. None are provided yet; the request is
-// logged so the needed tables can be identified (plan.md, phase 2.1).
+// Private interfaces the CUDA runtime requests by UUID: only with VULKANIZER_EXPORT_TABLES
+// (export_tables.cpp, experimental); otherwise the request is logged (plan.md, phase 2.1 and 6.5).
 CUresult CUDAAPI cuGetExportTable(const void** ppExportTable, const CUuuid* pExportTableId) {
     VULKANIZER_TRACE_API();
     if (!ppExportTable || !pExportTableId) return CUDA_ERROR_INVALID_VALUE;
+#ifdef VULKANIZER_EXPORT_TABLES
+    if (const void* table = vulkanizer::driver::exportTable(*pExportTableId)) {
+        *ppExportTable = table;
+        return CUDA_SUCCESS;
+    }
+#endif
     char hex[33];
     for (int i = 0; i < 16; ++i)
         std::snprintf(hex + 2 * i, 3, "%02x", static_cast<unsigned char>(pExportTableId->bytes[i]));

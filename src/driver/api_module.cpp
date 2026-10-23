@@ -72,6 +72,20 @@ compiler::Target targetFor(const DeviceSlot& slot);
 
 constexpr uint32_t kPrintfBufferBytes = 1 << 20;
 
+// A string in device memory: a module's constant strings (from its initial image), or any allocation.
+std::string readDeviceString(DeviceSlot& slot, const CUmod_st* mod, uint64_t addr) {
+    if (mod && addr >= mod->globals && addr < mod->globals + mod->globalsImage.size()) {
+        const char* p = reinterpret_cast<const char*>(mod->globalsImage.data()) + (addr - mod->globals);
+        return std::string(p, strnlen(p, mod->globalsImage.size() - (addr - mod->globals)));
+    }
+    AllocRef ref;
+    if (!addr || !findAllocation(slot, addr, 1, ref)) return "<unknown string>";
+    char tmp[256] = {};
+    const size_t n = std::min<size_t>(sizeof tmp - 1, ref.buffer->size - ref.offset);
+    slot.vk->read(*ref.buffer, ref.offset, tmp, n);
+    return tmp;
+}
+
 // Prints the records the kernel left in the printf buffer (see compiler/ptx_to_spirv.cpp).
 void flushDevicePrintf(DeviceSlot& slot, const CUmod_st& mod) {
     uint32_t header[2];
@@ -82,18 +96,7 @@ void flushDevicePrintf(DeviceSlot& slot, const CUmod_st& mod) {
     if (!used) return;
     std::vector<uint8_t> records(used);
     if (slot.vk->read(slot.printfBuffer, 16, records.data(), used) != VK_SUCCESS) return;
-    auto readString = [&](uint64_t addr) -> std::string {
-        if (addr >= mod.globals && addr < mod.globals + mod.globalsImage.size()) {
-            const char* p = reinterpret_cast<const char*>(mod.globalsImage.data()) + (addr - mod.globals);
-            return std::string(p, strnlen(p, mod.globalsImage.size() - (addr - mod.globals)));
-        }
-        AllocRef ref;
-        if (!findAllocation(slot, addr, 1, ref)) return "<unknown string>";
-        char tmp[256] = {};
-        const size_t n = std::min<size_t>(sizeof tmp - 1, ref.buffer->size - ref.offset);
-        slot.vk->read(*ref.buffer, ref.offset, tmp, n);
-        return tmp;
-    };
+    auto readString = [&](uint64_t addr) { return readDeviceString(slot, &mod, addr); };
     std::string text;
     for (uint32_t at = 0; at + recordBytes <= used; at += recordBytes) {
         uint64_t format;
@@ -308,6 +311,7 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
     const unsigned gridDimX = grid[0], gridDimY = grid[1], gridDimZ = grid[2];
     const unsigned blockDimX = block[0], blockDimY = block[1], blockDimZ = block[2];
 
+    if (s.slot->stickyError) return s.slot->stickyError;
     if (!f->compileAttempted) compileFunction(*f, *s.slot);
     if (!f->compiled) {
         VULKANIZER_ERROR("cannot launch '%s': %s", e.name.c_str(), f->compileError.c_str());
@@ -350,6 +354,22 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
         const uint32_t header[4] = {0, kPrintfBufferBytes, 0, 0};
         if (VkResult vr = s.dev->write(s.slot->printfBuffer, 0, header, sizeof header)) return toCuResult(vr);
         std::memcpy(push.data() + f->binary.printfOffset, &s.slot->printfBuffer.address, sizeof(VkDeviceAddress));
+    }
+
+    if (f->binary.assertOffset != compiler::KernelBinary::kNone) {
+        if (!s.slot->assertRecord.buffer) {
+            // Host memory if possible: the record is read at every synchronization, without a GPU copy.
+            vk::Buffer& rec = s.slot->assertRecord;
+            if (s.dev->allocateHostMemory(compiler::KernelBinary::kAssertRecordBytes, rec) != VK_SUCCESS) {
+                rec = {};
+                if (VkResult vr = s.dev->allocateBuffer(compiler::KernelBinary::kAssertRecordBytes, rec))
+                    return toCuResult(vr);
+            }
+            const uint8_t zero[compiler::KernelBinary::kAssertRecordBytes] = {};
+            if (VkResult vr = s.dev->write(rec, 0, zero, sizeof zero)) return toCuResult(vr);
+        }
+        std::memcpy(push.data() + f->binary.assertOffset, &s.slot->assertRecord.address, sizeof(VkDeviceAddress));
+        s.slot->assertArmed = true;
     }
 
     // The grid workspace of cooperative groups (0 for other launches, as with CUDA: grid_group's
@@ -400,6 +420,40 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
                                         buffered ? params.data() : nullptr, buffered ? params.size() : 0, cooperative);
     if (vr == VK_SUCCESS && printf) flushDevicePrintf(*s.slot, *f->module);  // read() waits for the kernel
     return toCuResult(vr);
+}
+
+CUresult checkDeviceAssert(DeviceSlot& slot, bool waited) {
+    if (slot.stickyError) return slot.stickyError;
+    if (!slot.assertArmed) return CUDA_SUCCESS;
+    const vk::Buffer& buf = slot.assertRecord;
+    uint8_t rec[compiler::KernelBinary::kAssertRecordBytes];
+    if (buf.mapped) std::memcpy(rec, buf.mapped, sizeof rec);
+    else if (!waited || slot.vk->read(buf, 0, rec, sizeof rec) != VK_SUCCESS) return CUDA_SUCCESS;
+    uint32_t complete, line, block[3], thread[3];
+    uint64_t message, file, function;
+    std::memcpy(&complete, rec + 60, 4);
+    if (!complete) return CUDA_SUCCESS;
+    std::memcpy(&line, rec + 4, 4);
+    std::memcpy(&message, rec + 8, 8);
+    std::memcpy(&file, rec + 16, 8);
+    std::memcpy(&function, rec + 24, 8);
+    std::memcpy(block, rec + 32, 12);
+    std::memcpy(thread, rec + 44, 12);
+    // CUDA's own wording, which programs and people search for.
+    std::fprintf(stderr, "%s:%u: %s: block: [%u,%u,%u], thread: [%u,%u,%u] Assertion `%s` failed.\n",
+                 readDeviceString(slot, nullptr, file).c_str(), line, readDeviceString(slot, nullptr, function).c_str(),
+                 block[0], block[1], block[2], thread[0], thread[1], thread[2],
+                 readDeviceString(slot, nullptr, message).c_str());
+    std::fflush(stderr);
+    slot.stickyError = CUDA_ERROR_ASSERT;
+    return slot.stickyError;
+}
+
+void resetDeviceAssert(DeviceSlot& slot) {
+    slot.stickyError = CUDA_SUCCESS;
+    if (!slot.assertRecord.buffer) return;
+    const uint8_t zero[compiler::KernelBinary::kAssertRecordBytes] = {};
+    slot.vk->write(slot.assertRecord, 0, zero, sizeof zero);
 }
 }  // namespace vulkanizer::driver
 

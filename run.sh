@@ -11,15 +11,18 @@
 #   --validation    enable the Vulkan validation layer (VULKANIZER_VALIDATION=1)
 #   --gdb           run under gdb
 #   --no-build      skip the build step
+#   --check         check the given files or directories for PTX and a shared CUDA runtime instead of
+#                   running them (vulkanizer-check)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${VULKANIZER_BUILD_DIR:-$ROOT/build}"
 
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
 
 BUILD=1
 GDB=0
+CHECK=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --device) export VULKANIZER_DEVICE="$2"; shift ;;
@@ -27,6 +30,7 @@ while [[ $# -gt 0 ]]; do
     --validation) export VULKANIZER_VALIDATION=1 ;;
     --gdb) GDB=1 ;;
     --no-build) BUILD=0 ;;
+    --check) CHECK=1 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) echo "unknown option: $1" >&2; usage; exit 1 ;;
@@ -42,6 +46,10 @@ fi
 
 if [[ $BUILD -eq 1 ]]; then
   "$ROOT/build.sh" >/dev/null
+fi
+
+if [[ $CHECK -eq 1 ]]; then
+  exec "$BUILD_DIR/bin/vulkanizer-check" "$@"
 fi
 
 PROGRAM="$1"

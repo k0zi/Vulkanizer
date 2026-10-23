@@ -1,8 +1,10 @@
 // Warp-level matrix instructions (mma.sync, ldmatrix) as Triton emits them for tl.dot, against
-// the fragment layouts of the PTX ISA computed on the host; warp reductions (redux.sync).
+// the fragment layouts of the PTX ISA computed on the host; warp reductions (redux.sync). The sm_80
+// instructions of PyTorch's attention kernels: tf32 mma, cp.async, packed f16x2/bf16x2 cvt.
 
 #include "test_util.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -37,6 +39,89 @@ const char* kPtx = R"(
     ld.global.v4.f32 {%c0, %c1, %c2, %c3}, [%rd8];
     mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};
     st.global.v4.f32 [%rd9], {%d0, %d1, %d2, %d3};
+    ret;
+}
+
+.visible .entry mma_tf32(.param .u64 pa, .param .u64 pb, .param .u64 pc, .param .u64 pd)
+{
+    .reg .b32 %a<4>, %b<2>, %t;
+    .reg .f32 %c<4>, %d<4>;
+    .reg .b64 %rd<12>;
+    mov.u32 %t, %tid.x;
+    ld.param.u64 %rd0, [pa];
+    ld.param.u64 %rd1, [pb];
+    ld.param.u64 %rd2, [pc];
+    ld.param.u64 %rd3, [pd];
+    mul.wide.u32 %rd4, %t, 16;
+    mul.wide.u32 %rd5, %t, 8;
+    add.u64 %rd6, %rd0, %rd4;
+    add.u64 %rd7, %rd1, %rd5;
+    add.u64 %rd8, %rd2, %rd4;
+    add.u64 %rd9, %rd3, %rd4;
+    ld.global.v4.b32 {%a0, %a1, %a2, %a3}, [%rd6];
+    ld.global.v2.b32 {%b0, %b1}, [%rd7];
+    ld.global.v4.f32 {%c0, %c1, %c2, %c3}, [%rd8];
+    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%c0, %c1, %c2, %c3};
+    st.global.v4.f32 [%rd9], {%d0, %d1, %d2, %d3};
+    ret;
+}
+
+// Lane t copies 16 bytes with src-size min(t, 16), and 8 bytes that odd lanes ignore (ignore-src);
+// out[32 t ..] = the 16 bytes, out[32 t + 16 ..] = the 8.
+.visible .entry cp_async(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %t, %s, %sa, %sb, %w<6>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p;
+    .shared .align 16 .b8 buf[768];
+    mov.u32 %t, %tid.x;
+    ld.param.u64 %rd0, [pin];
+    ld.param.u64 %rd1, [pout];
+    cvta.to.global.u64 %rd0, %rd0;
+    mul.wide.u32 %rd2, %t, 16;
+    add.u64 %rd3, %rd0, %rd2;
+    mov.u32 %sa, buf;
+    mad.lo.u32 %sa, %t, 16, %sa;
+    min.u32 %s, %t, 16;
+    cp.async.cg.shared.global.L2::128B [%sa], [%rd3], 16, %s;
+    and.b32 %w0, %t, 1;
+    setp.ne.u32 %p, %w0, 0;
+    mov.u32 %sb, buf;
+    add.u32 %sb, %sb, 512;
+    mad.lo.u32 %sb, %t, 8, %sb;
+    mul.wide.u32 %rd4, %t, 8;
+    add.u64 %rd4, %rd0, %rd4;
+    cp.async.ca.shared.global [%sb], [%rd4], 8, %p;
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+    bar.sync 0;
+    ld.shared.v4.b32 {%w0, %w1, %w2, %w3}, [%sa];
+    ld.shared.v2.b32 {%w4, %w5}, [%sb];
+    mul.wide.u32 %rd5, %t, 32;
+    add.u64 %rd6, %rd1, %rd5;
+    st.global.v4.b32 [%rd6], {%w0, %w1, %w2, %w3};
+    st.global.v2.b32 [%rd6+16], {%w4, %w5};
+    ret;
+}
+
+// in: two floats per lane; out: f16x2, bf16x2 and relu bf16x2 of them, then padding
+.visible .entry cvt_packed(.param .u64 pin, .param .u64 pout)
+{
+    .reg .b32 %t, %r<3>;
+    .reg .f32 %a, %b;
+    .reg .b64 %rd<6>;
+    mov.u32 %t, %tid.x;
+    ld.param.u64 %rd0, [pin];
+    ld.param.u64 %rd1, [pout];
+    mul.wide.u32 %rd2, %t, 8;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.v2.f32 {%a, %b}, [%rd3];
+    cvt.rn.f16x2.f32 %r0, %a, %b;
+    cvt.rn.bf16x2.f32 %r1, %a, %b;
+    cvt.rn.relu.bf16x2.f32 %r2, %a, %b;
+    mul.wide.u32 %rd4, %t, 16;
+    add.u64 %rd5, %rd1, %rd4;
+    st.global.v4.b32 [%rd5], {%r0, %r1, %r2, %r2};
     ret;
 }
 
@@ -220,6 +305,105 @@ void testMma(CUmodule mod, int k) {
     for (CUdeviceptr p : {da, db, dc, dd}) CHECK_CU(cuMemFree(p));
 }
 
+// m16n8k8 tf32: lane (g, t) holds A[g][t], A[g+8][t], A[g][t+4], A[g+8][t+4] and B[t][g], B[t+4][g]
+// as f32 bits; the low 13 mantissa bits are ignored, as by the tensor core.
+void testMmaTf32(CUmodule mod) {
+    float A[16][8], B[8][8], C[16][8];
+    for (int r = 0; r < 16; ++r)
+        for (int c = 0; c < 8; ++c) A[r][c] = float((r * 3 + c * 5) % 7 - 3) * 0.5f;
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 8; ++c) B[r][c] = float((r * 2 + c * 7) % 5 - 2);
+    for (int r = 0; r < 16; ++r)
+        for (int c = 0; c < 8; ++c) C[r][c] = float(r - c);
+    auto bitsOf = [](float f, uint32_t noise) {  // low bits the tensor core drops
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        return u | (noise & 0x1FFF);
+    };
+    std::vector<uint32_t> a(32 * 4), b(32 * 2);
+    std::vector<float> c(32 * 4);
+    for (int lane = 0; lane < 32; ++lane) {
+        const int g = lane / 4, t = lane % 4;
+        for (int i = 0; i < 4; ++i) a[lane * 4 + i] = bitsOf(A[g + 8 * (i % 2)][t + 4 * (i / 2)], uint32_t(lane * 37 + i));
+        for (int i = 0; i < 2; ++i) b[lane * 2 + i] = bitsOf(B[t + 4 * i][g], uint32_t(lane * 11 + i));
+        for (int i = 0; i < 4; ++i) c[lane * 4 + i] = C[g + 8 * (i / 2)][2 * t + i % 2];
+    }
+    CUdeviceptr da = upload(a.data(), a.size() * 4), db = upload(b.data(), b.size() * 4),
+                dc = upload(c.data(), c.size() * 4), dd;
+    CHECK_CU(cuMemAlloc(&dd, 32 * 16));
+    CUfunction f;
+    CHECK_CU(cuModuleGetFunction(&f, mod, "mma_tf32"));
+    void* args[] = {&da, &db, &dc, &dd};
+    CHECK_CU(cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr));
+    std::vector<float> out(32 * 4);
+    CHECK_CU(cuMemcpyDtoH(out.data(), dd, out.size() * 4));
+    for (int lane = 0; lane < 32; ++lane) {
+        const int g = lane / 4, t = lane % 4;
+        for (int i = 0; i < 4; ++i) {
+            const int row = g + 8 * (i / 2), col = 2 * t + i % 2;
+            float want = C[row][col];
+            for (int kk = 0; kk < 8; ++kk) want += A[row][kk] * B[kk][col];
+            CHECK_EQ("mma tf32 lane %d d%d", out[lane * 4 + i], want, lane, i);
+        }
+    }
+    for (CUdeviceptr p : {da, db, dc, dd}) CHECK_CU(cuMemFree(p));
+}
+
+void testCpAsync(CUmodule mod) {
+    std::vector<uint8_t> in(512);
+    for (size_t i = 0; i < in.size(); ++i) in[i] = uint8_t(i * 7 + 1);
+    CUdeviceptr din = upload(in.data(), in.size()), dout;
+    CHECK_CU(cuMemAlloc(&dout, 32 * 32));
+    CHECK_CU(cuMemsetD8(dout, 0xEE, 32 * 32));
+    CUfunction f;
+    CHECK_CU(cuModuleGetFunction(&f, mod, "cp_async"));
+    void* args[] = {&din, &dout};
+    CHECK_CU(cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr));
+    std::vector<uint8_t> out(32 * 32);
+    CHECK_CU(cuMemcpyDtoH(out.data(), dout, out.size()));
+    for (int t = 0; t < 32; ++t) {
+        for (int i = 0; i < 16; ++i)  // src-size min(t, 16): the rest is zero-filled
+            CHECK_EQ("cp.async lane %d byte %d", out[t * 32 + i], i < std::min(t, 16) ? in[t * 16 + i] : 0, t, i);
+        for (int i = 0; i < 8; ++i)  // ignore-src on odd lanes
+            CHECK_EQ("cp.async ignore-src lane %d byte %d", out[t * 32 + 16 + i], t % 2 ? 0 : in[t * 8 + i], t, i);
+    }
+    CHECK_CU(cuMemFree(din));
+    CHECK_CU(cuMemFree(dout));
+}
+
+uint16_t toBf16(float f) {  // round to nearest even
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return uint16_t((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+}
+
+void testCvtPacked(CUmodule mod) {
+    std::vector<float> in(64);
+    for (int t = 0; t < 32; ++t) {
+        in[2 * t] = float(t - 16) * 0.375f;         // exact in f16 and bf16, negative for relu
+        in[2 * t + 1] = 1.0f + float(t) / 1024.0f;  // exact in f16, rounded (to even) in bf16
+    }
+    CUdeviceptr din = upload(in.data(), in.size() * 4), dout;
+    CHECK_CU(cuMemAlloc(&dout, 32 * 16));
+    CUfunction f;
+    CHECK_CU(cuModuleGetFunction(&f, mod, "cvt_packed"));
+    void* args[] = {&din, &dout};
+    CHECK_CU(cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, nullptr, args, nullptr));
+    std::vector<uint32_t> out(32 * 4);
+    CHECK_CU(cuMemcpyDtoH(out.data(), dout, out.size() * 4));
+    for (int t = 0; t < 32; ++t) {
+        const float a = in[2 * t], b = in[2 * t + 1];
+        const uint32_t f16 = uint32_t(toHalf(a)) << 16 | toHalf(b);  // a in the upper half
+        const uint32_t bf16 = uint32_t(toBf16(a)) << 16 | toBf16(b);
+        const uint32_t relu = uint32_t(toBf16(a < 0 ? 0.0f : a)) << 16 | toBf16(b);
+        CHECK_EQ("cvt f16x2 lane %d", out[t * 4], f16, t);
+        CHECK_EQ("cvt bf16x2 lane %d", out[t * 4 + 1], bf16, t);
+        CHECK_EQ("cvt relu bf16x2 lane %d", out[t * 4 + 2], relu, t);
+    }
+    CHECK_CU(cuMemFree(din));
+    CHECK_CU(cuMemFree(dout));
+}
+
 void testLdmatrix(CUmodule mod) {
     // matrix m, row r, column c holds m * 1000 + r * 10 + c
     std::vector<uint16_t> in(32 * 8);
@@ -300,6 +484,9 @@ int main() {
     CHECK_CU(cuModuleLoadData(&mod, kPtx));
     testMma(mod, 16);
     testMma(mod, 8);
+    testMmaTf32(mod);
+    testCpAsync(mod);
+    testCvtPacked(mod);
     testLdmatrix(mod);
     testRedux(mod);
     CHECK_CU(cuModuleUnload(mod));

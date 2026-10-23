@@ -75,6 +75,7 @@ Vulkanizer tritt an die Stelle der echten NVIDIA-Bibliotheken; der dynamische Li
 LD_LIBRARY_PATH=$PWD/build/lib ./my_cuda_app args... # dasselbe von Hand
 ./run.sh --log info ./my_cuda_app                    # zeigt, auf welcher GPU es läuft
 ./run.sh --device llvmpipe ./my_cuda_app             # ein bestimmtes Gerät (CPU-Geräte brauchen VULKANIZER_ALLOW_CPU=1)
+./run.sh --check ./my_cuda_app                       # kann es laufen? (PTX, geteilte CUDA-Runtime; auch ein Verzeichnis oder eine Python-Umgebung)
 ```
 
 Das Programm muss zwei Bedingungen erfüllen:
@@ -280,8 +281,7 @@ Vollständige Liste: [plan.md, Abschnitt 4](plan.md).
   prüft die importierten Seiten erneut, ~4 ms pro 256 MB); Pinned- und Managed-Speicher sind nicht betroffen.
 - Flash Attention in llama.cpp läuft korrekt (`tools/build_llama.sh --fa`), aber ohne Tensor Cores ist die
   Prompt-Verarbeitung damit langsamer, daher ist sie standardmäßig aus.
-- PyTorch: keine cuDNN- oder fusionierten Attention-Kernel; ein fehlgeschlagenes `assert` auf dem Gerät hält
-  nur den Thread an (kein `cudaErrorAssert`).
+- PyTorch: keine cuDNN- oder fusionierten Attention-Kernel.
 - cuSOLVER: nur reelle Typen (f32, f64), kein `gesvda`, kein LDL^T (`sytrf`), keine unsymmetrischen Eigenwertprobleme
   (`geev`); `eigh` und SVD nutzen Jacobi-Iterationen, langsam für große Matrizen (n ≳ 1000). cuFFT: keine Callbacks
   und keine Multi-GPU-Pläne; Transformationen länger als 2048 (f64: 1024) brauchen einen Speicherdurchlauf pro Radix.

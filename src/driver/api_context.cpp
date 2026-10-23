@@ -75,6 +75,7 @@ CUresult CUDAAPI cuDevicePrimaryCtxReset_v2(CUdevice dev) {
     if (!s) return CUDA_ERROR_INVALID_DEVICE;
     s->primaryRefs = 0;
     s->primary.flags = 0;
+    if (s->vk) resetDeviceAssert(*s);
     return CUDA_SUCCESS;
 }
 
@@ -195,7 +196,8 @@ CUresult CUDAAPI cuCtxSynchronize(void) {
     VULKANIZER_TRACE_API();
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
-    return toCuResult(s.dev->finish());
+    if (VkResult vr = s.dev->finish()) return toCuResult(vr);
+    return checkDeviceAssert(*s.slot, true);
 }
 
 CUresult CUDAAPI cuCtxSynchronize_v2(CUcontext ctx) {

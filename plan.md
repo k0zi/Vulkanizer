@@ -58,6 +58,8 @@ Hátra, javasolt sorrendben:
 1. **5.1** cuDNN shim – halasztva (indoklás az 5.1-nél).
 2. **5.5** Jogi átnézés publikálás előtt (a csomagolás kész; a Sobol-adatok licencszövegét is ellenőrizni az eredetivel).
 3. Nyitott részfeladat: külön copy queue (5.4) – integrált GPU-n és GPU-korlátos tg mellett kevés haszonnal.
+4. **6. fázis**: a korlátok feloldása (PyTorch/ComfyUI → bináris kompatibilitás → teljesítmény → teljesség); a nem
+   clean-room feladatok külön, eltéve: [plan_non_clean.md](plan_non_clean.md).
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -317,7 +319,7 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     lusta PTX-törzs tokenizálás (15 MB modul: 300 → 22 ms).
   - Eredmény: MLP tanítás (Adam, 50 lépés) a CPU-val 6e-8 loss / 5e-7 súly eltéréssel; conv2d, softmax,
     LayerNorm, embedding, attention (math), Transformer réteg, f16 matmul, scatter/index_add helyes
-    (`tests/torch/`). cuDNN és a fused attention ki van kapcsolva; `cudaErrorAssert` nincs modellezve.
+    (`tests/torch/`). cuDNN és a fused attention ki van kapcsolva; a `cudaErrorAssert` a 6.2 óta modellezve van.
 - [x] **4.6** llama.cpp teljesítmény: flash attention, CUDA graphs (vagy egyenértékű batch-elés), gyorsabb GEMM/MMQ, összevetés a ggml Vulkan backendjével.
   - Kész: vektorizált f16 TN GEMM kernel packed-f16 szorzással `COMPUTE_16F`-hez (213 → ~900 GFLOPS);
     a 64 bites div/rem gyorsútja `DontFlatten`-nel (a driver különben mindig lefuttatta a 64 bites ciklust,
@@ -702,10 +704,88 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     shared memória + atomics, komplex/while, `cuda.reduce`, device-függvény + libdevice, stream/event – mind helyes.
     Futtatás: `CUDA_HOME=<env> ./run_torch.sh --env <env> script.py` (a `CUDA_HOME` a conda-env libNVVM-jéhez kell).
 
+### Fázis 6 – A korlátok feloldása
+Sorrend (2026-10-23 döntés): előbb a PyTorch/ComfyUI, aztán a bináris kompatibilitás, majd a teljesítmény, végül a
+könyvtárak teljessége. Csak clean-room feladatok: ami csak NVIDIA-binárisok visszafejtésével vagy védelmek
+megkerülésével menne (statikus libcudart, SASS futtatása, NVIDIA-azonos cuRAND-sorozatok nem dokumentált
+algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
+
+**A. PyTorch / ComfyUI**
+- [x] **6.1** Diagnosztika: `vulkanizer-run --check <bináris|env>` – van-e PTX (és milyen `compute_XX`), statikus-e a
+  libcudart, van-e NVIDIA cuDNN/NCCL a load pathon; futáskor a PTX nélküli fatbin hibájában a kernel neve és a SASS-célok.
+  Kész, ha: egy static és egy SASS-only nvcc-binárisra, valamint a conda-forge torch env-re helyes a verdikt.
+  - Kész (2026-10-23): `tools/vulkanizer_check.cpp` (`vulkanizer-check`, `run.sh --check`, `vulkanizer-run --check`).
+    Az ELF `.nv_fatbin` / `__nv_relfatbin` szekcióinak fatbinjeit nézi (`fatbin::parse`), a `DT_NEEDED`/`DT_SONAME`-et,
+    és statikus runtime-nak veszi, ha a fájlban benne vannak a runtime hibanevei (`cudaErrorInvalidDeviceFunction`),
+    de nem függ a `libcudart.so`-tól. Verdiktek: `ok`, `partial`, `sass`, `static`, `replaced` (az NVIDIA saját
+    cuBLAS/cuFFT/... példánya, amit a Vulkanizeré helyettesít), `nvidia` (cuDNN). Egy könyvtárat rekurzívan bejár
+    (a torch env ~4 s).
+  - A PTX nélküli fatbin hibája felsorolja a natív architektúrákat (`fatbin::nativeTargets`), a runtime pedig az
+    érintett kerneleket (`tests/fatbin.cpp` a JIT error logot ellenőrzi).
+  - Próba: nvcc `-cudart shared` → `ok`, alapértelmezett (static) → `static`, `sm_80,sm_86` kód → `sass`;
+    `.work/torch-cf`: a `libtorch_cuda` `ok`, az NVIDIA-példányok `replaced`; `static` csak az NVIDIA extrák
+    (cuDSS, cuFile, nvblas, cusolverMg), amik betöltve nem, csak használva buknak el.
+- [x] **6.2** Device-oldali `assert` → `CUDA_ERROR_ASSERT` / `cudaErrorAssert`: eszközönkénti host-visible hibarekord,
+  amit a `__assertfail` atomikusan tölt ki (üzenet, fájl, sor, függvény, block/thread), a driver a szinkronizációs
+  pontokon ellenőrzi, és sticky hibát ad. Nem szinkron indítás (a printffel ellentétben).
+  Kész, ha: PTX-teszt + nvcc-teszt; PyTorch-ban a túlindexelés „device-side assert triggered” hibát dob.
+  - Kész (2026-10-23, a PyTorch-próba a végső körben): a `__assertfail` az `assertfail` pszeudo-utasítás
+    (`ptx/instr.cpp`), a fordító `emitAssert`-je CAS-sal foglalja a rekordot (`KernelBinary::kAssertRecordBytes`,
+    címe az `assertOffset` push constant), kitölti, majd release barrier után a 60-as „kész” szót írja: így a host
+    akkor is csak teljes rekordot lát, ha egy későbbi kernel épp most ír. A rekord host-memória
+    (`allocateHostMemory`, ha nem megy: `allocateBuffer`), a `DeviceSlot::assertRecord`.
+  - `checkDeviceAssert`: `cuCtxSynchronize`, `cuStreamSynchronize/Query`, `cuEventSynchronize/Query`, szinkron
+    memcpy. Az üzenet a CUDA szövege (`file:line: func: block: [..], thread: [..] Assertion `...` failed.`), a hiba
+    sticky (`DeviceSlot::stickyError`, a launch is visszaadja), a `cuDevicePrimaryCtxReset` / `cudaDeviceReset` törli.
+    Kernel cache formátum: VKZ3 (+`assertOffset`).
+  - Tesztek: `tests/device_assert.cpp` (`data/assert.ptx`, két kör a reset előtt/után), `tests/cuda/rt_assert.cu`
+    (CUDA 12 és 13); RADV és llvmpipe.
+- [ ] **6.3** Fused attention: a mem-efficient (majd a flash) SDPA backend a hiányzó PTX-ek (`cp.async`, további
+  `mma`/`ldmatrix` változatok) pótlásával; kapcsoló: `VULKANIZER_TORCH_SDPA`.
+  Kész, ha: `zimage_forward.py` a fused backenddel is tűrésen belül, és a ComfyUI csúcsmemóriája kisebb.
+  - Felderítés (2026-10-23): a conda-forge build fatbinjeiben (`vulkanizer-check --dump-ptx`) a mem-efficient
+    (`fmha_cutlassF/B_*`) és a flash (`pytorch_flash::flash_fwd_*`) kernelek PTX-e megvan (`compute_120`), de az
+    `_sm50/_sm70/_sm75` változatok csak egy „FATAL: kernel is for sm80+” printf; tartalma csak az `_sm80`-asnak van.
+    A PyTorch a jelentett CC szerint választ, ezért kell a CC ≥ 8.0.
+  - Fordító: `cp.async` (ca/cg, 4/8/16 bájt, src-size zero-fill, ignore-src predikátum; szinkron ld + st.shared,
+    a `commit_group`/`wait_group`/`wait_all` no-op), a `.L2::128B` alakú modifier (számmal kezdődő `::` rész),
+    `cvt.rn{.relu}.{f16x2,bf16x2}.f32`, `mma.m16n8k8.row.col.f32.tf32.tf32.f32` (a tf32 alsó 13 bitje eldobva,
+    mint a tensor core-on). Teszt: `tests/warp_matrix.cpp` (RADV, llvmpipe). Az összes (125) attention-modul
+    első sm80/flash entryje lefordul (`vulkanizer-ptxc`).
+  - Kapcsoló: `VULKANIZER_TORCH_SDPA=mem_efficient,flash` (`tools/torch/sitecustomize.py` ezeket nem tiltja;
+    `run_torch.sh` és `vulkanizer-run --torch` ilyenkor `VULKANIZER_CC=80`-at állít, ha nincs megadva).
+  - Hátra (a végső torch-körben): helyesség (`zimage_forward.py`), sebesség és csúcsmemória a math úthoz képest,
+    ez alapján az alapértelmezés. Kockázat: a flash kernelek SPIR-V-je óriási (2,2 M szó: az emulált `mma` miatt),
+    a pipeline-fordítás ideje a driverben ismeretlen.
+- [ ] **6.4** cuDNN shim (`libcudnn.so.9`) – csak ha a mérés szerint a konvolúció a ComfyUI idejének jelentős része és
+  egy implicit-GEMM shader ≥ 1,5×-et hoz. A PyTorch által cuDNN-re küldött minden op kell (conv, batchnorm, RNN, CTC).
+
+**B. Bináris kompatibilitás**
+- [-] **6.5** Statikus libcudart (`cuGetExportTable`): nem clean-room feladat, áthelyezve a
+  [plan_non_clean.md](plan_non_clean.md)-be (2026-10-23). Ami itt marad: `-cudart shared` újrafordítás, amit a
+  `vulkanizer-check` (6.1) javasol.
+
+**C. Teljesítmény**
+- [ ] **6.6** `VK_KHR_cooperative_matrix`: előbb a cuBLAS f16/bf16 GEMM, utána a PTX `mma`/`wmma` (shared
+  scratch-en át), ha gyorsabb a shuffle-emulációnál. A fejlesztőgép (GFX9) nem tudja: más hardver kell.
+- [ ] **6.7** Regisztrált host-memória: privát anonim mappingnél saját host-cached memória `VK_EXT_map_memory_placed`-del
+  ugyanarra a címre (tartalommásolással), így nincs userptr és nincs submitonkénti lassulás.
+- [ ] **6.8** `eigh`/SVD tridiagonalizálással/bidiagonalizálással; cuFFT four-step és Bluestein; GPU-s SpGEMM és rendezés.
+
+**D. Teljesség**
+- [ ] **6.9** Fordító: indirekt hívás (függvény-azonosító + `OpSwitch`), device `malloc`/`free` (heap a
+  `CU_LIMIT_MALLOC_HEAP_SIZE` szerint).
+- [ ] **6.10** Textúrák: mipmap, cube map, texture reference, formázott `sust.p`.
+- [ ] **6.11** cuSOLVER komplex, `geev`, `sytrf`, `gesvda`; cuFFT callbackek (elő/utó-kernel); cuSPARSE BSR és komplex;
+  cuRAND MT19937/MTGP32 a nyilvános algoritmus, paramétertáblák és dokumentált elrendezés szerint (a hivatalos
+  kimenettel csak ellenőrizve), `curand_discrete`. (Az NVIDIA-azonos scrambled Sobol és Poisson: plan_non_clean.md.)
+- [ ] **6.12** Több GPU: peer access dma-buf importtal azonos címen; IPC event exportált timeline semaphore-ral;
+  managed memória migráció (csak dGPU-n, mérés után).
+
 ## 3. Ismert korlátok / kockázatok
 
-- **Statikusan linkelt libcudart** (az nvcc alapértelmezése) nem fut: az NVIDIA runtime a driver nem dokumentált belső tábláit igényli. Megoldás: `-cudart shared` újrafordítás, vagy később a táblák pótlása.
-- **Csak-SASS binárisok** (PTX nélkül) nem futtathatók – nincs reális SASS → SPIR-V út.
+- **Statikusan linkelt libcudart** (az nvcc alapértelmezése) nem fut: az NVIDIA runtime a driver nem dokumentált belső tábláit igényli. Megoldás: `-cudart shared` újrafordítás (a táblák pótlása nem clean-room: plan_non_clean.md).
+- **Csak-SASS binárisok** (PTX nélkül) nem futtathatók – nincs clean-room SASS → SPIR-V út (plan_non_clean.md).
 - **GPU-timeout**: a kernel driver reseteli a GPU-t, ha egy submit túl sokáig fut (amdgpu: 2 s). A batchek mért
   kernelidők alapján legfeljebb `VULKANIZER_BATCH_MS`-nyi munkát kapnak. Ha egyetlen workgroup is tovább fut a
   limitnél, vagy a becslés nagyon alulmér (ugyanaz a pipeline sokkal nagyobb K-val), a reset továbbra is előfordulhat.
@@ -721,7 +801,6 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   (eszközök között `cudaMemcpyPeer` működik, a `cudaMemcpyDefault` két eszköz pointerével nem).
 - **Regisztrált host-memória** (`cuMemHostRegister`): amíg él, minden GPU-submit lassabb (a kernel minden submitnál
   újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát ez nem érinti.
-- **libcudart privát export table-jei** (`cuGetExportTable`) nem dokumentáltak, CUDA verziónként változhatnak → verzió-specifikus kezelés, sok trace-elés.
 - **Jogi**: NVIDIA EULA (CUDA ≥ 11.6) tiltja az SDK kimenetének visszafejtését/átfordítását nem-NVIDIA platformra. Clean-room API implementáció; NVIDIA headert/binárist nem teszünk a repóba. Publikálás előtt jogi átnézés.
 
 ## 4. Konfiguráció (környezeti változók)

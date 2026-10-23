@@ -2,7 +2,7 @@
 #
 #   <prefix>/lib/vulkanizer/          libcuda.so.1, libcudart.so.12, libcublas(Lt).so.12
 #   <prefix>/lib/vulkanizer/cuda13/   libcudart.so.13, libcublas(Lt).so.13
-#   <prefix>/bin/                     vulkanizer-run, vulkanizer-info, vulkanizer-ptxc, vulkanizer-bandwidth
+#   <prefix>/bin/                     vulkanizer-run, vulkanizer-info, vulkanizer-check, vulkanizer-ptxc, vulkanizer-bandwidth
 #   <prefix>/include/vulkanizer/      cuda.h, vulkanizer/vulkanizer_ext.h, cublas/ (-I<prefix>/include/vulkanizer)
 #   <prefix>/share/vulkanizer/        PyTorch and Triton support files for vulkanizer-run --torch
 #
@@ -30,7 +30,7 @@ install(TARGETS vulkanizer_cudart vulkanizer_cublas vulkanizer_cublaslt vulkaniz
   LIBRARY DESTINATION ${VULKANIZER_INSTALL_LIBDIR} NAMELINK_SKIP)
 install(TARGETS vulkanizer_cudart13 vulkanizer_cublas13 vulkanizer_cublaslt13 vulkanizer_cusolver13 vulkanizer_cufft13 vulkanizer_cusparse13 vulkanizer_curand13
   LIBRARY DESTINATION ${VULKANIZER_INSTALL_LIBDIR}/cuda13 NAMELINK_SKIP)
-install(TARGETS vulkanizer-info vulkanizer-ptxc vulkanizer-bandwidth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS vulkanizer-info vulkanizer-check vulkanizer-ptxc vulkanizer-bandwidth RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 configure_file(${PROJECT_SOURCE_DIR}/tools/vulkanizer-run.in ${PROJECT_BINARY_DIR}/vulkanizer-run @ONLY)
 install(PROGRAMS ${PROJECT_BINARY_DIR}/vulkanizer-run DESTINATION ${CMAKE_INSTALL_BINDIR})

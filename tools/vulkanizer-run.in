@@ -4,6 +4,7 @@
 #
 #   vulkanizer-run ./my_cuda_app args...      a CUDA program (CUDA 12 or 13 runtime)
 #   vulkanizer-run --torch python script.py   PyTorch (a pip or conda build bringing NVIDIA's libraries)
+#   vulkanizer-run --check PATH...            whether programs, libraries or a Python environment can run
 #
 # Options (before the program):
 #   --torch          preload Vulkanizer's libraries over the NVIDIA ones a Python environment brings,
@@ -13,6 +14,8 @@
 #   --device NAME    Vulkan device by name substring (VULKANIZER_DEVICE)
 #   --log LEVEL      off|error|warn|info|debug|trace (VULKANIZER_LOG)
 #   --profile        per-kernel GPU and per-call host times at exit (VULKANIZER_PROFILE=1)
+#   --check          check the given files or directories for PTX and a shared CUDA runtime instead of
+#                    running them (vulkanizer-check)
 #
 # The libraries live in their own directory, outside the linker's search path, so an NVIDIA driver
 # on the same system stays in use for everything else.
@@ -23,7 +26,7 @@ LIB="$PREFIX/@VULKANIZER_INSTALL_LIBDIR@"
 SHARE="$PREFIX/@VULKANIZER_INSTALL_DATADIR@"
 INCLUDE="$PREFIX/@VULKANIZER_INSTALL_INCLUDEDIR@"
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; }
 
 TORCH=0
 MAJOR=""
@@ -35,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     --device) export VULKANIZER_DEVICE="$2"; shift ;;
     --log) export VULKANIZER_LOG="$2"; shift ;;
     --profile) export VULKANIZER_PROFILE=1 ;;
+    --check) shift; exec "$PREFIX/bin/vulkanizer-check" "$@" ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) echo "unknown option: $1" >&2; usage; exit 1 ;;
@@ -78,6 +82,9 @@ if [[ $TORCH -eq 1 ]]; then
     export TRITON_PTXAS_PATH="${TRITON_PTXAS_PATH:-$SHARE/triton/ptxas}"
     export TRITON_PTXAS_BLACKWELL_PATH="${TRITON_PTXAS_BLACKWELL_PATH:-$SHARE/triton/ptxas}"
     export C_INCLUDE_PATH="$INCLUDE${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+    # fused attention kernels (sitecustomize.py, VULKANIZER_TORCH_SDPA=mem_efficient,flash): PyTorch has
+    # them only for sm_80 and later, so that is the compute capability reported then
+    if [[ -n "${VULKANIZER_TORCH_SDPA:-}" ]]; then export VULKANIZER_CC="${VULKANIZER_CC:-80}"; fi
   fi
 fi
 exec "$@"

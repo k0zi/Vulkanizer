@@ -163,6 +163,13 @@ int main() {
     // only native code: nothing to translate
     const std::vector<uint64_t> cubins = fatbin({entry(2, 75, cubin), entry(2, 86, cubin)});
     EXPECT_CU(CUDA_ERROR_NO_BINARY_FOR_GPU, cuModuleLoadData(&mod, cubins.data()));
+    {  // the error log names the native architectures
+        char log[512] = {};
+        CUjit_option opts[] = {CU_JIT_ERROR_LOG_BUFFER, CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+        void* values[] = {log, reinterpret_cast<void*>(uintptr_t(sizeof log))};
+        EXPECT_CU(CUDA_ERROR_NO_BINARY_FOR_GPU, cuModuleLoadDataEx(&mod, cubins.data(), 2, opts, values));
+        EXPECT(std::strstr(log, "sm_75, sm_86") != nullptr);
+    }
 
     CHECK_CU(cuCtxDestroy(ctx));
     std::printf("OK\n");

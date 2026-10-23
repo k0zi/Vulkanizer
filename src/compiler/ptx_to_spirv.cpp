@@ -88,6 +88,7 @@ public:
         out.gridOffset = usesGrid_ ? gridOffset_ : KernelBinary::kNone;
         out.paramsInBuffer = paramsInBuffer_;
         out.printfOffset = usesPrintf_ ? printfOffset_ : KernelBinary::kNone;
+        out.assertOffset = usesAssert_ ? assertOffset_ : KernelBinary::kNone;
         out.workspaceOffset = usesWorkspace_ ? workspaceOffset_ : KernelBinary::kNone;
         out.staticSharedBytes = sharedStatic_;
         out.localBytes = localBytes_;
@@ -479,6 +480,7 @@ private:
     void setupPushConstants() {
         for (const ptx::Instruction& ins : fn_.instructions) {
             usesPrintf_ |= ins.opcode == "vprintf";
+            usesAssert_ |= ins.opcode == "assertfail";
             for (const ptx::Operand& o : ins.operands) {
                 usesGrid_ |= o.kind == ptx::OperandKind::Special && o.name == "%nctaid";
                 usesWorkspace_ |= o.kind == ptx::OperandKind::Special && (o.name == "%envreg1" || o.name == "%envreg2");
@@ -497,6 +499,10 @@ private:
             if (usesPrintf_) {
                 printfOffset_ = uint32_t(alignTo(at, 8));
                 at = printfOffset_ + 8;
+            }
+            if (usesAssert_) {
+                assertOffset_ = uint32_t(alignTo(at, 8));
+                at = assertOffset_ + 8;
             }
             if (usesWorkspace_) {
                 workspaceOffset_ = uint32_t(alignTo(at, 8));
@@ -896,6 +902,57 @@ private:
         for (const ptx::Operand* o : dataOperands(ins, ins.operands[1], a.count)) values.push_back(value(ins, *o, a.type));
         withSpace(a.space, address(ins, ins.operands[0], a.space),
                   [&](Space sp, uint32_t at) { storeAt(ins, sp, at, a, values); });
+    }
+
+    // cp.async.{ca,cg}.shared{::cta}.global{.L2::cache_hint}{.L2::NB} [dst], [src], cp-size
+    //     {, src-size | ignore-src}{, cache-policy}
+    // Done right away as a global load and a shared store, so commit_group, wait_group and wait_all
+    // have nothing to wait for. Bytes from src-size on are zero (and not read); ignore-src zeroes all.
+    void emitCpAsync(const ptx::Instruction& ins) {
+        if (ins.has(".commit_group") || ins.has(".wait_group") || ins.has(".wait_all")) return;
+        if (ins.has(".bulk") || ins.has(".mbarrier")) fail(ins, "cp.async.bulk / cp.async.mbarrier are not supported");
+        if (!ins.has(".shared") || !ins.has(".global")) fail(ins, "cp.async must copy from .global to .shared");
+        size_t n = ins.operands.size();
+        if (ins.has(".L2::cache_hint")) --n;  // the cache policy
+        if (n < 3 || ins.operands[2].kind != ptx::OperandKind::Immediate) fail(ins, "malformed cp.async");
+        const uint32_t bytes = uint32_t(ins.operands[2].imm);
+        if (bytes != 4 && bytes != 8 && bytes != 16) fail(ins, "cp.async size must be 4, 8 or 16");
+        const PtxType u32t{Base::Unsigned, 32};
+        uint32_t srcSize = cU32(bytes);
+        if (n >= 4) {
+            const ptx::Operand& o = ins.operands[3];
+            if (o.kind == ptx::OperandKind::Register && reg(ins, o.name).type.base == Base::Pred) {
+                const uint32_t ignore = value(ins, o, {Base::Pred, 1});
+                srcSize = b_.op(spv::OpSelect, tU32(), {ignore, cU32(0), cU32(bytes)});
+            } else {
+                srcSize = glsl(tU32(), GLSLstd450UMin, {value(ins, o, u32t), cU32(bytes)});
+            }
+        }
+        const uint32_t dst = address(ins, ins.operands[0], Space::Shared);
+        const uint32_t src = address(ins, ins.operands[1], Space::Global);
+        Access a32;
+        a32.type = {Base::Bit, 32};
+        a32.isVolatile = ins.has(".cg");  // .cg bypasses L1, as ld.cg does
+        const uint32_t word = b_.localVariable(tU32());
+        for (uint32_t w = 0; w < bytes / 4; ++w) {
+            // bytes of this word below src-size: 0..4
+            const uint32_t valid = glsl(tU32(), GLSLstd450UMin,
+                                        {b_.op(spv::OpISub, tU32(), {glsl(tU32(), GLSLstd450UMax, {srcSize, cU32(4 * w)}),
+                                                                     cU32(4 * w)}),
+                                         cU32(4)});
+            b_.opVoid(spv::OpStore, {word, cU32(0)});
+            selection(b_.op(spv::OpUGreaterThan, tBool(), {valid, cU32(0)}), [&] {
+                uint32_t v = loadAt(ins, Space::Global, b_.op(spv::OpIAdd, tU64(), {src, cU64(4 * w)}), a32)[0];
+                // keep the low `valid` bytes: mask = (1 << 8 * valid) - 1, computed in 64 bits for valid = 4
+                const uint32_t mask = truncTo32(b_.op(
+                    spv::OpISub, tU64(),
+                    {b_.op(spv::OpShiftLeftLogical, tU64(), {cU64(1), b_.op(spv::OpIMul, tU32(), {valid, cU32(8)})}), cU64(1)}));
+                v = b_.op(spv::OpBitwiseAnd, tU32(), {v, mask});
+                b_.opVoid(spv::OpStore, {word, v});
+            }, [] {});
+            storeAt(ins, Space::Shared, b_.op(spv::OpIAdd, tU32(), {dst, cU32(4 * w)}), a32,
+                    {b_.op(spv::OpLoad, tU32(), {word})});
+        }
     }
 
     // Space named by a cvta/isspacep modifier.
@@ -1597,6 +1654,33 @@ private:
         return op(spv::OpBitwiseOr, h, sign);
     }
 
+    // f32 -> f16 or bf16 bits (in a u32), rounded to nearest even; NaN stays a (quiet) NaN.
+    uint32_t toHalfBits(uint32_t f, bool brain) {
+        if (!brain) return floatToHalf(f);
+        const uint32_t u = b_.op(spv::OpBitcast, tU32(), {f});
+        const uint32_t lsb = b_.op(spv::OpBitwiseAnd, tU32(), {b_.op(spv::OpShiftRightLogical, tU32(), {u, cU32(16)}), cU32(1)});
+        const uint32_t rounded = b_.op(spv::OpShiftRightLogical, tU32(),
+                                       {b_.op(spv::OpIAdd, tU32(), {u, b_.op(spv::OpIAdd, tU32(), {cU32(0x7FFF), lsb})}), cU32(16)});
+        return b_.op(spv::OpSelect, tU32(), {b_.op(spv::OpIsNan, tBool(), {f}), cU32(0x7FC0), rounded});
+    }
+
+    // cvt.rn{.relu}.{f16x2,bf16x2}.f32 d, a, b: a converted into the upper half of d, b into the lower.
+    void emitCvtPacked(const ptx::Instruction& ins, bool brain) {
+        expectOperands(ins, 3);
+        if (!ins.has(".rn")) fail(ins, "packed cvt needs .rn");
+        const PtxType f32t{Base::Float, 32};
+        auto half = [&](const ptx::Operand& o) {
+            uint32_t f = value(ins, o, f32t);
+            if (ins.has(".relu"))  // negative -> 0; NaN stays NaN
+                f = b_.op(spv::OpSelect, tFloat(32),
+                          {b_.op(spv::OpFOrdLessThan, tBool(), {f, b_.constFloat(32, 0)}), b_.constFloat(32, 0), f});
+            return toHalfBits(f, brain);
+        };
+        const uint32_t hi = half(ins.operands[1]), lo = half(ins.operands[2]);
+        storeReg(ins, dstReg(ins).name, {Base::Bit, 32},
+                 b_.op(spv::OpBitwiseOr, tU32(), {b_.op(spv::OpShiftLeftLogical, tU32(), {hi, cU32(16)}), lo}));
+    }
+
     template <class Round>
     void emitCvtHalf(const ptx::Instruction& ins, PtxType to, std::string_view toHalf, PtxType from,
                      std::string_view fromHalf, Round roundInt) {
@@ -1615,18 +1699,7 @@ private:
             else f = b_.op(from.isSigned() ? spv::OpConvertSToF : spv::OpConvertUToF, f32, {v});
         }
         if (!toHalf.empty()) {
-            uint32_t bits;
-            if (toHalf == ".bf16") {
-                // round to nearest even; NaN stays a (quiet) NaN
-                const uint32_t u = b_.op(spv::OpBitcast, tU32(), {f});
-                const uint32_t lsb = b_.op(spv::OpBitwiseAnd, tU32(), {b_.op(spv::OpShiftRightLogical, tU32(), {u, cU32(16)}), cU32(1)});
-                const uint32_t rounded = b_.op(spv::OpShiftRightLogical, tU32(),
-                                               {b_.op(spv::OpIAdd, tU32(), {u, b_.op(spv::OpIAdd, tU32(), {cU32(0x7FFF), lsb})}), cU32(16)});
-                bits = b_.op(spv::OpSelect, tU32(), {b_.op(spv::OpIsNan, tBool(), {f}), cU32(0x7FC0), rounded});
-            } else {
-                bits = floatToHalf(f);
-            }
-            storeReg(ins, dstReg(ins).name, bits16, bits);
+            storeReg(ins, dstReg(ins).name, bits16, toHalfBits(f, toHalf == ".bf16"));
             return;
         }
         uint32_t r;
@@ -1637,6 +1710,7 @@ private:
     }
 
     void emitCvt(const ptx::Instruction& ins) {
+        if (ins.has(".f16x2") || ins.has(".bf16x2")) return emitCvtPacked(ins, ins.has(".bf16x2"));
         expectOperands(ins, 2);
         std::vector<PtxType> types;
         std::string_view rnd;
@@ -2305,6 +2379,45 @@ private:
         }, [] {});
     }
 
+    // assertfail [message], [file], [line], [function]: the first failing thread of the device
+    // claims the assert record (KernelBinary::kAssertRecordBytes) and fills it in.
+    void emitAssert(const ptx::Instruction& ins) {
+        const PtxType u64t{Base::Unsigned, 64}, u32t{Base::Unsigned, 32};
+        auto loadParamVar = [&](const ptx::Operand& o, const PtxType& t) {
+            return loadWords(Space::Local, address(ins, o, Space::Local), t);
+        };
+        const uint32_t message = loadParamVar(ins.operands[0], u64t);
+        const uint32_t file = loadParamVar(ins.operands[1], u64t);
+        const uint32_t line = loadParamVar(ins.operands[2], u32t);
+        const uint32_t function = loadParamVar(ins.operands[3], u64t);
+        const uint32_t rec = canonical(pushU64(assertOffset_));
+        const uint32_t old = b_.op(spv::OpAtomicCompareExchange, tU32(),
+                                   {globalPointer(rec, tU32()), cU32(spv::ScopeDevice), cU32(0), cU32(0), cU32(1), cU32(0)});
+        selection(b_.op(spv::OpIEqual, tBool(), {old, cU32(0)}), [&] {
+            Access a64, a32;
+            a64.type = u64t;
+            a32.type = u32t;
+            auto at = [&](uint32_t offset) { return b_.op(spv::OpIAdd, tU64(), {rec, cU64(offset)}); };
+            storeAt(ins, Space::Global, at(4), a32, {line});
+            storeAt(ins, Space::Global, at(8), a64, {message});
+            storeAt(ins, Space::Global, at(16), a64, {file});
+            storeAt(ins, Space::Global, at(24), a64, {function});
+            for (char c = 'x'; c <= 'z'; ++c) {
+                ptx::Operand ctaid, tid;
+                ctaid.kind = tid.kind = ptx::OperandKind::Special;
+                ctaid.name = "%ctaid";
+                tid.name = "%tid";
+                ctaid.component = tid.component = c;
+                storeAt(ins, Space::Global, at(32 + 4 * uint32_t(c - 'x')), a32, {special(ins, ctaid, u32t)});
+                storeAt(ins, Space::Global, at(44 + 4 * uint32_t(c - 'x')), a32, {special(ins, tid, u32t)});
+            }
+            // complete: the host may look while the kernel still runs (a later event's synchronization)
+            b_.opVoid(spv::OpMemoryBarrier, {cU32(spv::ScopeDevice), cU32(uint32_t(spv::MemorySemanticsReleaseMask) |
+                                                                       uint32_t(spv::MemorySemanticsUniformMemoryMask))});
+            storeAt(ins, Space::Global, at(60), a32, {cU32(1)});
+        }, [] {});
+    }
+
     // ---- warps -------------------------------------------------------------------------------
     //
     // A CUDA warp is always 32 threads. With a subgroup size that is a multiple of 32 a warp is
@@ -2491,6 +2604,9 @@ private:
             if (m == ".f32" || m == ".f16" || m == ".bf16" || m == ".tf32" || m == ".s8" || m == ".u8" || m == ".s32" ||
                 m == ".f64" || m == ".e4m3" || m == ".e5m2")
                 types.push_back(m);
+        if (types.size() == 4 && types[1] == ".tf32" && types[2] == ".tf32" && types[0] == ".f32" && types[3] == ".f32" &&
+            k == 8)
+            return emitMmaTf32(ins);
         if (types.size() != 4 || types[1] != types[2] || (types[1] != ".f16" && types[1] != ".bf16") ||
             (types[0] != ".f32" && types[0] != ".f16") || (types[3] != ".f32" && types[3] != ".f16"))
             fail(ins, "only f16/bf16 inputs with f32/f16 accumulators are supported by mma");
@@ -2549,6 +2665,44 @@ private:
             }
         } else {
             for (uint32_t i = 0; i < 4; ++i) storeReg(ins, dOps[i]->name, f32t, acc[i]);
+        }
+    }
+
+    // mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 d, a, b, c: tf32 elements are f32 registers of
+    // which the tensor core uses the top 19 bits. Lane (groupID g, threadID_in_group t) holds
+    // A[g][t], A[g+8][t], A[g][t+4], A[g+8][t+4] (a0..a3) and B[t][g], B[t+4][g] (b0, b1); C and D as
+    // for the f16 shapes.
+    void emitMmaTf32(const ptx::Instruction& ins) {
+        const PtxType bits{Base::Bit, 32}, f32t{Base::Float, 32};
+        const auto dOps = vectorElems(ins, ins.operands[0], 4);
+        const auto aOps = vectorElems(ins, ins.operands[1], 4);
+        const auto bOps = vectorElems(ins, ins.operands[2], 2);
+        const auto cOps = vectorElems(ins, ins.operands[3], 4);
+        const uint32_t f32 = tFloat(32);
+        auto tf32 = [&](uint32_t word) {
+            return b_.op(spv::OpBitcast, f32, {b_.op(spv::OpBitwiseAnd, tU32(), {word, cU32(0xFFFFE000u)})});
+        };
+        const uint32_t lane = laneId();
+        const uint32_t quad = b_.op(spv::OpBitwiseAnd, tU32(), {lane, cU32(~3u)});  // 4 * groupID
+        const uint32_t t2 = b_.op(spv::OpShiftLeftLogical, tU32(), {b_.op(spv::OpBitwiseAnd, tU32(), {lane, cU32(3)}), cU32(3)});
+        uint32_t a[4], bb[2];
+        for (uint32_t i = 0; i < 4; ++i) a[i] = value(ins, *aOps[i], bits);
+        for (uint32_t i = 0; i < 2; ++i) bb[i] = value(ins, *bOps[i], bits);
+        // aRow[r][k] = A[g + 8r][k], held by lane 4g + k % 4 in a[r + 2 (k / 4)];
+        // bCol[c][k] = B[k][2t + c], held by lane 4 (2t + c) + k % 4 in b[k / 4]
+        uint32_t aRow[2][8], bCol[2][8];
+        for (uint32_t kk = 0; kk < 8; ++kk) {
+            const uint32_t j = kk % 4, half = kk / 4;
+            for (uint32_t r = 0; r < 2; ++r)
+                aRow[r][kk] = tf32(warpShuffle(a[r + 2 * half], b_.op(spv::OpIAdd, tU32(), {quad, cU32(j)})));
+            for (uint32_t c = 0; c < 2; ++c)
+                bCol[c][kk] = tf32(warpShuffle(bb[half], b_.op(spv::OpIAdd, tU32(), {t2, cU32(4 * c + j)})));
+        }
+        for (uint32_t i = 0; i < 4; ++i) {
+            uint32_t acc = value(ins, *cOps[i], f32t);
+            for (uint32_t kk = 0; kk < 8; ++kk)
+                acc = b_.op(spv::OpFAdd, f32, {acc, b_.op(spv::OpFMul, f32, {aRow[i / 2][kk], bCol[i % 2][kk]})});
+            storeReg(ins, dOps[i]->name, f32t, acc);
         }
     }
 
@@ -2716,11 +2870,13 @@ private:
         else if (op == "shfl") emitShfl(ins);
         else if (op == "mma") emitMma(ins);
         else if (op == "ldmatrix") emitLdmatrix(ins);
+        else if (op == "cp" && ins.has(".async")) emitCpAsync(ins);
         else if (op == "vote") emitVote(ins);
         else if (op == "activemask") emitActivemask(ins);
         else if (op == "match") emitMatch(ins);
         else if (op == "redux") emitRedux(ins);
         else if (op == "vprintf") emitPrintf(ins);
+        else if (op == "assertfail") emitAssert(ins);
         else if (op == "bar" || op == "barrier" || op == "membar" || op == "fence") emitBarrier(ins);
         else fail(ins, "unsupported instruction '" + std::string(op) + "'");
     }
@@ -3016,8 +3172,8 @@ private:
     uint32_t pushVar_ = 0, pushBytes_ = 0;
     std::unordered_map<std::string_view, Symbol> symbols_;
     uint32_t sharedStatic_ = 0, localBytes_ = 0, globalsOffset_ = 0, gridOffset_ = 0;
-    bool paramsInBuffer_ = false, usesGrid_ = false, usesPrintf_ = false, usesWorkspace_ = false;
-    uint32_t printfOffset_ = 0;
+    bool paramsInBuffer_ = false, usesGrid_ = false, usesPrintf_ = false, usesAssert_ = false, usesWorkspace_ = false;
+    uint32_t printfOffset_ = 0, assertOffset_ = 0;
     uint32_t workspaceOffset_ = 0;
     uint32_t addressHigh_ = 0;  // specialization constant 5 (canonical())
     bool usesGlobals_ = false, hasShared_ = false;

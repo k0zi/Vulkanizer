@@ -67,6 +67,12 @@ add_library(vulkanizer_cuda SHARED
   driver/printf.cpp
   driver/kernel_cache.cpp
 )
+# cuGetExportTable probes for statically linked CUDA runtimes (plan.md 6.5): shelved, not a clean-room
+# task; built only on request, and at run time only with VULKANIZER_EXPORT_TABLES set.
+if(VULKANIZER_EXPORT_TABLES)
+  target_sources(vulkanizer_cuda PRIVATE driver/export_tables.cpp)
+  target_compile_definitions(vulkanizer_cuda PRIVATE VULKANIZER_EXPORT_TABLES)
+endif()
 target_link_libraries(vulkanizer_cuda PRIVATE vulkanizer_core ${CMAKE_DL_LIBS})
 target_include_directories(vulkanizer_cuda PUBLIC ${PROJECT_SOURCE_DIR}/include)
 set_target_properties(vulkanizer_cuda PROPERTIES

@@ -23,7 +23,7 @@ namespace vulkanizer::driver {
 
 namespace {
 
-constexpr uint32_t kMagic = 0x325A4B56;  // "VKZ2"
+constexpr uint32_t kMagic = 0x335A4B56;  // "VKZ3"
 
 // GNU build-id of the library containing this code: any rebuild invalidates the cache.
 std::string buildId() {
@@ -166,7 +166,7 @@ bool loadCachedKernel(const std::string& key, compiler::KernelBinary& out) {
     const std::string path = dir + "/" + key + ".vkz";
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
-    uint32_t h[11];
+    uint32_t h[12];
     if (!f.read(reinterpret_cast<char*>(h), sizeof h) || h[0] != kMagic) return false;
     compiler::KernelBinary b;
     b.pushConstantSize = h[1];
@@ -180,6 +180,7 @@ bool loadCachedKernel(const std::string& key, compiler::KernelBinary& out) {
     b.entryPoint.resize(h[8]);
     b.spirv.resize(h[9]);
     b.workspaceOffset = h[10];
+    b.assertOffset = h[11];
     if (!f.read(b.entryPoint.data(), std::streamsize(b.entryPoint.size())) ||
         !f.read(reinterpret_cast<char*>(b.spirv.data()), std::streamsize(b.spirv.size() * 4)))
         return false;
@@ -195,9 +196,9 @@ void storeCachedKernel(const std::string& key, const compiler::KernelBinary& b) 
     const std::string tmp = path + ".tmp" + std::to_string(getpid());
     {
         std::ofstream f(tmp, std::ios::binary);
-        const uint32_t h[11] = {kMagic,       b.pushConstantSize,  b.globalsOffset,           b.gridOffset,
+        const uint32_t h[12] = {kMagic,       b.pushConstantSize,  b.globalsOffset,           b.gridOffset,
                                 b.printfOffset, uint32_t(b.paramsInBuffer) | uint32_t(b.packable) << 1, b.staticSharedBytes, b.localBytes,
-                                uint32_t(b.entryPoint.size()), uint32_t(b.spirv.size()), b.workspaceOffset};
+                                uint32_t(b.entryPoint.size()), uint32_t(b.spirv.size()), b.workspaceOffset, b.assertOffset};
         f.write(reinterpret_cast<const char*>(h), sizeof h);
         f.write(b.entryPoint.data(), std::streamsize(b.entryPoint.size()));
         f.write(reinterpret_cast<const char*>(b.spirv.data()), std::streamsize(b.spirv.size() * 4));

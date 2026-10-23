@@ -219,12 +219,18 @@ private:
         while (peek().kind == TokenKind::Directive) {
             std::string_view mod = next().text;
             // Qualified modifiers: ".L1::evict_last", ".shared::cta" (the CTA's own shared memory,
-            // the same as ".shared"), ".shared::cluster".
-            while (isPunct(peek(), ':') && isPunct(peek(1), ':') && peek(2).kind == TokenKind::Identifier) {
+            // the same as ".shared"), ".shared::cluster", ".L2::128B" (lexed as 128 and B).
+            auto adjacent = [&](const Token& t) { return t.text.data() == mod.data() + mod.size(); };
+            while (isPunct(peek(), ':') && isPunct(peek(1), ':') &&
+                   (peek(2).kind == TokenKind::Identifier || peek(2).kind == TokenKind::Integer)) {
                 next();
                 next();
                 const Token& q = next();
                 mod = std::string_view(mod.data(), size_t(q.text.data() + q.text.size() - mod.data()));
+                if (q.kind == TokenKind::Integer && peek().kind == TokenKind::Identifier && adjacent(peek())) {
+                    const Token& unit = next();
+                    mod = std::string_view(mod.data(), size_t(unit.text.data() + unit.text.size() - mod.data()));
+                }
             }
             ins.mods.push_back(mod == ".shared::cta" ? std::string_view(".shared") : mod);
         }
@@ -535,8 +541,20 @@ private:
             return true;
         }
         if (callee == "__assertfail") {
-            // A failed device-side assert(): the thread stops, like trap. (CUDA would also
-            // report cudaErrorAssert and print the message; not modeled yet.)
+            // A failed device-side assert(message, file, line, function, charSize): the pseudo
+            // instruction assertfail [message], [file], [line], [function] records it for the
+            // driver (CUDA_ERROR_ASSERT), then the thread stops like at trap.
+            if (!args || args->elems.size() < 4) return fail(call.line, "malformed __assertfail call");
+            Instruction a;
+            a.opcode = "assertfail";
+            a.line = call.line;
+            for (size_t i = 0; i < 4; ++i) {
+                Operand addr;
+                addr.kind = OperandKind::Address;
+                addr.name = args->elems[i].name;
+                a.operands.push_back(addr);
+            }
+            out.push_back(std::move(a));
             Instruction t;
             t.opcode = "trap";
             t.line = call.line;

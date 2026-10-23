@@ -76,6 +76,7 @@ premier :
 LD_LIBRARY_PATH=$PWD/build/lib ./my_cuda_app args... # la même chose, à la main
 ./run.sh --log info ./my_cuda_app                    # affiche le GPU utilisé
 ./run.sh --device llvmpipe ./my_cuda_app             # un périphérique précis (les CPU demandent VULKANIZER_ALLOW_CPU=1)
+./run.sh --check ./my_cuda_app                       # peut-il tourner ? (PTX, runtime CUDA partagé ; aussi un répertoire ou un env Python)
 ```
 
 Le programme doit remplir deux conditions :
@@ -284,8 +285,7 @@ Liste complète : [plan.md, section 4](plan.md).
   revalide les pages importées, ~4 ms pour 256 Mo) ; la mémoire épinglée et managed n’est pas concernée.
 - La flash attention de llama.cpp fonctionne correctement (`tools/build_llama.sh --fa`), mais sans tensor cores le
   traitement du prompt est plus lent avec elle ; elle est donc désactivée par défaut.
-- PyTorch : pas de kernels cuDNN ni d’attention fusionnée ; un `assert` qui échoue sur le périphérique arrête
-  seulement le thread (pas de `cudaErrorAssert`).
+- PyTorch : pas de kernels cuDNN ni d’attention fusionnée.
 - cuSOLVER : types réels (f32, f64) uniquement, pas de `gesvda`, de LDL^T (`sytrf`) ni de problèmes aux valeurs
   propres non symétriques (`geev`) ; `eigh` et la SVD utilisent des itérations de Jacobi, lentes pour les grandes
   matrices (n ≳ 1000). cuFFT : pas de callbacks ni de plans multi-GPU ; les transformées de plus de 2048 points (f64 :

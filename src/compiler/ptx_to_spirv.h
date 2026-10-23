@@ -40,6 +40,7 @@ struct Target {
 //  - parameter blocks that do not fit: the push constants start with the address of a copy
 //    of the parameter buffer (`paramsInBuffer`)
 //  - device printf: the address of the launch's printf buffer at `printfOffset`
+//  - device-side assert: the address of the device's assert record at `assertOffset`
 //  - cooperative groups: the grid workspace address (%envreg2:%envreg1) at `workspaceOffset`, 0 unless
 //    the launch is cooperative
 //  - global addresses: specialization constant 5 = the device's address bits 63..47 (high word),
@@ -49,6 +50,10 @@ struct Target {
 struct KernelBinary {
     static constexpr uint32_t kNone = ~0u;
     static constexpr uint32_t kPrintfArgBytes = 64;
+    // The assert record the first failing assert() fills in (the driver reports CUDA_ERROR_ASSERT):
+    //   u32 claimed (by the first failing thread), u32 line, u64 message, u64 file, u64 function
+    //   (device addresses of strings), u32 block x/y/z, u32 thread x/y/z, at 60: u32 complete (written last)
+    static constexpr uint32_t kAssertRecordBytes = 64;
     std::vector<uint32_t> spirv;
     std::string entryPoint;
     uint32_t pushConstantSize = 0;  // multiple of 4
@@ -56,6 +61,7 @@ struct KernelBinary {
     uint32_t gridOffset = kNone;
     bool paramsInBuffer = false;
     uint32_t printfOffset = kNone;
+    uint32_t assertOffset = kNone;
     uint32_t workspaceOffset = kNone;
     uint32_t staticSharedBytes = 0;
     uint32_t localBytes = 0;

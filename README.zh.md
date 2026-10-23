@@ -72,6 +72,7 @@ Vulkanizer 取代真正的 NVIDIA 库；只需让动态链接器先找到它们�
 LD_LIBRARY_PATH=$PWD/build/lib ./my_cuda_app args... # 手动做同样的事
 ./run.sh --log info ./my_cuda_app                    # 显示运行在哪个 GPU 上
 ./run.sh --device llvmpipe ./my_cuda_app             # 指定设备（CPU 设备需要 VULKANIZER_ALLOW_CPU=1）
+./run.sh --check ./my_cuda_app                       # 能否运行？（PTX、共享 CUDA 运行时；也可以是目录或 Python 环境）
 ```
 
 程序必须满足两个条件：
@@ -263,7 +264,7 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
   锁页内存和托管内存不受影响。
 - llama.cpp 的 flash attention 可以正确运行（`tools/build_llama.sh --fa`），但在没有 tensor core 的情况下，
   它会让提示词处理变慢，因此默认关闭。
-- PyTorch：没有 cuDNN 和融合 attention 内核；设备端 `assert` 失败只会停止该线程（没有 `cudaErrorAssert`）。
+- PyTorch：没有 cuDNN 和融合 attention 内核。
 - cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；`eigh` 和 SVD
   使用 Jacobi 迭代，对大矩阵（n ≳ 1000）较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换每个基数
   遍历一次内存。cuSPARSE：没有块稀疏（BSR）格式和复数值；SpGEMM 和排序例程在主机上运行。

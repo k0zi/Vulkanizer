@@ -248,6 +248,12 @@ struct DeviceSlot {
     std::map<std::pair<int32_t, uint64_t>, IpcImport> ipcImports;
     std::unordered_map<CUdeviceptr, GraphAllocation> graphAllocations;  // graph memory (GraphMemory), in `allocations`
     vk::Buffer printfBuffer;  // device printf records of the current launch
+    // Device-side assert(): the record the first failing thread fills in (KernelBinary::kAssertRecordBytes),
+    // checked at synchronization once a kernel with an assert ran (checkDeviceAssert). An assert is
+    // sticky like in CUDA: every later launch and synchronization fails until the context is reset.
+    vk::Buffer assertRecord;
+    bool assertArmed = false;
+    CUresult stickyError = CUDA_SUCCESS;
     vk::Buffer gridWorkspace;  // cooperative launches' {size, barrier} (cooperative groups' grid.sync())
 };
 
@@ -359,6 +365,17 @@ CUresult toCuResult(VkResult r);
 CUresult packParams(const ptx::Entry& e, void** kernelParams, void** extra, std::vector<uint8_t>& out);
 CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const unsigned block[3],
                       unsigned sharedMemBytes, const std::vector<uint8_t>& params, bool cooperative = false);
+
+// CUDA_ERROR_ASSERT (printing the assert's message once) when a kernel's assert() failed, else
+// CUDA_SUCCESS. `waited`: the device finished all recorded work, so an unmapped record may be read
+// too (it is read in queue order). Caller holds the driver lock.
+CUresult checkDeviceAssert(DeviceSlot& slot, bool waited);
+// Clears the assert state of a device whose primary context is reset.
+void resetDeviceAssert(DeviceSlot& slot);
+
+// cuGetExportTable's private interfaces (export_tables.cpp, VULKANIZER_EXPORT_TABLES): nullptr when
+// the interface is not provided.
+const void* exportTable(const CUuuid& id);
 
 // Stream capture (api_graph.cpp): `hStream` if it is capturing, else nullptr; captureNode appends
 // a node after the stream's current dependencies (invalidated captures report the error).

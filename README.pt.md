@@ -75,6 +75,7 @@ O Vulkanizer ocupa o lugar das bibliotecas reais da NVIDIA; basta que o linker d
 LD_LIBRARY_PATH=$PWD/build/lib ./my_cuda_app args... # o mesmo, à mão
 ./run.sh --log info ./my_cuda_app                    # mostra em qual GPU roda
 ./run.sh --device llvmpipe ./my_cuda_app             # um dispositivo específico (os de CPU exigem VULKANIZER_ALLOW_CPU=1)
+./run.sh --check ./my_cuda_app                       # pode rodar? (PTX, runtime CUDA compartilhado; também um diretório ou um ambiente Python)
 ```
 
 O programa precisa atender a dois requisitos:
@@ -278,8 +279,7 @@ Lista completa: [plan.md, seção 4](plan.md).
   revalida as páginas importadas, ~4 ms por 256 MB); a memória fixada e a managed não são afetadas.
 - A flash attention do llama.cpp funciona corretamente (`tools/build_llama.sh --fa`), mas sem tensor cores o
   processamento do prompt fica mais lento com ela, por isso vem desativada.
-- PyTorch: sem kernels de cuDNN ou atenção fundida; um `assert` que falha no dispositivo só para a thread
-  (não há `cudaErrorAssert`).
+- PyTorch: sem kernels de cuDNN ou atenção fundida.
 - cuSOLVER: apenas tipos reais (f32, f64), sem `gesvda`, LDL^T (`sytrf`) nem problemas de autovalores não simétricos
   (`geev`); `eigh` e a SVD usam iterações de Jacobi, lentas para matrizes grandes (n ≳ 1000). cuFFT: sem callbacks nem
   planos multi-GPU; transformadas com mais de 2048 pontos (f64: 1024) fazem uma passada pela memória por radix.

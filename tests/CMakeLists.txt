@@ -35,6 +35,9 @@ vulkanizer_cuda_test(library)
 vulkanizer_cuda_test(ptx_module)
 vulkanizer_cuda_test(vector_add)
 vulkanizer_cuda_test(kernels)
+vulkanizer_cuda_test(device_assert)
+set_tests_properties(device_assert PROPERTIES PASS_REGULAR_EXPRESSION
+  "assert.cu:42: void check\\(int \\*, int\\): block: \\[2,0,0\\], thread: \\[5,0,0\\] Assertion `i < n` failed.*OK")
 vulkanizer_cuda_test(fatbin)
 vulkanizer_cuda_test(vmm)
 vulkanizer_cuda_test(warp_matrix)
@@ -73,7 +76,7 @@ add_test(NAME ptx_parse COMMAND ptx_parse)
 function(vulkanizer_nvcc_tests toolkit major suffix libdir)
   find_program(VULKANIZER_NVCC_HOST_CXX NAMES g++-13 g++-12 g++-14 g++ REQUIRED)
   set(nvcc_out ${CMAKE_CURRENT_BINARY_DIR}/cuda${suffix})
-  foreach(name rt_vector_add rt_features rt_kernels rt_printf rt_math_f64 rt_texture rt_graph)
+  foreach(name rt_vector_add rt_features rt_kernels rt_printf rt_assert rt_math_f64 rt_texture rt_graph)
     set(src ${CMAKE_CURRENT_SOURCE_DIR}/cuda/${name}.cu)
     add_custom_command(
       OUTPUT ${nvcc_out}/${name}
@@ -98,6 +101,9 @@ function(vulkanizer_nvcc_tests toolkit major suffix libdir)
 
   set_tests_properties(rt_printf${suffix} PROPERTIES PASS_REGULAR_EXPRESSION
     "hello from the GPU\nint -7, unsigned 4000000000, hex 0xff, char Z\nlong -1234567890123, float 3.142, double 0.0025, padded \\[   42\\]\nstring 'device', percent 100%\nthread 3 of 32\n.*done: no error")
+
+  set_tests_properties(rt_assert${suffix} PROPERTIES PASS_REGULAR_EXPRESSION
+    "rt_assert.cu:[0-9]+: .*check.*: block: \\[2,0,0\\], thread: \\[5,0,0\\] Assertion `i < n` failed.*sticky: device-side assert triggered.*after reset: no error, 3")
 
   # the official headers and Vulkanizer's clash, so each side is its own translation unit
   add_library(cudart_abi_nvidia${suffix} OBJECT cudart_abi/nvidia.cpp)

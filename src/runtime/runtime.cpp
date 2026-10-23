@@ -132,7 +132,11 @@ cudaError_t moduleFor(FatBinary& fb, CUmodule& out) {
     if (!mod) {
         if (CUresult r = cuModuleLoadData(&mod, fb.image)) {
             mod = nullptr;
-            VULKANIZER_ERROR("cannot load device code for device %d (%d)", t_device, int(r));
+            std::string names;  // which kernels are lost, so the binary that lacks PTX can be found
+            for (size_t i = 0; i < fb.kernels.size() && i < 3; ++i) names += (i ? ", " : "") + fb.kernels[i]->name;
+            if (fb.kernels.size() > 3) names += ", ... (" + std::to_string(fb.kernels.size()) + " kernels)";
+            VULKANIZER_ERROR("cannot load device code for device %d (%d)%s%s", t_device, int(r),
+                             names.empty() ? "" : "; kernels: ", names.c_str());
             return r == CUDA_ERROR_NO_BINARY_FOR_GPU ? cudaErrorNoKernelImageForDevice : toCudaError(r);
         }
     }
@@ -246,6 +250,7 @@ const ErrorText kErrors[] = {
     {cudaErrorIllegalAddress, "cudaErrorIllegalAddress", "an illegal memory access was encountered"},
     {cudaErrorLaunchOutOfResources, "cudaErrorLaunchOutOfResources", "too many resources requested for launch"},
     {cudaErrorLaunchFailure, "cudaErrorLaunchFailure", "unspecified launch failure"},
+    {cudaErrorAssert, "cudaErrorAssert", "device-side assert triggered"},
     {cudaErrorCooperativeLaunchTooLarge, "cudaErrorCooperativeLaunchTooLarge", "too many blocks in cooperative launch"},
     {cudaErrorNotPermitted, "cudaErrorNotPermitted", "operation not permitted"},
     {cudaErrorNotSupported, "cudaErrorNotSupported", "operation not supported"},
@@ -595,6 +600,8 @@ cudaError_t CUDARTAPI cudaDeviceReset(void) {
         cuDevicePrimaryCtxRelease(t_device);
         rt.primary[t_device] = nullptr;
     }
+    cuDevicePrimaryCtxReset(t_device);  // clears a sticky error (device-side assert)
+    t_lastError = cudaSuccess;
     return cudaSuccess;
 }
 

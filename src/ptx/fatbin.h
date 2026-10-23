@@ -29,6 +29,9 @@ struct Entry {
 // Accepts a wrapper (0x466243B1) or a fat binary header (0xBA55ED50).
 bool parse(const void* image, std::vector<Entry>& out, std::string& error);
 
+// "sm_75, sm_86": the architectures of the native (cubin) entries, for error messages.
+std::string nativeTargets(const std::vector<Entry>& entries);
+
 // Picks the PTX entry with the highest sm_XX <= `cc` (or the lowest one if all are newer)
 // and returns its text.
 bool extractPtx(const void* image, uint32_t cc, std::string& ptx, uint32_t& smVersion, std::string& error);

@@ -39,7 +39,8 @@ CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
     if (CUresult r = enterContext(s)) return r;
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
     if (CUresult r = refuseIfCapturing(hStream)) return r;
-    return toCuResult(s.dev->finish());
+    if (VkResult vr = s.dev->finish()) return toCuResult(vr);
+    return checkDeviceAssert(*s.slot, true);
 }
 
 CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
@@ -50,7 +51,8 @@ CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
     if (CUresult r = refuseIfCapturing(hStream)) return r;
     const uint64_t serial = s.dev->currentSerial();
     if (VkResult vr = s.dev->flush()) return toCuResult(vr);
-    return s.dev->isComplete(serial) ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY;
+    if (!s.dev->isComplete(serial)) return CUDA_ERROR_NOT_READY;
+    return checkDeviceAssert(*s.slot, false);
 }
 
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int Flags) {
@@ -85,6 +87,12 @@ CUresult CUDAAPI cuEventCreate(CUevent* phEvent, unsigned int Flags) {
 
 static vk::Device* deviceOf(CUevent e) { return Driver::get().slot(e->ctx->device)->vk.get(); }
 
+// A failed device-side assert of the work before a completed event (or of later work, already).
+static CUresult eventAssert(CUevent e) {
+    std::lock_guard<std::recursive_mutex> lock(Driver::get().mutex());
+    return checkDeviceAssert(*Driver::get().slot(e->ctx->device), false);
+}
+
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
     VULKANIZER_TRACE_API();
     if (!validHandle(hEvent) || !validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
@@ -110,7 +118,8 @@ CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
 CUresult CUDAAPI cuEventSynchronize(CUevent hEvent) {
     VULKANIZER_TRACE_API();
     if (!validHandle(hEvent)) return CUDA_ERROR_INVALID_HANDLE;
-    return toCuResult(deviceOf(hEvent)->wait(hEvent->serial));
+    if (VkResult vr = deviceOf(hEvent)->wait(hEvent->serial)) return toCuResult(vr);
+    return eventAssert(hEvent);
 }
 
 CUresult CUDAAPI cuEventQuery(CUevent hEvent) {
@@ -118,7 +127,8 @@ CUresult CUDAAPI cuEventQuery(CUevent hEvent) {
     if (!validHandle(hEvent)) return CUDA_ERROR_INVALID_HANDLE;
     vk::Device* dev = deviceOf(hEvent);
     if (VkResult vr = dev->flush()) return toCuResult(vr);  // otherwise it would never complete
-    return dev->isComplete(hEvent->serial) ? CUDA_SUCCESS : CUDA_ERROR_NOT_READY;
+    if (!dev->isComplete(hEvent->serial)) return CUDA_ERROR_NOT_READY;
+    return eventAssert(hEvent);
 }
 
 CUresult CUDAAPI cuEventElapsedTime(float* pMilliseconds, CUevent hStart, CUevent hEnd) {

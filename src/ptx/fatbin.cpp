@@ -1,5 +1,6 @@
 #include "ptx/fatbin.h"
 
+#include <algorithm>
 #include <cstring>
 #include <dlfcn.h>
 
@@ -129,6 +130,17 @@ static bool zstdDecompress(const uint8_t* src, size_t srcSize, uint8_t* dst, siz
     return true;
 }
 
+std::string nativeTargets(const std::vector<Entry>& entries) {
+    std::vector<uint32_t> sms;
+    for (const Entry& e : entries)
+        if (e.kind == uint16_t(Kind::Elf) && std::find(sms.begin(), sms.end(), e.smVersion) == sms.end())
+            sms.push_back(e.smVersion);
+    std::sort(sms.begin(), sms.end());
+    std::string r;
+    for (uint32_t sm : sms) r += (r.empty() ? "sm_" : ", sm_") + std::to_string(sm);
+    return r.empty() ? "no architecture" : r;
+}
+
 bool extractPtx(const void* image, uint32_t cc, std::string& ptx, uint32_t& smVersion, std::string& error) {
     std::vector<Entry> entries;
     if (!parse(image, entries, error)) return false;
@@ -141,7 +153,8 @@ bool extractPtx(const void* image, uint32_t cc, std::string& ptx, uint32_t& smVe
     }
     if (!best) best = lowest;
     if (!best) {
-        error = "fat binary contains no PTX (only native cubins, which cannot be translated)";
+        error = "fat binary contains no PTX, only native code (SASS) for " + nativeTargets(entries) +
+                ", which cannot be translated; rebuild with a virtual architecture (e.g. nvcc -arch=compute_61)";
         return false;
     }
     smVersion = best->smVersion;
