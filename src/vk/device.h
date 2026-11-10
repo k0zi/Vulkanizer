@@ -3,10 +3,13 @@
 #include "common/device_address.h"
 #include "vk/instance.h"
 
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -182,6 +185,13 @@ public:
     bool isComplete(uint64_t serial);
     bool idle();                          // nothing recorded or running
 
+    // Runs `fn` on a worker thread once the work recorded so far has executed, and returns at once;
+    // the work recorded afterwards waits for `fn` on the device (an empty batch waiting for a
+    // host-signalled timeline semaphore, whose serial completes with `fn`). Host steps run one at a
+    // time, in order. `fn` must not wait for device work recorded after it. Without timeline
+    // semaphores (or with CUDA_LAUNCH_BLOCKING=1) it waits for the work and runs `fn` here.
+    VkResult enqueueHost(std::function<void()> fn);
+
     // GPU timestamps (for CUDA events). Slots come from a fixed pool; -1 if unsupported.
     int32_t allocateTimestamp();
     void freeTimestamp(int32_t slot);
@@ -266,6 +276,22 @@ private:
     bool timing_ = false;     // dispatches are timed (batch budget, profiling)
     bool profiling_ = false;  // VULKANIZER_PROFILE
     bool deviceLost_ = false;  // reported once
+    // Host steps (enqueueHost): every batch signals progress_ = its serial; a host step's batch waits
+    // for hostSteps_ = its value, which the worker signals after running the step.
+    struct HostStep {
+        uint64_t after;  // progress_ value to wait for
+        uint64_t value;  // hostSteps_ value to signal
+        std::function<void()> fn;
+    };
+    VkSemaphore progress_ = VK_NULL_HANDLE, hostSteps_ = VK_NULL_HANDLE;
+    uint64_t hostStepValue_ = 0;
+    uint64_t hostWait_ = 0;  // the open batch waits for hostSteps_ >= this when submitted (0: none)
+    std::mutex hostMutex_;
+    std::condition_variable hostCv_;
+    std::deque<HostStep> hostQueue_;
+    std::thread hostWorker_;
+    bool hostStop_ = false;
+    void runHostSteps();
     bool launchBlocking_ = false;  // CUDA_LAUNCH_BLOCKING=1
     double batchBudgetNs_ = 0;  // 0: no limit
     // GPU time per workgroup of each pipeline: the highest seen, so estimates err on the long side.

@@ -56,10 +56,15 @@ set_tests_properties(cublas_npu PROPERTIES ENVIRONMENT "VULKANIZER_NPU=force;VUL
 add_test(NAME cublas_npu_copy COMMAND cublas)
 set_tests_properties(cublas_npu_copy PROPERTIES ENVIRONMENT
   "VULKANIZER_NPU=force;VULKANIZER_NPU_BACKEND=cpu;VULKANIZER_NPU_ZERO_COPY=0")
-# ... with the 14th NPU run failing: the 4th entry of the first batched GEMM (batch 7), whose rest goes to the GPU
+# ... with the 14th NPU run failing: the 4th entry of the first batched GEMM (batch 7), computed on the host
 add_test(NAME cublas_npu_fail COMMAND cublas)
 set_tests_properties(cublas_npu_fail PROPERTIES ENVIRONMENT
   "VULKANIZER_NPU=force;VULKANIZER_NPU_BACKEND=cpu;VULKANIZER_NPU_CPU_FAIL_AT=14")
+# asynchronous NPU GEMMs (7.4): ordering against events, other streams and graphs, a slow host backend
+vulkanizer_cuda_test(npu_async)
+target_link_libraries(npu_async PRIVATE vulkanizer_cublas)
+set_tests_properties(npu_async PROPERTIES ENVIRONMENT
+  "VULKANIZER_NPU=force;VULKANIZER_NPU_BACKEND=cpu;VULKANIZER_NPU_CPU_DELAY_MS=200")
 vulkanizer_cuda_test(cusolver)
 target_link_libraries(cusolver PRIVATE vulkanizer_cusolver)
 vulkanizer_cuda_test(cufft)

@@ -7,7 +7,8 @@
 // the GPU packs into the NPU kernel's buffers and writes C from its result). copy: the host copying
 // path (7.1) through the backend directly, on the host addresses of the device buffers (write-combined
 // on RADV) and on cached pinned memory, the latter split into pack / run / epi (run: the NPU alone).
-// relerr: max |C_zc - C_gpu| / max |C_gpu|.
+// "x8": per GEMM of 8 issued back to back and synchronized once (asynchronous execution, 7.4), and
+// "ratio" = gpu x8 / zc x8. relerr: max |C_zc - C_gpu| / max |C_gpu|.
 // "pad" is the kernel's m * n * k over the shape's. Times are medians, in ms.
 
 #include <cublas_v2.h>
@@ -153,9 +154,9 @@ int main(int argc, char** argv) {
 
     std::printf("GPU: %s, NPU: %s %s (%s); bf16 x bf16 -> f32, median ms\n", devName, npu::vendorName(devices[0].vendor),
                 devices[0].generation.c_str(), backend->name());
-    std::printf("%-27s %-4s %5s %5s %5s %3s %5s | %8s %7s | %8s %7s %6s | %8s | %8s %7s %7s %7s | %8s\n", "case", "op",
-                "m", "n", "k", "b", "pad", "gpu", "GFLOP/s", "zc", "GFLOP/s", "gpu/zc", "copy(wc)", "copy(pin)", "pack",
-                "run", "epi", "relerr");
+    std::printf("%-27s %-4s %5s %5s %5s %3s %5s | %8s %7s %8s | %8s %7s %6s %8s %6s | %8s | %8s %7s %7s %7s | %8s\n",
+                "case", "op", "m", "n", "k", "b", "pad", "gpu", "GFLOP/s", "gpu x8", "zc", "GFLOP/s", "gpu/zc", "zc x8",
+                "ratio", "copy(wc)", "copy(pin)", "pack", "run", "epi", "relerr");
 
     std::mt19937 rng(1);
     std::uniform_real_distribution<float> dist(-1, 1);
@@ -177,7 +178,7 @@ int main(int argc, char** argv) {
         CK(cuMemsetD8(dC, 0, bytesC));
 
         const float alpha = 1, beta = 0;
-        const auto gemm = [&] {
+        const auto issue = [&] {
             const cublasOperation_t ta = c.transA ? CUBLAS_OP_T : CUBLAS_OP_N, tb = c.transB ? CUBLAS_OP_T : CUBLAS_OP_N;
             if (c.batch == 1)
                 CK(cublasGemmEx(handle, ta, tb, c.m, c.n, c.k, &alpha, reinterpret_cast<void*>(dA), CUDA_R_16BF, lda,
@@ -188,18 +189,29 @@ int main(int argc, char** argv) {
                                               CUDA_R_16BF, lda, sA, reinterpret_cast<void*>(dB), CUDA_R_16BF, ldb, sB,
                                               &beta, reinterpret_cast<void*>(dC), CUDA_R_32F, ldc, sC, c.batch,
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        };
+        const auto gemm = [&] {
+            issue();
+            CK(cuCtxSynchronize());
+        };
+        // kQueued GEMMs back to back, one sync: the time per GEMM (asynchronous execution, 7.4)
+        constexpr int kQueued = 8;
+        const auto queued = [&] {
+            for (int i = 0; i < kQueued; ++i) issue();
             CK(cuCtxSynchronize());
         };
         // zero copy first: the first GEMM of the process creates cuBLAS's NPU backend
         setenv("VULKANIZER_NPU", "force", 1);
         gemm();
         const double zcTime = median(repeat(gemm));
+        const double zcQueued = median(repeat(queued)) / kQueued;
         std::vector<float> zcC(sC * c.batch);
         CK(cuMemcpyDtoH(zcC.data(), dC, bytesC));
         setenv("VULKANIZER_NPU", "off", 1);
         CK(cuMemsetD8(dC, 0, bytesC));
         gemm();
         const double gpuTime = median(repeat(gemm));
+        const double gpuQueued = median(repeat(queued)) / kQueued;
         std::vector<float> gpuC(sC * c.batch);
         CK(cuMemcpyDtoH(gpuC.data(), dC, bytesC));
         double maxErr = 0, maxRef = 0;
@@ -249,12 +261,13 @@ int main(int argc, char** argv) {
             std::printf("%5.1f ", pad);
         else
             std::printf("%5s ", "-");
-        std::printf("| %8.3f %7.0f | ", gpuTime * 1e3, flop / gpuTime / 1e9);
+        std::printf("| %8.3f %7.0f %8.3f | ", gpuTime * 1e3, flop / gpuTime / 1e9, gpuQueued * 1e3);
         if (volume <= 0) {
             std::printf("no npu kernel\n");
             continue;
         }
-        std::printf("%8.3f %7.0f %6.2f | ", zcTime * 1e3, flop / zcTime / 1e9, gpuTime / zcTime);
+        std::printf("%8.3f %7.0f %6.2f %8.3f %6.2f | ", zcTime * 1e3, flop / zcTime / 1e9, gpuTime / zcTime,
+                    zcQueued * 1e3, gpuQueued / zcQueued);
         if (wc.ok)
             std::printf("%8.3f | ", wc.total * 1e3);
         else

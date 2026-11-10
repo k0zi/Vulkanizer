@@ -350,6 +350,14 @@ VkResult Device::init() {
         if ((r = vkAllocateCommandBuffers(device_, &cai, &b.cmd)) != VK_SUCCESS) return r;
         if ((r = vkCreateFence(device_, &fci, nullptr, &b.fence)) != VK_SUCCESS) return r;
     }
+    if (e12.timelineSemaphore) {
+        VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        sci.pNext = &ti;
+        if ((r = vkCreateSemaphore(device_, &sci, nullptr, &progress_)) != VK_SUCCESS) return r;
+        if ((r = vkCreateSemaphore(device_, &sci, nullptr, &hostSteps_)) != VK_SUCCESS) return r;
+    }
 
     // GPU timestamps for CUDA events, if the queue supports them.
     uint32_t familyCount = 0;
@@ -436,7 +444,17 @@ VkResult Device::init() {
 
 Device::~Device() {
     if (!device_) return;
+    if (hostWorker_.joinable()) {  // runs the queued host steps first: the device may wait for them
+        {
+            std::lock_guard<std::mutex> lock(hostMutex_);
+            hostStop_ = true;
+        }
+        hostCv_.notify_all();
+        hostWorker_.join();
+    }
     vkDeviceWaitIdle(device_);
+    if (progress_) vkDestroySemaphore(device_, progress_, nullptr);
+    if (hostSteps_) vkDestroySemaphore(device_, hostSteps_, nullptr);
     for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
     destroyBuffer(readStaging_);
     for (auto& b : blocks_) destroyBuffer(b->buf);
@@ -1185,9 +1203,74 @@ VkResult Device::flushLocked() {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &b.cmd;
-    if (VkResult r = vkQueueSubmit(queue_, 1, &si, b.fence)) return r;
+    // With timeline semaphores every batch signals its serial (host steps wait for it), and a host
+    // step's batch waits for the step.
+    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (progress_) {
+        si.pNext = &ts;
+        ts.signalSemaphoreValueCount = 1;
+        ts.pSignalSemaphoreValues = &b.serial;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &progress_;
+        if (hostWait_) {
+            ts.waitSemaphoreValueCount = 1;
+            ts.pWaitSemaphoreValues = &hostWait_;
+            si.waitSemaphoreCount = 1;
+            si.pWaitSemaphores = &hostSteps_;
+            si.pWaitDstStageMask = &waitStage;
+        }
+    }
+    const VkResult r = vkQueueSubmit(queue_, 1, &si, b.fence);
+    hostWait_ = 0;
+    if (r != VK_SUCCESS) return r;
     b.pending = true;
     return VK_SUCCESS;
+}
+
+VkResult Device::enqueueHost(std::function<void()> fn) {
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    if (!progress_ || launchBlocking_) {
+        if (VkResult r = finish()) return r;
+        lock.unlock();
+        fn();
+        return VK_SUCCESS;
+    }
+    if (VkResult r = flushLocked()) return r;
+    const uint64_t after = nextSerial_ - 1;  // every batch so far is submitted
+    if (VkResult r = beginBatch()) return r;  // empty: waits for the step, completes with it
+    hostWait_ = ++hostStepValue_;
+    {
+        std::lock_guard<std::mutex> hl(hostMutex_);
+        hostQueue_.push_back({after, hostWait_, std::move(fn)});
+        if (!hostWorker_.joinable()) hostWorker_ = std::thread(&Device::runHostSteps, this);
+    }
+    hostCv_.notify_one();
+    return flushLocked();
+}
+
+void Device::runHostSteps() {
+    std::unique_lock<std::mutex> lock(hostMutex_);
+    for (;;) {
+        hostCv_.wait(lock, [&] { return hostStop_ || !hostQueue_.empty(); });
+        if (hostQueue_.empty()) return;  // stopping, and nothing left
+        HostStep step = std::move(hostQueue_.front());
+        hostQueue_.pop_front();
+        lock.unlock();
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &progress_;
+        wi.pValues = &step.after;
+        // Device lost: the step still runs and signals, so nothing waits for it forever.
+        if (VkResult r = vkWaitSemaphores(device_, &wi, UINT64_MAX); r != VK_SUCCESS)
+            VULKANIZER_WARN("host step: waiting for the device failed (%d)", int(r));
+        step.fn();
+        VkSemaphoreSignalInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        si.semaphore = hostSteps_;
+        si.value = step.value;
+        vkSignalSemaphore(device_, &si);
+        lock.lock();
+    }
 }
 
 void Device::collectTimings(Batch& b) {

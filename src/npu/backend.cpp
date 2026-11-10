@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vulkanizer::npu {
@@ -66,20 +68,12 @@ public:
     }
 
     bool runStaged(const Staging& st) override {
-        // VULKANIZER_NPU_CPU_FAIL_AT=n (tests): the n-th run fails, for the GPU fallback of a batch's rest
+        // VULKANIZER_NPU_CPU_FAIL_AT=n (tests): the n-th run fails, for the callers' fallbacks
         if (const char* f = std::getenv("VULKANIZER_NPU_CPU_FAIL_AT"); f && ++runs_ == std::atoi(f)) return false;
-        const auto* l = static_cast<const float*>(st.lhs);
-        const auto* r = static_cast<const float*>(st.rhs);
-        auto* o = static_cast<float*>(st.result);
-        for (int64_t i = 0; i < st.m; ++i) {
-            float* row = o + i * st.n;
-            std::fill(row, row + st.n, 0.0f);
-            for (int64_t p = 0; p < st.k; ++p) {
-                const float x = l[i * st.k + p];
-                const float* rr = r + p * st.n;
-                for (int64_t j = 0; j < st.n; ++j) row[j] += x * rr[j];
-            }
-        }
+        // VULKANIZER_NPU_CPU_DELAY_MS=n (tests): every run takes n ms more, for asynchronous execution
+        if (const char* d = std::getenv("VULKANIZER_NPU_CPU_DELAY_MS"); d && *d)
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(d)));
+        hostGemm(st);
         return true;
     }
 

@@ -2145,9 +2145,26 @@ cudaError_t CUDARTAPI cudaStreamAddCallback(cudaStream_t stream, cudaStreamCallb
                                             unsigned int flags) {
     ENTER();
     if (!callback) return record(cudaErrorInvalidValue);
-    const CUresult r = cuStreamSynchronize(stream);  // runs once the stream's preceding work is done
-    callback(stream, toCudaError(r), userData);
-    return cudaSuccess;
+    CUstreamCaptureStatus capturing = CU_STREAM_CAPTURE_STATUS_NONE;
+    if (CUresult r = cuStreamIsCapturing(stream, &capturing)) return record(r);
+    if (capturing != CU_STREAM_CAPTURE_STATUS_NONE) return record(cudaErrorStreamCaptureUnsupported);  // as CUDA
+    // A host function: runs once the stream's preceding work is done, the stream's later work waits
+    struct Call {
+        cudaStream_t stream;
+        cudaStreamCallback_t callback;
+        void* userData;
+    };
+    auto* call = new Call{stream, callback, userData};
+    const CUresult r = cuLaunchHostFunc(
+        stream,
+        [](void* p) {
+            auto* c = static_cast<Call*>(p);
+            c->callback(c->stream, cudaSuccess, c->userData);
+            delete c;
+        },
+        call);
+    if (r != CUDA_SUCCESS) delete call;
+    return record(r);
 }
 
 cudaError_t CUDARTAPI cudaStreamCreateWithFlags(cudaStream_t* stream, unsigned int flags) {

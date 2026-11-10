@@ -112,8 +112,9 @@ public:
     virtual GemmTimes lastTimes() const { return {}; }
     // Zero copy: whether the backend has stage() / runStaged(); stage() picks the kernel for one batch
     // entry of `shape` and returns its buffers (they stay valid for the backend's lifetime), runStaged()
-    // runs it on what the caller put into them. The caller serializes stage..runStaged..reading out
-    // against other users of the backend through lockStaging().
+    // runs it on what the caller put into them (possibly on another thread, later: plan.md 7.4). The
+    // caller orders stage..runStaged..reading out against other users of the buffers: lockStaging()
+    // while it enqueues them, the GPU queue's order after that.
     virtual bool canStage() const { return false; }
     virtual bool stage(const GemmShape& shape, Staging& out) { return false; }
     virtual bool runStaged(const Staging& staging) { return false; }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
+#include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
@@ -203,6 +204,34 @@ HostPages& HostPages::operator=(HostPages&& o) noexcept {
 
 HostPages::~HostPages() {
     if (data_) munmap(data_, size_);
+}
+
+void hostGemm(const Staging& st) {
+    // rhs as f32 once; each thread converts its lhs rows on the way
+    std::vector<float> rhs(size_t(st.k * st.n));
+    convert(static_cast<const char*>(st.rhs), st.in, st.k * st.n, reinterpret_cast<char*>(rhs.data()), DType::F32, 1);
+    const size_t ie = dtypeSize(st.in), oe = dtypeSize(st.out);
+    const auto rows = [&](int64_t first, int64_t last) {
+        std::vector<float> l(size_t(st.k)), row(size_t(st.n));
+        for (int64_t i = first; i < last; ++i) {
+            convert(static_cast<const char*>(st.lhs) + size_t(i * st.k) * ie, st.in, st.k,
+                    reinterpret_cast<char*>(l.data()), DType::F32, 1);
+            std::fill(row.begin(), row.end(), 0.0f);
+            for (int64_t p = 0; p < st.k; ++p) {
+                const float x = l[size_t(p)];
+                const float* r = &rhs[size_t(p * st.n)];
+                for (int64_t j = 0; j < st.n; ++j) row[size_t(j)] += x * r[j];
+            }
+            convert(reinterpret_cast<const char*>(row.data()), DType::F32, st.n,
+                    static_cast<char*>(st.result) + size_t(i * st.n) * oe, st.out, 1);
+        }
+    };
+    const int64_t threads = std::clamp<int64_t>(std::min<int64_t>(std::thread::hardware_concurrency(),
+                                                                    st.m * st.n * st.k >> 20), 1, st.m);
+    std::vector<std::thread> pool;
+    for (int64_t t = 1; t < threads; ++t) pool.emplace_back(rows, st.m * t / threads, st.m * (t + 1) / threads);
+    rows(0, st.m / threads);
+    for (std::thread& t : pool) t.join();
 }
 
 }  // namespace vulkanizer::npu

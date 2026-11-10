@@ -35,6 +35,11 @@ void zeroPadding(void* dst, size_t elem, int64_t rows, int64_t cols, int64_t ld,
 void epilogue(const void* d, DType dt, int64_t dLd, float alpha, float beta, void* c, DType ct, int64_t ldc, int64_t m,
               int64_t n);
 
+// The staged GEMM on the host: result = lhs x rhs (Staging's m x k times k x n, row-major, of its
+// types), on all cores. The CPU backend's runStaged, and the fallback when an NPU run fails after
+// the caller can no longer take the GEMM back (asynchronous execution, plan.md 7.4).
+void hostGemm(const Staging& st);
+
 // Anonymous, zeroed, page-aligned host memory (mmap), whole pages: what both the NPU driver (user
 // pointer buffers) and Vulkan (VK_EXT_external_memory_host) can import, unlike memory mapped from
 // either driver (zero copy, plan.md 7.3).

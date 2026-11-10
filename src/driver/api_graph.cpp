@@ -249,10 +249,8 @@ CUresult runNode(ApiScope& s, CUstream stream, const CUgraphNode_st& n) {
                 if (r) return r;
             }
             return CUDA_SUCCESS;
-        case CU_GRAPH_NODE_TYPE_HOST:
-            if (VkResult vr = s.dev->finish()) return toCuResult(vr);  // after the work before it
-            n.fn(n.userData);
-            return CUDA_SUCCESS;
+        case CU_GRAPH_NODE_TYPE_HOST:  // after the work before it, the work after it waits
+            return toCuResult(s.dev->enqueueHost([fn = n.fn, data = n.userData] { fn(data); }));
         default:  // empty, event wait: ordering the single queue gives anyway; memory nodes allocated when
                   // they were created
             return CUDA_SUCCESS;
@@ -495,9 +493,8 @@ CUresult CUDAAPI cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void* userData)
         node->userData = userData;
         return captureNode(cs, std::move(node));
     }
-    if (VkResult vr = s.dev->finish()) return toCuResult(vr);  // runs after the stream's work so far
-    fn(userData);
-    return CUDA_SUCCESS;
+    // On a worker thread, after the stream's work so far; the stream's later work waits for it.
+    return toCuResult(s.dev->enqueueHost([fn, userData] { fn(userData); }));
 }
 CUresult CUDAAPI cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void* userData) {
     return cuLaunchHostFunc(hStream, fn, userData);
