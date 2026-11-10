@@ -40,6 +40,15 @@ CUresult CUDAAPI vulkanizerGetFeature(VulkanizerFeature feature, int* value);
 // caller orders the access against the GPU (cuStreamSynchronize).
 CUresult CUDAAPI vulkanizerGetHostPointer(CUdeviceptr ptr, size_t bytes, void** host, int* cached);
 
+// Host work alongside the device (the NPU offload): runs fn(userData) on a driver thread once the
+// stream's work so far has executed, like cuLaunchHostFunc, but the stream's later work does not wait
+// for it until vulkanizerStreamWaitHostFunc(stream, *token); every launch needs that wait. Streams
+// share the device's queue, so the wait holds up the work of every stream recorded after it. Not
+// while the stream is captured (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED). Without timeline semaphores
+// fn runs before the launch returns.
+CUresult CUDAAPI vulkanizerLaunchHostFuncAsync(CUstream stream, CUhostFn fn, void* userData, uint64_t* token);
+CUresult CUDAAPI vulkanizerStreamWaitHostFunc(CUstream stream, uint64_t token);
+
 #ifdef __cplusplus
 }
 #endif

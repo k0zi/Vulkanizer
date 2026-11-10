@@ -1,6 +1,7 @@
 // GEMM on the GPU (Vulkanizer cuBLAS) vs the NPU backend (plan.md 7.2), bf16 x bf16 -> f32.
 //   vulkanizer-npu-bench                      the default shapes
 //   vulkanizer-npu-bench NN 1024 1024 1024 1  one shape: op(A) op(B) m n k batch (cuBLAS, column-major)
+//   vulkanizer-npu-bench split NN 4096 4096 4096  GPU + NPU split at several NPU shares (plan.md 7.5)
 //
 // gpu: cublasGemmEx / cublasGemmStridedBatchedEx on device memory (VULKANIZER_NPU=off), timed to
 // cuCtxSynchronize. zc: the same call with VULKANIZER_NPU=force, i.e. the zero-copy path (plan.md 7.3:
@@ -101,9 +102,91 @@ NpuRun runNpu(npu::Backend& backend, const npu::GemmArgs& args) {
     return r;
 }
 
+// vulkanizer-npu-bench split OP m n k: one GEMM split between GPU and NPU (plan.md 7.5) at several NPU
+// shares (VULKANIZER_NPU_SPLIT), against the GPU alone; single (synced) and x8 (queued) per GEMM.
+int splitSweep(char** argv) {
+    const std::string ops = argv[2];
+    const bool transA = ops[0] == 'T', transB = ops.size() > 1 && ops[1] == 'T';
+    const int m = std::atoi(argv[3]), n = std::atoi(argv[4]), k = std::atoi(argv[5]);
+    CK(cuInit(0));
+    CUdevice dev;
+    CK(cuDeviceGet(&dev, 0));
+    CUcontext ctx;
+    CK(cuDevicePrimaryCtxRetain(&ctx, dev));
+    CK(cuCtxSetCurrent(ctx));
+    cublasHandle_t handle;
+    CK(cublasCreate(&handle));
+    const int lda = transA ? k : m, ldb = transB ? n : k, ldc = m;
+    const size_t sA = size_t(lda) * (transA ? m : k), sB = size_t(ldb) * (transB ? k : n), sC = size_t(m) * n;
+    std::mt19937 rng(1);
+    std::uniform_real_distribution<float> dist(-1, 1);
+    std::vector<uint16_t> a(sA), b(sB);
+    for (uint16_t& x : a) x = toBf16(dist(rng));
+    for (uint16_t& x : b) x = toBf16(dist(rng));
+    CUdeviceptr dA, dB, dC;
+    CK(cuMemAlloc(&dA, sA * 2));
+    CK(cuMemAlloc(&dB, sB * 2));
+    CK(cuMemAlloc(&dC, sC * 4));
+    CK(cuMemcpyHtoD(dA, a.data(), sA * 2));
+    CK(cuMemcpyHtoD(dB, b.data(), sB * 2));
+    const float alpha = 1, beta = 0;
+    const auto issue = [&] {
+        CK(cublasGemmEx(handle, transA ? CUBLAS_OP_T : CUBLAS_OP_N, transB ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha,
+                        reinterpret_cast<void*>(dA), CUDA_R_16BF, lda, reinterpret_cast<void*>(dB), CUDA_R_16BF, ldb,
+                        &beta, reinterpret_cast<void*>(dC), CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    };
+    const auto single = [&] {
+        issue();
+        CK(cuCtxSynchronize());
+    };
+    const auto queued = [&] {
+        for (int i = 0; i < 8; ++i) issue();
+        CK(cuCtxSynchronize());
+    };
+    const double flop = 2.0 * m * n * k;
+    struct Row {
+        double share, single, queued;
+        std::vector<float> c;
+    };
+    std::vector<Row> rows;
+    // the GPU alone last: the first GEMM in force mode creates cuBLAS's NPU backend
+    for (const double share : {0.125, 0.1875, 0.25, 0.3, 0.35, 0.4, 0.5, 0.0}) {
+        setenv("VULKANIZER_NPU", share > 0 ? "force" : "off", 1);
+        setenv("VULKANIZER_NPU_SPLIT", std::to_string(share).c_str(), 1);
+        CK(cuMemsetD8(dC, 0, sC * 4));
+        single();
+        Row r{share, median(repeat(single)), median(repeat(queued)) / 8, std::vector<float>(sC)};
+        CK(cuMemcpyDtoH(r.c.data(), dC, sC * 4));
+        rows.push_back(std::move(r));
+    }
+    const Row& gpu = rows.back();
+    std::printf("%c%c m=%d n=%d k=%d, bf16 x bf16 -> f32, median ms (VULKANIZER_LOG=debug shows each split)\n",
+                transA ? 'T' : 'N', transB ? 'T' : 'N', m, n, k);
+    std::printf("%-6s %9s %6s %9s %6s %8s %9s\n", "npu", "single", "gain", "x8", "gain", "GFLOP/s", "relerr");
+    for (const Row& r : rows) {
+        double maxErr = 0, maxRef = 0;
+        for (size_t i = 0; i < sC; ++i) {
+            maxErr = std::max(maxErr, double(std::fabs(r.c[i] - gpu.c[i])));
+            maxRef = std::max(maxRef, double(std::fabs(gpu.c[i])));
+        }
+        if (r.share > 0)
+            std::printf("%-6.3g ", r.share);
+        else
+            std::printf("%-6s ", "gpu");
+        std::printf("%9.3f %6.2f %9.3f %6.2f %8.0f %9.1e\n", r.single * 1e3, gpu.single / r.single, r.queued * 1e3,
+                    gpu.queued / r.queued, flop / r.queued / 1e9, maxRef > 0 ? maxErr / maxRef : maxErr);
+    }
+    CK(cuMemFree(dA));
+    CK(cuMemFree(dB));
+    CK(cuMemFree(dC));
+    cublasDestroy(handle);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 6 && std::string(argv[1]) == "split") return splitSweep(argv);
     // cuBLAS creates its NPU backend on the first GEMM, unless the mode is off then.
     setenv("VULKANIZER_NPU", "force", 1);
     unsetenv("VULKANIZER_NPU_ZERO_COPY");
@@ -113,7 +196,7 @@ int main(int argc, char** argv) {
         cases.push_back({"custom", ops[0] == 'T', ops.size() > 1 && ops[1] == 'T', std::atoi(argv[2]), std::atoi(argv[3]),
                          std::atoi(argv[4]), std::atoi(argv[5])});
     } else if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [NN|NT|TN|TT m n k batch]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [NN|NT|TN|TT m n k batch | split NN|NT|TN|TT m n k]\n", argv[0]);
         return 2;
     } else {
         for (int s : {256, 512, 1024, 2048, 4096}) cases.push_back({"square", false, false, s, s, s, 1});

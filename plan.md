@@ -60,7 +60,7 @@ Hátra, javasolt sorrendben:
 3. Nyitott részfeladat: külön copy queue (5.4) – integrált GPU-n és GPU-korlátos tg mellett kevés haszonnal.
 4. **6. fázis**: a korlátok feloldása (PyTorch/ComfyUI → bináris kompatibilitás → teljesítmény → teljesség); a nem
    clean-room feladatok külön, eltéve: [plan_non_clean.md](plan_non_clean.md).
-5. **7. fázis**: NPU offload (2026-11-10: váz, XDNA bring-up, mérés, zero-copy és aszinkron végrehajtás kész; következik a 7.5 GPU + NPU párhuzamosan).
+5. **7. fázis**: NPU offload (2026-11-10: váz, XDNA bring-up, mérés, zero-copy, aszinkron végrehajtás és GPU + NPU megosztás kész; a megosztás ezen az APU-n nem gyorsít, a 7.6 igény szerint).
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -1072,10 +1072,45 @@ GLSL GEMM kernelek            force: zero-copy, aszinkron (7.3, 7.4)  │ auto: 
     egymás után dolgozik (egy sor): a párhuzamosság a 7.5.
   - Döntés: változatlan – zero-copy (most aszinkron) csak `force` mellett, az `auto` a 7.2 szabálya, az alapértelmezés
     `off`. Az 512³-as nyereség a bimodalitás miatt nem megbízható egy automatikus szabályhoz.
-- [ ] **7.5** GPU + NPU párhuzamosan: egy nagy GEMM felosztása C oszlopai mentén a mért átviteli arány szerint (a két
+- [x] **7.5** GPU + NPU párhuzamosan: egy nagy GEMM felosztása C oszlopai mentén a mért átviteli arány szerint (a két
   rész egyszerre fut, a 7.4-re épül), illetve különböző streamek GEMM-jei külön eszközön. Korlát: APU-n a kettő
   ugyanazon a DRAM-sávszélességen és hőkereten osztozik. Kész, ha: 4096³ bf16 GEMM-en ≥ 1,3× a csak-GPU-hoz képest,
   vagy a llama.cpp prompt-feldolgozása (pp512) mérhetően gyorsabb.
+  (2026-11-10; a cél nem teljesült, lásd a tanulságokat)
+  - Driver: `vk::Device::startHost` / `joinHost` (az `enqueueHost` két fele): a host-lépés a GPU addigi munkája után
+    indul, de a később rögzített munka nem vár rá, csak a `joinHost` után. Kiterjesztésként:
+    `vulkanizerLaunchHostFuncAsync(stream, fn, data, &token)` és `vulkanizerStreamWaitHostFunc(stream, token)`
+    (`vulkanizer_ext.h`; capture alatt `STREAM_CAPTURE_UNSUPPORTED`).
+  - cuBLAS (`runSplit`): `VULKANIZER_NPU_SPLIT=<arány>` (0..0,9; alap 0 = ki), csak zero-copy-val (`force`), batch = 1.
+    C oszlopainak vagy sorainak egy 256-tal osztható része megy az NPU-ra – az arányhoz legközelebbi, amelyre van kernel
+    legfeljebb 10% kitöltéssel (sor szerint a projekcióknál, ahol a tokenek száma kevés) –, a többi GPU-GEMM. Sorrend:
+    az NPU-rész csomagolása, NPU indul, GPU-rész, várakozás az NPU-ra, epilógus. Ha nincs illő kernel, nincs felosztás
+    (`force` mellett ilyenkor az egész az NPU-é).
+  - Közben: a `npu.comp` csomagolása soronként egyszer címez és két elemet tárol egyszerre, az epilógus soronként
+    címez: a GPU-oldali munka 4096×512×4096-on GEMM-enként ~10,4 → ~3,8 ms (a 7.3/7.4 zero-copy útnak is). A lépés
+    bontása `VULKANIZER_LOG=debug`-gal („npu run …: sync in, run, sync out”).
+  - Teszt: `npu_async` 4. része (`cpu` backend, `VULKANIZER_NPU_SPLIT=0.5`): oszlop és sor szerinti felosztás,
+    transzponálással, ld-hézaggal, alpha/beta-val, a hostszámításhoz képest pontosan; a `cublas` xdna-val és
+    `VULKANIZER_NPU_SPLIT=0.375`-tel is zöld. A teljes készlet (28) zöld.
+  - Mérés (`vulkanizer-npu-bench split OP m n k`, Release, medián ms; „×8”: 8 sorban, GEMM-enként; két futás):
+
+    | Alak | NPU-rész | GPU egyedül (×8) | megosztva (×8) | GPU / megosztva (×8) |
+    |---|---|---|---|---|
+    | 4096³ NN | 512 / 1024 / 1536 / 2048 oszlop | 42,5 | 39,7–51,4 | 0,83–1,07 |
+    | proj 4096→4096, 512 tok TN | 1024 sor | 8,5 | 9,9–10,8 | 0,78–0,86 |
+    | proj 4096→4096, 2048 tok TN | 512 / 1024 oszlop | 25,3 | 27,1–29,6 | 0,85–0,93 |
+
+    Külön mérve (4096³, 1536 oszlop az NPU-n): GPU-rész (2560 oszlop) 24–28 ms, NPU-rész 30 ms (futás 21–25 ms);
+    tökéletes átfedéssel ~31 ms lenne a ~36–42 helyett.
+  - Tanulságok: (1) A két egység ugyanazon az LPDDR5X-en és hőkereten osztozik: két külön folyamatban egyszerre futtatva
+    a GPU-rész 24 → 31,7 ms-ra lassul (+32%), amíg az NPU dolgozik, az NPU alig (30,4 → 32,7 ms). A GPU-GEMM ~3,5
+    TFLOP/s-a messze a 890M csúcsa alatt van, azaz memóriakorlátos – pont azon az erőforráson, amit az NPU is használ.
+    (2) Egy folyamaton belül ehhez jön az NPU-rész GPU-oldali csomagolása (NN-nél az egész A), és a GPU-kernelidő
+    megosztva is ~45 ms/GEMM: a nyereség elfogy. (3) A GPU-idő maga ±15%-ot szór futásonként, ami a kis
+    különbségeket elfedi.
+  - Döntés: a felosztás opcionális marad (`VULKANIZER_NPU_SPLIT`, alap ki). Ezen a gépen (Ryzen AI 9 HX 370) a GPU + NPU
+    nem gyorsabb a csak-GPU-nál; értelme egy hatékonyabb NPU-kernellel (a `whole_array` design 4096³-on ~2,4 TFLOP/s-ot
+    ad a futásra) vagy egy compute-korlátos GPU-kernellel lehet, illetve energiában (nem mértük).
 - [ ] **7.6** Bővítések, igény szerint: int8 GEMM (`CUDA_R_8I`, `CUBLAS_COMPUTE_32I`: a cuBLAS ma nem tudja, GPU-ra is
   kell); Intel NPU backend (Level Zero / OpenVINO, `intel_vpu`), csak ha van ilyen gép; konvolúció a cuDNN shimből (6.4).
 
@@ -1144,6 +1179,7 @@ fix költsége (~100 µs nagyságrend, mérendő) miatt a kis GEMM-ek sosem éri
 | `VULKANIZER_NPU_ZERO_COPY` | `force` módban a zero-copy út (7.3: a GPU csomagol); `0`: a másolós út (7.1) |
 | `VULKANIZER_NPU_MAX_LOADED` | Egyszerre legfeljebb ennyi NPU-kernel tart hardver-kontextust (alap: 4, LRU) |
 | `VULKANIZER_NPU_CPU_FAIL_AT` | Teszthez: a `cpu` backend n-edik zero-copy futása hibázik (a host-GEMM tartalékút) |
+| `VULKANIZER_NPU_SPLIT` | GPU + NPU megosztás: egy GEMM ekkora része (0..0,9) megy az NPU-ra, a többi közben a GPU-n; csak `VULKANIZER_NPU=force` mellett (alap: 0, ki; 7.5) |
 | `VULKANIZER_NPU_CPU_DELAY_MS` | Teszthez: a `cpu` backend zero-copy futásai ennyi ms-mal tovább tartanak (aszinkron végrehajtás, 7.4) |
 | `VULKANIZER_NPU_MIN_DIM` | `auto` módban m és n legalább ennyi (alap: 64; a mátrix-vektor szorzás GPU-n marad) |
 | `VULKANIZER_NPU_KERNELS` | Az NPU GEMM-kernelek (`gemm_<in>_<out>_<M>x<K>x<N>.xclbin` + `.insts.bin`) könyvtára (alap: `$XDG_DATA_HOME/vulkanizer/npu`) |

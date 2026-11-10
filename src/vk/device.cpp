@@ -1229,23 +1229,38 @@ VkResult Device::flushLocked() {
 }
 
 VkResult Device::enqueueHost(std::function<void()> fn) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    uint64_t token = 0;
+    if (VkResult r = startHost(std::move(fn), token)) return r;
+    return joinHost(token);
+}
+
+VkResult Device::startHost(std::function<void()> fn, uint64_t& token) {
     std::unique_lock<std::recursive_mutex> lock(mutex_);
+    token = 0;
     if (!progress_ || launchBlocking_) {
         if (VkResult r = finish()) return r;
         lock.unlock();
         fn();
         return VK_SUCCESS;
     }
-    if (VkResult r = flushLocked()) return r;
-    const uint64_t after = nextSerial_ - 1;  // every batch so far is submitted
-    if (VkResult r = beginBatch()) return r;  // empty: waits for the step, completes with it
-    hostWait_ = ++hostStepValue_;
+    if (VkResult r = flushLocked()) return r;  // the step waits for every batch so far
+    token = ++hostStepValue_;
     {
         std::lock_guard<std::mutex> hl(hostMutex_);
-        hostQueue_.push_back({after, hostWait_, std::move(fn)});
+        hostQueue_.push_back({nextSerial_ - 1, token, std::move(fn)});
         if (!hostWorker_.joinable()) hostWorker_ = std::thread(&Device::runHostSteps, this);
     }
     hostCv_.notify_one();
+    return VK_SUCCESS;
+}
+
+VkResult Device::joinHost(uint64_t token) {
+    if (!token) return VK_SUCCESS;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (VkResult r = flushLocked()) return r;
+    if (VkResult r = beginBatch()) return r;  // empty: waits for the step, completes with it
+    hostWait_ = std::max(hostWait_, token);
     return flushLocked();
 }
 

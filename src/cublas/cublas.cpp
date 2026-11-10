@@ -12,6 +12,7 @@
 #include "npu/npu.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
@@ -320,51 +321,95 @@ const NpuStep* npuStep(vulkanizer::npu::Backend& backend, const vulkanizer::npu:
 // GPU here (later work is queued already): if the NPU fails, the host computes the result.
 void runNpuStep(void* data) {
     const auto* step = static_cast<const NpuStep*>(data);
-    if (step->backend->runStaged(step->st)) return;
+    if (step->backend->runStaged(step->st)) {
+        const vulkanizer::npu::GemmTimes t = step->backend->lastTimes();
+        VULKANIZER_DEBUG("npu run %lldx%lldx%lld: sync in %.3f ms, run %.3f ms, sync out %.3f ms", (long long)step->st.m,
+                         (long long)step->st.k, (long long)step->st.n, t.pack * 1e3, t.run * 1e3, t.epilogue * 1e3);
+        return;
+    }
     VULKANIZER_WARN_ONCE("cublas: the %s NPU backend failed a GEMM, computing it on the host", step->backend->name());
     vulkanizer::npu::hostGemm(step->st);
 }
 
+// A GEMM staged for the NPU (zero copy, plan.md 7.3): the kernel's buffers and their device addresses.
+struct Staged {
+    vulkanizer::npu::Staging st;
+    CUdeviceptr lhs = 0, rhs = 0, result = 0;
+    uint32_t ta = 0, tb = 0, tc = 0, in = 0, out = 0;
+    const NpuStep* step = nullptr;
+};
+
+// Picks the kernel for `s` and maps its buffers; the caller holds the backend's lockStaging().
+bool stage(const Gemm& g, const vulkanizer::npu::GemmShape& s, vulkanizer::npu::Backend& backend, Staged& out) {
+    Staged& o = out;
+    if (!backend.stage(s, o.st) || !stagingAddress(o.st.lhs, o.st.lhsBytes, o.lhs) ||
+        !stagingAddress(o.st.rhs, o.st.rhsBytes, o.rhs) || !stagingAddress(o.st.result, o.st.resultBytes, o.result) ||
+        !typeCode(g.ta, o.ta) || !typeCode(g.tb, o.tb) || !typeCode(g.tc, o.tc))
+        return false;
+    o.in = npuTypeCode(o.st.in), o.out = npuTypeCode(o.st.out);
+    o.step = npuStep(backend, o.st);
+    return true;
+}
+
+// The GPU packs batch entry i: op(B)^T (n x k) into lhs, a st.m x st.k buffer, and op(A)^T (k x m)
+// into rhs, st.k x st.n; bf16 rounding and zero padding included (npu.comp).
+bool packNpu(cublasHandle_t h, const Gemm& g, const vulkanizer::npu::GemmShape& s, const Staged& o, int i) {
+    NpuParams q{};
+    q.src = uint64_t(g.b) + uint64_t(i * g.strideB) * typeSize(g.tb), q.dst = o.lhs;
+    q.ld = g.ldb, q.dstLd = o.st.k, q.rows = g.k, q.cols = g.n, q.dstRows = int32_t(o.st.m);
+    q.flags = o.tb | o.in << 2 | (s.transB ? kNpuTrans : 0);
+    if (!launchNpu(h, q, unsigned(o.st.k), unsigned(o.st.m))) return false;
+    q.src = uint64_t(g.a) + uint64_t(i * g.strideA) * typeSize(g.ta), q.dst = o.rhs;
+    q.ld = g.lda, q.dstLd = o.st.n, q.rows = g.m, q.cols = g.k, q.dstRows = int32_t(o.st.k);
+    q.flags = o.ta | o.in << 2 | (s.transA ? kNpuTrans : 0);
+    return launchNpu(h, q, unsigned(o.st.n), unsigned(o.st.k));
+}
+
+// The GPU writes C of batch entry i = alpha * result + beta * C.
+bool epilogueNpu(cublasHandle_t h, const Gemm& g, const Staged& o, int i, float alpha, float beta) {
+    NpuParams q{};
+    q.src = o.result, q.dst = uint64_t(g.c) + uint64_t(i * g.strideC) * typeSize(g.tc);
+    q.ld = o.st.n, q.dstLd = g.ldc, q.rows = g.m, q.cols = g.n;
+    q.alpha = alpha, q.beta = beta;
+    q.flags = o.out | o.tc << 2 | kNpuEpilogue;
+    return launchNpu(h, q, unsigned(g.m), unsigned(g.n));
+}
+
 // Zero copy (plan.md 7.3) and asynchronous (7.4): per batch entry, the GPU packs op(B)^T and op(A)^T
-// into the NPU kernel's buffers (npu.comp), the NPU runs as a host function of the stream, and the
-// GPU writes C from its result; nothing waits. The device's single queue orders every use of the
-// shared buffers (lockStaging() keeps other threads' GEMMs out while one is enqueued). Works under
-// stream capture too: the run becomes a host node. Returns the batch entries enqueued; C of the
-// others is untouched.
+// into the NPU kernel's buffers, the NPU runs as a host function of the stream, and the GPU writes C
+// from its result; nothing waits. The device's single queue orders every use of the shared buffers
+// (lockStaging() keeps other threads' GEMMs out while one is enqueued). Works under stream capture
+// too: the run becomes a host node. Returns the batch entries enqueued; C of the others is untouched.
 int runNpuStaged(cublasHandle_t h, const Gemm& g, const vulkanizer::npu::GemmShape& s, float alpha, float beta,
                  vulkanizer::npu::Backend& backend) {
-    namespace npu = vulkanizer::npu;
     std::lock_guard<std::mutex> lock(backend.lockStaging());
-    npu::Staging st;
-    CUdeviceptr lhs, rhs, result;
-    uint32_t ta, tb, tc;
-    if (!backend.stage(s, st) || !stagingAddress(st.lhs, st.lhsBytes, lhs) || !stagingAddress(st.rhs, st.rhsBytes, rhs) ||
-        !stagingAddress(st.result, st.resultBytes, result) || !typeCode(g.ta, ta) || !typeCode(g.tb, tb) ||
-        !typeCode(g.tc, tc))
-        return 0;
-    const NpuStep* step = npuStep(backend, st);
-    const uint32_t in = npuTypeCode(st.in), out = npuTypeCode(st.out);
+    Staged o;
+    if (!stage(g, s, backend, o)) return 0;
     for (int i = 0; i < g.batch; ++i) {
-        // lhs = op(B)^T: n x k in a st.m x st.k buffer; rhs = op(A)^T: k x m in st.k x st.n
-        NpuParams q{};
-        q.src = uint64_t(g.b) + uint64_t(i * g.strideB) * typeSize(g.tb), q.dst = lhs;
-        q.ld = g.ldb, q.dstLd = st.k, q.rows = g.k, q.cols = g.n, q.dstRows = int32_t(st.m);
-        q.flags = tb | in << 2 | (s.transB ? kNpuTrans : 0);
-        if (!launchNpu(h, q, unsigned(st.k), unsigned(st.m))) return i;
-        q.src = uint64_t(g.a) + uint64_t(i * g.strideA) * typeSize(g.ta), q.dst = rhs;
-        q.ld = g.lda, q.dstLd = st.n, q.rows = g.m, q.cols = g.k, q.dstRows = int32_t(st.k);
-        q.flags = ta | in << 2 | (s.transA ? kNpuTrans : 0);
-        if (!launchNpu(h, q, unsigned(st.n), unsigned(st.k))) return i;
+        if (!packNpu(h, g, s, o, i)) return i;
         // A failure past this point is the stream's: C_i would be half done, the GPU cannot redo it
-        if (cuLaunchHostFunc(h->stream, runNpuStep, const_cast<NpuStep*>(step)) != CUDA_SUCCESS) return i;
-        q = {};
-        q.src = result, q.dst = uint64_t(g.c) + uint64_t(i * g.strideC) * typeSize(g.tc);
-        q.ld = st.n, q.dstLd = g.ldc, q.rows = g.m, q.cols = g.n;
-        q.alpha = alpha, q.beta = beta;
-        q.flags = out | tc << 2 | kNpuEpilogue;
-        if (!launchNpu(h, q, unsigned(g.m), unsigned(g.n))) return i;
+        if (cuLaunchHostFunc(h->stream, runNpuStep, const_cast<NpuStep*>(o.step)) != CUDA_SUCCESS) return i;
+        if (!epilogueNpu(h, g, o, i, alpha, beta)) return i;
     }
     return g.batch;
+}
+
+vulkanizer::npu::GemmShape npuShape(const Gemm& g) {
+    namespace npu = vulkanizer::npu;
+    const auto dtype = [](cudaDataType t) {
+        return t == CUDA_R_32F ? npu::DType::F32 : t == CUDA_R_16F ? npu::DType::F16 : npu::DType::BF16;
+    };
+    npu::GemmShape s;
+    s.transA = g.transa != CUBLAS_OP_N, s.transB = g.transb != CUBLAS_OP_N;
+    s.m = g.m, s.n = g.n, s.k = g.k, s.batch = g.batch;
+    s.a = dtype(g.ta), s.b = dtype(g.tb), s.c = dtype(g.tc);
+    s.reducedPrecision = g.compute == CUBLAS_COMPUTE_32F_FAST_16BF;
+    return s;
+}
+
+bool zeroCopyAllowed(vulkanizer::npu::Backend& backend) {
+    const char* zc = std::getenv("VULKANIZER_NPU_ZERO_COPY");
+    return vulkanizer::npu::mode() == vulkanizer::npu::Mode::Force && backend.canStage() && !(zc && !std::strcmp(zc, "0"));
 }
 
 // The GEMM on the NPU when the policy says so (plan.md 7.). Returns the batch entries done there
@@ -373,15 +418,9 @@ int runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
     namespace npu = vulkanizer::npu;
     npu::Backend* backend = npu::backend();
     if (!g.npu || !backend || g.pointerArrays || g.strideA < 0 || g.strideB < 0 || g.strideC < 0) return 0;
-    const auto dtype = [](cudaDataType t) {
-        return t == CUDA_R_32F ? npu::DType::F32 : t == CUDA_R_16F ? npu::DType::F16 : npu::DType::BF16;
-    };
     npu::GemmArgs a;
     npu::GemmShape& s = a.shape;
-    s.transA = g.transa != CUBLAS_OP_N, s.transB = g.transb != CUBLAS_OP_N;
-    s.m = g.m, s.n = g.n, s.k = g.k, s.batch = g.batch;
-    s.a = dtype(g.ta), s.b = dtype(g.tb), s.c = dtype(g.tc);
-    s.reducedPrecision = g.compute == CUBLAS_COMPUTE_32F_FAST_16BF;
+    s = npuShape(g);
     // Each operand's host address over all its batches: column-major rows x cols, leading dimension ld.
     void *ha = nullptr, *hb = nullptr, *hc = nullptr;
     const auto host = [&](const void* p, cudaDataType t, long long rows, long long cols, int ld, long long stride,
@@ -400,9 +439,8 @@ int runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
     // with VULKANIZER_NPU=force: it was slower than the GPU on every shape measured (plan.md 7.3), while
     // the auto mode's wins are cached host operands on the copying path (7.2). VULKANIZER_NPU_ZERO_COPY=0
     // forces the copying path.
-    const char* zc = std::getenv("VULKANIZER_NPU_ZERO_COPY");
     const npu::Mode mode = npu::mode();
-    const bool zeroCopy = mode == npu::Mode::Force && backend->canStage() && !(zc && !std::strcmp(zc, "0"));
+    const bool zeroCopy = zeroCopyAllowed(*backend);
     if (!zeroCopy && !mapped) return 0;
     if (npu::route(s, mode, npu::policy(), backend->volume(s)) != npu::Target::Npu) return 0;
     if (zeroCopy) {
@@ -429,6 +467,78 @@ int runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
     return g.batch;
 }
 
+cublasStatus_t run(cublasHandle_t h, const Gemm& g);
+
+// GPU + NPU together (plan.md 7.5): VULKANIZER_NPU_SPLIT = the NPU's share of a GEMM (0..0.9; 0, the
+// default: off), only with zero copy (VULKANIZER_NPU=force). One part of C's columns (or rows) goes to
+// the NPU, sized to a kernel it has (at most 10% padding), the rest is a GPU GEMM that runs meanwhile.
+double npuSplit() {
+    const char* e = std::getenv("VULKANIZER_NPU_SPLIT");
+    return e && *e ? std::clamp(std::atof(e), 0.0, 0.9) : 0.0;
+}
+
+// The part of g from column (rows: row) `first`, `count` of them.
+Gemm partOf(const Gemm& g, bool rows, int first, int count) {
+    Gemm p = g;
+    const auto at = [](const void* base, long long elements, cudaDataType t) {
+        return static_cast<const char*>(base) + elements * (long long)typeSize(t);
+    };
+    if (rows) {  // rows of op(A) and C
+        p.a = at(g.a, g.transa == CUBLAS_OP_N ? first : (long long)first * g.lda, g.ta);
+        p.c = const_cast<char*>(at(g.c, first, g.tc));
+        p.m = count;
+    } else {  // columns of op(B) and C
+        p.b = at(g.b, g.transb == CUBLAS_OP_N ? (long long)first * g.ldb : first, g.tb);
+        p.c = const_cast<char*>(at(g.c, (long long)first * g.ldc, g.tc));
+        p.n = count;
+    }
+    return p;
+}
+
+// Returns false (nothing enqueued) when the GEMM is not split; else its status.
+bool runSplit(cublasHandle_t h, const Gemm& g, float alpha, float beta, cublasStatus_t& status) {
+    namespace npu = vulkanizer::npu;
+    const double share = npuSplit();
+    npu::Backend* backend = npu::backend();
+    if (share <= 0 || !g.npu || !backend || g.batch != 1 || g.pointerArrays || !zeroCopyAllowed(*backend)) return false;
+    CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
+    if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return false;
+    // The NPU part: a multiple of 256 columns or rows near the share, whose kernel pads little.
+    const npu::GemmShape whole = npuShape(g);
+    bool rows = false;
+    int count = 0;
+    double best = 1e9;
+    for (const bool r : {false, true}) {
+        const int total = r ? g.m : g.n;
+        for (int c = 256; c + 256 <= total; c += 256) {
+            npu::GemmShape s = whole;
+            (r ? s.m : s.n) = c;
+            const int64_t volume = backend->volume(s);
+            if (volume <= 0 || double(volume) > 1.1 * double(s.m * s.n * s.k)) continue;
+            const double miss = std::fabs(double(c) / total - share);
+            if (miss < best) best = miss, rows = r, count = c;
+        }
+    }
+    if (!count || best > share / 2) return false;
+    const Gemm npuPart = partOf(g, rows, 0, count);
+    Gemm gpuPart = partOf(g, rows, count, (rows ? g.m : g.n) - count);
+    gpuPart.npu = false;
+    const npu::GemmShape s = npuShape(npuPart);
+    std::lock_guard<std::mutex> lock(backend->lockStaging());
+    Staged o;
+    uint64_t token = 0;
+    if (!stage(npuPart, s, *backend, o) || !packNpu(h, npuPart, s, o, 0) ||
+        vulkanizerLaunchHostFuncAsync(h->stream, runNpuStep, const_cast<NpuStep*>(o.step), &token) != CUDA_SUCCESS)
+        return false;  // at most the NPU's buffers were written: the GPU does it all
+    // From here on the NPU run must be waited for, whatever fails
+    status = run(h, gpuPart);
+    const bool joined = vulkanizerStreamWaitHostFunc(h->stream, token) == CUDA_SUCCESS;
+    if (!joined || !epilogueNpu(h, npuPart, o, 0, alpha, beta)) status = CUBLAS_STATUS_EXECUTION_FAILED;
+    VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d -> split: npu (%s) %d %s, gpu the rest", s.transA ? 'T' : 'N',
+                     s.transB ? 'T' : 'N', g.m, g.n, g.k, backend->name(), count, rows ? "rows" : "columns");
+    return true;
+}
+
 cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
     if (g.m < 0 || g.n < 0 || g.k < 0 || g.batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
@@ -443,6 +553,7 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (!scalar(h, g.alpha, g.compute, p.alpha) || !scalar(h, g.beta, g.compute, p.beta))
         return CUBLAS_STATUS_INVALID_VALUE;
     if (g.k > 0) {
+        if (cublasStatus_t status; runSplit(h, g, p.alpha, p.beta, status)) return status;
         const int done = runNpu(h, g, p.alpha, p.beta);
         if (done == g.batch) return CUBLAS_STATUS_SUCCESS;
         if (done > 0) {  // the rest of the batch on the GPU

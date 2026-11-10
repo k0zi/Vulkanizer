@@ -13,12 +13,15 @@
 //    (C is not read when beta is 0).
 // Workgroup 64 x 4. Epilogue: one element per thread, x along i (contiguous in D). Pack: a 64 x 64
 // tile of dst per workgroup (x: 64-column blocks of dst, y: 64-row blocks), transposed through shared
-// memory when kTrans, so that both the reads and the writes are contiguous along x.
+// memory when kTrans, so that both the reads and the writes are contiguous along x; two elements per
+// thread and store (a 16-bit dst needs an even dstLd, as the NPU kernels' sizes are).
 
 layout(local_size_x = 64, local_size_y = 4) in;
 
-layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
-layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
+// Rows addressed once, elements indexed within (cheaper than 64-bit addresses per element)
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32Row { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16Row { uint16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32Row { uint v[]; };
 
 // Device addresses arrive without their top bits (see vk/device.h); the hardware wants them
 // canonical. The device's address bits 63..47 (vk::Device::addressHighBits), specialization constant 5.
@@ -39,13 +42,6 @@ layout(push_constant, std430) uniform Params {
 
 const uint kTrans = 0x10u, kEpilogue = 0x20u;
 const uint kF32 = 0u, kF16 = 1u, kBF16 = 2u;
-
-float load(uint64_t base, int64_t index, uint type) {
-    if (type == kF32) return F32(canon(base + uint64_t(index) * 4ul)).v;
-    const uint bits = uint(U16(canon(base + uint64_t(index) * 2ul)).v);
-    if (type == kBF16) return uintBitsToFloat(bits << 16);
-    return unpackHalf2x16(bits).x;
-}
 
 uint roundToBits(float f, bool brain) {
     const uint u = floatBitsToUint(f);
@@ -71,42 +67,64 @@ uint roundToBits(float f, bool brain) {
     return sign | h;
 }
 
-void store(uint64_t base, int64_t index, uint type, float v) {
-    if (type == kF32) F32(canon(base + uint64_t(index) * 4ul)).v = v;
-    else U16(canon(base + uint64_t(index) * 2ul)).v = uint16_t(roundToBits(v, type == kBF16));
-}
-
 shared float tile[64][65];
+
+// Element i of a row starting at `row` (an address with its top bits)
+float loadRow(uint64_t row, int i, uint type) {
+    if (type == kF32) return F32Row(row).v[i];
+    const uint bits = uint(U16Row(row).v[i]);
+    if (type == kBF16) return uintBitsToFloat(bits << 16);
+    return unpackHalf2x16(bits).x;
+}
 
 void main() {
     const uint typeSrc = p.flags & 3u, typeDst = (p.flags >> 2) & 3u;
     if ((p.flags & kEpilogue) != 0u) {
         const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
         if (x >= p.rows || y >= p.cols) return;
-        const int64_t c = int64_t(x) + int64_t(y) * p.dstLd;
-        float v = p.alpha * load(p.src, int64_t(y) * p.ld + x, typeSrc);
-        if (p.beta != 0.0) v += p.beta * load(p.dst, c, typeDst);
-        store(p.dst, c, typeDst, v);
+        const uint esrc = typeSrc == kF32 ? 4u : 2u, edst = typeDst == kF32 ? 4u : 2u;
+        float v = p.alpha * loadRow(canon(p.src + uint64_t(int64_t(y) * p.ld) * esrc), x, typeSrc);
+        const uint64_t col = canon(p.dst + uint64_t(int64_t(y) * p.dstLd) * edst);
+        if (p.beta != 0.0) v += p.beta * loadRow(col, x, typeDst);
+        if (typeDst == kF32) F32Row(col).v[x] = v;
+        else U16Row(col).v[x] = uint16_t(roundToBits(v, typeDst == kBF16));
         return;
     }
+    // Pack: a 64 x 64 tile of dst (rows c0.., columns r0..). Each thread writes two adjacent columns
+    // (r, r + 1) of rows ty * 2 + tx / 32 + 8 * i: the kernel's buffers have even widths (dstLd).
     const int tx = int(gl_LocalInvocationID.x), ty = int(gl_LocalInvocationID.y);
     const int r0 = int(gl_WorkGroupID.x) * 64, c0 = int(gl_WorkGroupID.y) * 64;
     const bool trans = (p.flags & kTrans) != 0u;
-    if (trans) {  // op(X)[r][c] = X[c + r * ld]: read along c, write along r
+    const uint esrc = typeSrc == kF32 ? 4u : 2u, edst = typeDst == kF32 ? 4u : 2u;
+    if (trans) {  // op(X)[r][c] = X[c + r * ld]: read along c into tile[r - r0][c - c0]
         for (int j = ty; j < 64; j += 4) {
             const int r = r0 + j, c = c0 + tx;
-            tile[j][tx] = r < p.rows && c < p.cols ? load(p.src, int64_t(c) + int64_t(r) * p.ld, typeSrc) : 0.0;
+            float v = 0.0;
+            if (r < p.rows && c < p.cols) v = loadRow(canon(p.src + uint64_t(int64_t(r) * p.ld) * esrc), c, typeSrc);
+            tile[j][tx] = v;
         }
         barrier();
     }
-    const int r = r0 + tx;
+    const int pair = tx & 31, r = r0 + pair * 2;
     if (int64_t(r) >= p.dstLd) return;
-    for (int j = ty; j < 64; j += 4) {
+    for (int j = ty * 2 + (tx >> 5); j < 64; j += 8) {
         const int c = c0 + j;
         if (c >= p.dstRows) break;
-        float v;
-        if (trans) v = tile[tx][j];
-        else v = r < p.rows && c < p.cols ? load(p.src, int64_t(r) + int64_t(c) * p.ld, typeSrc) : 0.0;
-        store(p.dst, int64_t(c) * p.dstLd + r, typeDst, v);
+        float v0 = 0.0, v1 = 0.0;
+        if (trans) {
+            v0 = tile[pair * 2][j], v1 = tile[pair * 2 + 1][j];
+        } else if (c < p.cols) {
+            const uint64_t col = canon(p.src + uint64_t(int64_t(c) * p.ld) * esrc);
+            if (r < p.rows) v0 = loadRow(col, r, typeSrc);
+            if (r + 1 < p.rows) v1 = loadRow(col, r + 1, typeSrc);
+        }
+        const uint64_t row = canon(p.dst + uint64_t(int64_t(c) * p.dstLd) * edst);
+        if (typeDst == kF32) {
+            F32Row(row).v[r] = v0;
+            if (int64_t(r + 1) < p.dstLd) F32Row(row).v[r + 1] = v1;
+        } else {
+            const bool brain = typeDst == kBF16;
+            U32Row(row).v[r >> 1] = roundToBits(v0, brain) | roundToBits(v1, brain) << 16;
+        }
     }
 }

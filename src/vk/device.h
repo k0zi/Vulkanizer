@@ -191,6 +191,13 @@ public:
     // time, in order. `fn` must not wait for device work recorded after it. Without timeline
     // semaphores (or with CUDA_LAUNCH_BLOCKING=1) it waits for the work and runs `fn` here.
     VkResult enqueueHost(std::function<void()> fn);
+    // The same in two parts, for host work running alongside the device: startHost runs `fn` once the
+    // work recorded so far has executed, without holding up the work recorded afterwards; joinHost
+    // makes the work recorded after it wait for `fn` (token from startHost). Every start needs a join
+    // (until then finish() does not wait for `fn`). Without timeline semaphores startHost runs `fn`
+    // at once (after waiting) and joinHost does nothing.
+    VkResult startHost(std::function<void()> fn, uint64_t& token);
+    VkResult joinHost(uint64_t token);
 
     // GPU timestamps (for CUDA events). Slots come from a fixed pool; -1 if unsupported.
     int32_t allocateTimestamp();
@@ -285,7 +292,7 @@ private:
     };
     VkSemaphore progress_ = VK_NULL_HANDLE, hostSteps_ = VK_NULL_HANDLE;
     uint64_t hostStepValue_ = 0;
-    uint64_t hostWait_ = 0;  // the open batch waits for hostSteps_ >= this when submitted (0: none)
+    uint64_t hostWait_ = 0;  // the next batch submitted waits for hostSteps_ >= this (0: none)
     std::mutex hostMutex_;
     std::condition_variable hostCv_;
     std::deque<HostStep> hostQueue_;

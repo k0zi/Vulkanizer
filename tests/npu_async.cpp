@@ -1,7 +1,7 @@
 // Asynchronous NPU GEMMs (plan.md 7.4) on the host reference backend, slowed down
 // (VULKANIZER_NPU=force, VULKANIZER_NPU_BACKEND=cpu, VULKANIZER_NPU_CPU_DELAY_MS): the cuBLAS call
 // returns before the NPU run, and everything after it in stream order (events, other streams, a
-// captured graph) sees the result.
+// captured graph) sees the result; split GEMMs (GPU + NPU together) are right.
 
 #include "test_util.h"
 
@@ -161,6 +161,44 @@ int main() {
         }
         CHECK_CU(cuGraphExecDestroy(exec));
         CHECK_CU(cuGraphDestroy(graph));
+    }
+
+    // 4. GPU + NPU split (7.5): a share of C's columns (rows, when the columns are too few) on the
+    //    NPU, the rest on the GPU meanwhile; general shapes, transposes and beta, against a host GEMM.
+    {
+        setenv("VULKANIZER_NPU_SPLIT", "0.5", 1);
+        struct Case { cublasOperation_t ta, tb; int m, n, k; };
+        for (const Case c : {Case{CUBLAS_OP_N, CUBLAS_OP_N, 300, 768, 40}, Case{CUBLAS_OP_T, CUBLAS_OP_N, 768, 300, 40},
+                             Case{CUBLAS_OP_N, CUBLAS_OP_T, 520, 600, 33}}) {
+            const int lda = (c.ta == CUBLAS_OP_N ? c.m : c.k) + 3, ldb = (c.tb == CUBLAS_OP_N ? c.k : c.n) + 1, ldc = c.m + 2;
+            const int colsA = c.ta == CUBLAS_OP_N ? c.k : c.m, colsB = c.tb == CUBLAS_OP_N ? c.n : c.k;
+            const std::vector<float> ha = values(lda * colsA, 5), hb = values(ldb * colsB, 6), hc = values(ldc * c.n, 7);
+            const CUdeviceptr pa = upload(ha), pb = upload(hb), pc = upload(hc);
+            const float alpha = 2.0f, beta = -1.0f;
+            const auto t0 = std::chrono::steady_clock::now();
+            CHECK_BLAS(cublasGemmEx(h1, c.ta, c.tb, c.m, c.n, c.k, &alpha, reinterpret_cast<void*>(pa), CUDA_R_32F, lda,
+                                    reinterpret_cast<void*>(pb), CUDA_R_32F, ldb, &beta, reinterpret_cast<void*>(pc),
+                                    CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT));
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            EXPECT(ms < delayMs / 2);
+            EXPECT_CU(CUDA_ERROR_NOT_READY, cuStreamQuery(s1));  // the NPU part is running
+            CHECK_CU(cuStreamSynchronize(s1));
+            const std::vector<float> got = download(pc, size_t(ldc) * c.n);
+            for (int j = 0; j < c.n; ++j)
+                for (int i = 0; i < c.m; ++i) {
+                    float sum = 0;
+                    for (int p = 0; p < c.k; ++p) {
+                        const float x = c.ta == CUBLAS_OP_N ? ha[size_t(i + p * lda)] : ha[size_t(p + i * lda)];
+                        const float y = c.tb == CUBLAS_OP_N ? hb[size_t(p + j * ldb)] : hb[size_t(j + p * ldb)];
+                        sum += x * y;
+                    }
+                    EXPECT(got[size_t(i + j * ldc)] == alpha * sum + beta * hc[size_t(i + j * ldc)]);
+                }
+            CHECK_CU(cuMemFree(pa));
+            CHECK_CU(cuMemFree(pb));
+            CHECK_CU(cuMemFree(pc));
+        }
+        unsetenv("VULKANIZER_NPU_SPLIT");
     }
 
     CHECK_BLAS(cublasDestroy(h1));

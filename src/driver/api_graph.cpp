@@ -496,6 +496,25 @@ CUresult CUDAAPI cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void* userData)
     // On a worker thread, after the stream's work so far; the stream's later work waits for it.
     return toCuResult(s.dev->enqueueHost([fn, userData] { fn(userData); }));
 }
+CUresult CUDAAPI vulkanizerLaunchHostFuncAsync(CUstream hStream, CUhostFn fn, void* userData, uint64_t* token) {
+    VULKANIZER_TRACE_API();
+    if (!fn || !token) return CUDA_ERROR_INVALID_VALUE;
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (capturingStream(hStream)) return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
+    return toCuResult(s.dev->startHost([fn, userData] { fn(userData); }, *token));
+}
+
+CUresult CUDAAPI vulkanizerStreamWaitHostFunc(CUstream hStream, uint64_t token) {
+    VULKANIZER_TRACE_API();
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
+    if (capturingStream(hStream)) return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
+    return toCuResult(s.dev->joinHost(token));
+}
+
 CUresult CUDAAPI cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void* userData) {
     return cuLaunchHostFunc(hStream, fn, userData);
 }
