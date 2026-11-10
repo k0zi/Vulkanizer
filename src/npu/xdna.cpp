@@ -28,6 +28,7 @@
 #include <xrt/experimental/xrt_xclbin.h>
 #endif
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -54,12 +55,20 @@ struct KernelFile {
     fs::path xclbin, insts;
 };
 
-// A kernel loaded on the NPU, with its buffers (sized for the kernel's M, K, N).
+// A kernel's operand and result memory (sized for its M, K, N): anonymous pages, which the NPU takes
+// as user pointer buffers and the GPU can import as well (zero copy, plan.md 7.3). Kept for the
+// backend's lifetime, also when the kernel is unloaded: the GPU may have them registered.
+using Pages = std::array<HostPages, 3>;  // lhs, rhs, out
+
+// A kernel loaded on the NPU (a hardware context), with buffers over its Pages.
 struct Loaded {
+    Pages* pages = nullptr;
+    uint64_t lastUse = 0;
     xrt::hw_context context;
     xrt::kernel kernel;
     xrt::bo instr, lhs, rhs, out, tmp, trace;
     uint32_t instrWords = 0;
+    const KernelFile* file = nullptr;
 };
 
 std::optional<DType> parseType(const std::string& s) {
@@ -116,6 +125,55 @@ public:
     }
 
     GemmTimes lastTimes() const override { return times_; }
+
+    bool canStage() const override { return true; }
+
+    bool stage(const GemmShape& s, Staging& st) override {
+        const KernelFile* f = pick(s);
+        if (!f) return false;
+        std::lock_guard<std::mutex> lock(mutex_);
+        try {
+            Loaded& k = load(*f);
+            const Pages& p = *k.pages;
+            st = {f->in, f->out, f->m, f->k, f->n, p[0].data(), p[1].data(), p[2].data(), p[0].size(), p[1].size(),
+                  p[2].size()};
+            return true;
+        } catch (const std::exception& e) {
+            VULKANIZER_ERROR("npu: %s: %s", f->xclbin.filename().c_str(), e.what());
+            return false;
+        }
+    }
+
+    bool runStaged(const Staging& st) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const KernelFile* f = nullptr;
+        for (const KernelFile& file : files_)
+            if (auto it = pages_.find(file.xclbin.string()); it != pages_.end() && it->second[0].data() == st.lhs) f = &file;
+        if (!f) return false;
+        Loaded* k = nullptr;
+        try {
+            k = &load(*f);  // usually loaded by stage(), unless evicted since
+            using Clock = std::chrono::steady_clock;
+            const Clock::time_point t0 = Clock::now();
+            k->lhs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            k->rhs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            const Clock::time_point t1 = Clock::now();
+            xrt::run run = k->kernel(kOpcode, k->instr, k->instrWords, k->lhs, k->rhs, k->out, k->tmp, k->trace);
+            const ert_cmd_state state = run.wait();
+            const Clock::time_point t2 = Clock::now();
+            if (state != ERT_CMD_STATE_COMPLETED) {
+                VULKANIZER_ERROR("npu: %s ended in state %d", k->file->xclbin.filename().c_str(), int(state));
+                return false;
+            }
+            k->out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            const auto sec = [](Clock::duration d) { return std::chrono::duration<double>(d).count(); };
+            times_ = {sec(t1 - t0), sec(t2 - t1), sec(Clock::now() - t2)};
+            return true;
+        } catch (const std::exception& e) {
+            VULKANIZER_ERROR("npu: %s: %s", f->xclbin.filename().c_str(), e.what());
+            return false;
+        }
+    }
 
     bool gemm(const GemmArgs& g) override {
         const GemmShape& s = g.shape;
@@ -200,9 +258,40 @@ private:
         return best;
     }
 
+    // The kernel on the NPU. At most VULKANIZER_NPU_MAX_LOADED (default 4) kernels hold a hardware
+    // context at a time (the NPU has few; other processes use them too), the least recently used
+    // goes first; when the NPU refuses a context, all others are released and it is tried once more.
     Loaded& load(const KernelFile& f) {
-        auto it = loaded_.find(f.xclbin.string());
-        if (it != loaded_.end()) return it->second;
+        const std::string key = f.xclbin.string();
+        if (auto it = loaded_.find(key); it != loaded_.end()) {
+            it->second.lastUse = ++uses_;
+            return it->second;
+        }
+        static const size_t maxLoaded = [] {
+            const char* v = std::getenv("VULKANIZER_NPU_MAX_LOADED");
+            const int n = v ? std::atoi(v) : 0;
+            return size_t(n > 0 ? n : 4);
+        }();
+        while (loaded_.size() >= maxLoaded) evictOldest();
+        try {
+            return loadNew(f, key);
+        } catch (const std::exception& e) {
+            if (loaded_.empty()) throw;
+            VULKANIZER_INFO("npu: %s: %s; unloading the other kernels", f.xclbin.filename().c_str(), e.what());
+            loaded_.clear();
+            return loadNew(f, key);
+        }
+    }
+
+    void evictOldest() {
+        auto oldest = loaded_.begin();
+        for (auto it = loaded_.begin(); it != loaded_.end(); ++it)
+            if (it->second.lastUse < oldest->second.lastUse) oldest = it;
+        VULKANIZER_DEBUG("npu: unloading %s", oldest->second.file->xclbin.filename().c_str());
+        loaded_.erase(oldest);
+    }
+
+    Loaded& loadNew(const KernelFile& f, const std::string& key) {
         xrt::xclbin xclbin(f.xclbin.string());
         std::string kernelName;
         for (const xrt::xclbin::kernel& k : xclbin.get_kernels())
@@ -212,25 +301,42 @@ private:
         xrt::hw_context context(device_, xclbin.get_uuid());
         xrt::kernel kernel(context, kernelName);
         const std::vector<uint32_t> words = readWords(f.insts);
-        Loaded l{context, kernel,
+        auto pit = pages_.find(key);
+        if (pit == pages_.end())
+            pit = pages_
+                      .emplace(key, Pages{HostPages(size_t(f.m * f.k) * dtypeSize(f.in)),
+                                          HostPages(size_t(f.k * f.n) * dtypeSize(f.in)),
+                                          HostPages(size_t(f.m * f.n) * dtypeSize(f.out))})
+                      .first;
+        Pages& pages = pit->second;
+        const auto user = [&](HostPages& p, int arg) {
+            return xrt::bo(device_, p.data(), p.size(), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(arg));
+        };
+        Loaded l{&pages,
+                 ++uses_,
+                 context,
+                 kernel,
                  xrt::bo(device_, words.size() * 4, XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1)),
-                 xrt::bo(device_, size_t(f.m * f.k) * dtypeSize(f.in), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3)),
-                 xrt::bo(device_, size_t(f.k * f.n) * dtypeSize(f.in), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4)),
-                 xrt::bo(device_, size_t(f.m * f.n) * dtypeSize(f.out), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5)),
+                 user(pages[0], 3),
+                 user(pages[1], 4),
+                 user(pages[2], 5),
                  xrt::bo(device_, 1, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(6)),
                  xrt::bo(device_, 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(7)),
-                 uint32_t(words.size())};
+                 uint32_t(words.size()),
+                 &f};
         l.instr.write(words.data());
         l.instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         VULKANIZER_INFO("npu: loaded %s (%lld x %lld x %lld)", f.xclbin.filename().c_str(), (long long)f.m,
                         (long long)f.k, (long long)f.n);
-        return loaded_.emplace(f.xclbin.string(), std::move(l)).first->second;
+        return loaded_.emplace(key, std::move(l)).first->second;
     }
 
     xrt::device device_;
     std::vector<KernelFile> files_;
     std::mutex mutex_;
+    std::map<std::string, Pages> pages_;  // declared before loaded_: outlives the buffers over it
     std::map<std::string, Loaded> loaded_;
+    uint64_t uses_ = 0;
     GemmTimes times_;
 };
 

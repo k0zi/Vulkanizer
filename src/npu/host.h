@@ -7,6 +7,7 @@
 
 #include "npu/npu.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace vulkanizer::npu {
@@ -33,5 +34,25 @@ void zeroPadding(void* dst, size_t elem, int64_t rows, int64_t cols, int64_t ld,
 // when beta is 0 (as in cuBLAS: NaNs in C do not propagate).
 void epilogue(const void* d, DType dt, int64_t dLd, float alpha, float beta, void* c, DType ct, int64_t ldc, int64_t m,
               int64_t n);
+
+// Anonymous, zeroed, page-aligned host memory (mmap), whole pages: what both the NPU driver (user
+// pointer buffers) and Vulkan (VK_EXT_external_memory_host) can import, unlike memory mapped from
+// either driver (zero copy, plan.md 7.3).
+class HostPages {
+public:
+    HostPages() = default;
+    explicit HostPages(size_t bytes);
+    HostPages(HostPages&& o) noexcept;
+    HostPages& operator=(HostPages&& o) noexcept;
+    HostPages(const HostPages&) = delete;
+    HostPages& operator=(const HostPages&) = delete;
+    ~HostPages();
+    void* data() const { return data_; }
+    size_t size() const { return size_; }  // rounded up to pages
+
+private:
+    void* data_ = nullptr;
+    size_t size_ = 0;
+};
 
 }  // namespace vulkanizer::npu

@@ -11,6 +11,7 @@
 #include "npu/npu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <initializer_list>
@@ -58,6 +59,20 @@ const uint32_t kGemvSpirv[] = {
 const uint32_t kTrsmSpirv[] = {
 #include "trsm.comp.inc"
 };
+const uint32_t kNpuSpirv[] = {
+#include "npu.comp.inc"
+};
+
+// Push constants of npu.comp (std430).
+struct NpuParams {
+    uint64_t src, dst;
+    int64_t ld, dstLd;
+    int32_t rows, cols, dstRows;
+    float alpha, beta;
+    uint32_t flags;
+};
+static_assert(sizeof(NpuParams) == 56, "must match npu.comp");
+constexpr uint32_t kNpuTrans = 0x10, kNpuEpilogue = 0x20;
 
 // Push constants of trsm.comp (std430).
 struct TrsmParams {
@@ -143,6 +158,7 @@ struct cublasContext {
     // queried yet) and the subgroup size (a workgroup is 4 subgroups)
     CUfunction gemmCoop[2] = {};
     int coopSize = -1, subgroupSize = 0;
+    CUfunction npu = nullptr;  // npu.comp: packing and epilogue of the zero-copy NPU path
     CUfunction trsm = nullptr;
 };
 
@@ -206,6 +222,7 @@ struct Gemm {
     int batch;
     bool pointerArrays;
     cublasComputeType_t compute;
+    bool npu = true;  // may go to the NPU (false: the GPU rest of a batch the NPU did not finish)
 };
 
 // The device array of output pointers, passed like the matrices (only its address is used).
@@ -251,10 +268,103 @@ cublasStatus_t runF64(cublasHandle_t h, const Gemm& g) {
 // The NPU offload (src/npu, plan.md 7.): a GEMM the policy sends to the NPU, on matrices the host
 // reaches directly (integrated GPUs). Synchronous: waits for the stream, then for the NPU. true:
 // done; false: not taken, the GPU path runs it.
-bool runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
+size_t typeSize(cudaDataType t) { return t == CUDA_R_32F ? 4 : 2; }
+
+uint32_t npuTypeCode(vulkanizer::npu::DType t) {
+    return t == vulkanizer::npu::DType::F32 ? 0 : t == vulkanizer::npu::DType::F16 ? 1 : 2;
+}
+
+// The device address of an NPU staging buffer: registered with the driver on first use (it stays
+// registered, the backend keeps its buffers for the process's lifetime).
+bool stagingAddress(void* host, size_t bytes, CUdeviceptr& out) {
+    static std::mutex mutex;
+    static std::map<void*, CUdeviceptr> registered;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (auto it = registered.find(host); it != registered.end()) return out = it->second, true;
+    if (cuMemHostRegister(host, bytes, CU_MEMHOSTREGISTER_DEVICEMAP) != CUDA_SUCCESS) return false;
+    if (cuMemHostGetDevicePointer(&out, host, 0) != CUDA_SUCCESS) return false;
+    registered[host] = out;
+    return true;
+}
+
+// Grid: packing takes 64 x 64 tiles of dst, the epilogue 64 x 4 elements of C per workgroup.
+bool launchNpu(cublasHandle_t h, const NpuParams& q, unsigned x, unsigned y) {
+    if (!h->npu && vulkanizerCreateSpirvFunction(&h->npu, kNpuSpirv, sizeof kNpuSpirv / 4, "main", sizeof(NpuParams)) !=
+                       CUDA_SUCCESS)
+        return false;
+    size_t size = sizeof q;
+    void* extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, const_cast<NpuParams*>(&q), CU_LAUNCH_PARAM_BUFFER_SIZE, &size,
+                     CU_LAUNCH_PARAM_END};
+    const unsigned rowsPerGroup = (q.flags & kNpuEpilogue) ? 4 : 64;
+    return cuLaunchKernel(h->npu, (x + 63) / 64, (y + rowsPerGroup - 1) / rowsPerGroup, 1, 64, 4, 1, 0, h->stream, nullptr,
+                          extra) == CUDA_SUCCESS;
+}
+
+// Zero copy (plan.md 7.3): per batch entry, the GPU packs op(B)^T and op(A)^T into the NPU kernel's
+// buffers (npu.comp), the NPU runs once the stream is idle, and the GPU writes C from its result.
+// Returns the batch entries done; C of the others is untouched.
+int runNpuStaged(cublasHandle_t h, const Gemm& g, const vulkanizer::npu::GemmShape& s, float alpha, float beta,
+                 vulkanizer::npu::Backend& backend) {
+    namespace npu = vulkanizer::npu;
+    std::lock_guard<std::mutex> lock(backend.lockStaging());
+    npu::Staging st;
+    CUdeviceptr lhs, rhs, result;
+    uint32_t ta, tb, tc;
+    if (!backend.stage(s, st) || !stagingAddress(st.lhs, st.lhsBytes, lhs) || !stagingAddress(st.rhs, st.rhsBytes, rhs) ||
+        !stagingAddress(st.result, st.resultBytes, result) || !typeCode(g.ta, ta) || !typeCode(g.tb, tb) ||
+        !typeCode(g.tc, tc))
+        return 0;
+    const uint32_t in = npuTypeCode(st.in), out = npuTypeCode(st.out);
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    double tPack = 0, tNpu = 0, tEpi = 0;
+    npu::GemmTimes tn{};
+    Clock::time_point t = Clock::now();
+    for (int i = 0; i < g.batch; ++i) {
+        // lhs = op(B)^T: n x k in a st.m x st.k buffer; rhs = op(A)^T: k x m in st.k x st.n
+        NpuParams q{};
+        q.src = uint64_t(g.b) + uint64_t(i * g.strideB) * typeSize(g.tb), q.dst = lhs;
+        q.ld = g.ldb, q.dstLd = st.k, q.rows = g.k, q.cols = g.n, q.dstRows = int32_t(st.m);
+        q.flags = tb | in << 2 | (s.transB ? kNpuTrans : 0);
+        if (!launchNpu(h, q, unsigned(st.k), unsigned(st.m))) return i;
+        q.src = uint64_t(g.a) + uint64_t(i * g.strideA) * typeSize(g.ta), q.dst = rhs;
+        q.ld = g.lda, q.dstLd = st.n, q.rows = g.m, q.cols = g.k, q.dstRows = int32_t(st.k);
+        q.flags = ta | in << 2 | (s.transA ? kNpuTrans : 0);
+        if (!launchNpu(h, q, unsigned(st.n), unsigned(st.k))) return i;
+        // the packing, earlier work on A and B, and the previous entry's epilogue (reads result)
+        if (cuStreamSynchronize(h->stream) != CUDA_SUCCESS) return i;
+        const Clock::time_point t1 = Clock::now();
+        tPack += ms(t, t1);  // incl. the previous entry's epilogue
+        if (!backend.runStaged(st)) {
+            VULKANIZER_WARN_ONCE("cublas: the %s NPU backend failed a GEMM, running it on the GPU", backend.name());
+            return i;
+        }
+        t = Clock::now();
+        tNpu += ms(t1, t);
+        const npu::GemmTimes bt = backend.lastTimes();
+        tn.pack += bt.pack, tn.run += bt.run, tn.epilogue += bt.epilogue;
+        q = {};
+        q.src = result, q.dst = uint64_t(g.c) + uint64_t(i * g.strideC) * typeSize(g.tc);
+        q.ld = st.n, q.dstLd = g.ldc, q.rows = g.m, q.cols = g.n;
+        q.alpha = alpha, q.beta = beta;
+        q.flags = out | tc << 2 | kNpuEpilogue;
+        if (!launchNpu(h, q, unsigned(g.m), unsigned(g.n))) return i;  // C_i untouched: the GPU redoes it
+    }
+    // The last epilogue reads result, which the next GEMM (any stream) may overwrite: wait for it
+    // (7.4: no wait). A failure here is the stream's, reported by the application's next sync.
+    cuStreamSynchronize(h->stream);
+    tEpi = ms(t, Clock::now());
+    VULKANIZER_DEBUG("npu zero copy: gpu pack %.3f ms, npu %.3f ms (sync in %.3f, run %.3f, sync out %.3f), gpu epilogue %.3f ms",
+                     tPack, tNpu, tn.pack * 1e3, tn.run * 1e3, tn.epilogue * 1e3, tEpi);
+    return g.batch;
+}
+
+// The GEMM on the NPU when the policy says so (plan.md 7.). Returns the batch entries done there
+// (0: none, everything stays on the GPU; less than g.batch: the rest goes to the GPU).
+int runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
     namespace npu = vulkanizer::npu;
     npu::Backend* backend = npu::backend();
-    if (!backend || g.pointerArrays || g.strideA < 0 || g.strideB < 0 || g.strideC < 0) return false;
+    if (!g.npu || !backend || g.pointerArrays || g.strideA < 0 || g.strideB < 0 || g.strideC < 0) return 0;
     const auto dtype = [](cudaDataType t) {
         return t == CUDA_R_32F ? npu::DType::F32 : t == CUDA_R_16F ? npu::DType::F16 : npu::DType::BF16;
     };
@@ -265,35 +375,49 @@ bool runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
     s.a = dtype(g.ta), s.b = dtype(g.tb), s.c = dtype(g.tc);
     s.reducedPrecision = g.compute == CUBLAS_COMPUTE_32F_FAST_16BF;
     // Each operand's host address over all its batches: column-major rows x cols, leading dimension ld.
-    const auto host = [&](const void* p, cudaDataType t, long long rows, long long cols, int ld, long long stride, void*& out) {
-        const size_t elem = t == CUDA_R_32F ? 4 : 2;
-        const size_t bytes = size_t((g.batch - 1) * stride + (cols - 1) * ld + rows) * elem;
+    void *ha = nullptr, *hb = nullptr, *hc = nullptr;
+    const auto host = [&](const void* p, cudaDataType t, long long rows, long long cols, int ld, long long stride,
+                          void*& out) {
+        const size_t bytes = size_t((g.batch - 1) * stride + (cols - 1) * ld + rows) * typeSize(t);
         int cached = 0;
         if (vulkanizerGetHostPointer(CUdeviceptr(p), bytes, &out, &cached) != CUDA_SUCCESS) return false;
         s.cached = s.cached && cached;
         return true;
     };
-    void *ha, *hb, *hc;
-    if (!host(g.a, g.ta, s.transA ? g.k : g.m, s.transA ? g.m : g.k, g.lda, g.strideA, ha) ||
-        !host(g.b, g.tb, s.transB ? g.n : g.k, s.transB ? g.k : g.n, g.ldb, g.strideB, hb) ||
-        !host(g.c, g.tc, g.m, g.n, g.ldc, g.strideC, hc))
-        return false;
-    if (npu::route(s, npu::mode(), npu::policy(), backend->volume(s)) != npu::Target::Npu) return false;
+    const bool mapped = host(g.a, g.ta, s.transA ? g.k : g.m, s.transA ? g.m : g.k, g.lda, g.strideA, ha) &&
+                        host(g.b, g.tb, s.transB ? g.n : g.k, s.transB ? g.k : g.n, g.ldb, g.strideB, hb) &&
+                        host(g.c, g.tc, g.m, g.n, g.ldc, g.strideC, hc);
+    s.cached = s.cached && mapped;
+    // Zero copy (the GPU packs, the host never reads the operands, which need not be host-mapped) only
+    // with VULKANIZER_NPU=force: it was slower than the GPU on every shape measured (plan.md 7.3), while
+    // the auto mode's wins are cached host operands on the copying path (7.2). VULKANIZER_NPU_ZERO_COPY=0
+    // forces the copying path.
+    const char* zc = std::getenv("VULKANIZER_NPU_ZERO_COPY");
+    const npu::Mode mode = npu::mode();
+    const bool zeroCopy = mode == npu::Mode::Force && backend->canStage() && !(zc && !std::strcmp(zc, "0"));
+    if (!zeroCopy && !mapped) return 0;
+    if (npu::route(s, mode, npu::policy(), backend->volume(s)) != npu::Target::Npu) return 0;
     CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
-    if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return false;
+    if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return 0;
+    if (zeroCopy) {
+        const int done = runNpuStaged(h, g, s, alpha, beta, *backend);
+        VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d batch %d -> npu (%s, zero copy, %d done)", s.transA ? 'T' : 'N',
+                         s.transB ? 'T' : 'N', g.m, g.n, g.k, g.batch, backend->name(), done);
+        return done;
+    }
     if (!s.cached) VULKANIZER_WARN_ONCE("cublas: NPU operands in write-combined memory: slow host reads");
     a.alpha = alpha, a.beta = beta;
     a.a = ha, a.lda = g.lda, a.strideA = g.strideA;
     a.b = hb, a.ldb = g.ldb, a.strideB = g.strideB;
     a.c = hc, a.ldc = g.ldc, a.strideC = g.strideC;
-    if (cuStreamSynchronize(h->stream) != CUDA_SUCCESS) return false;  // earlier GPU writes to A, B, C
+    if (cuStreamSynchronize(h->stream) != CUDA_SUCCESS) return 0;  // earlier GPU writes to A, B, C
     if (!backend->gemm(a)) {
         VULKANIZER_WARN_ONCE("cublas: the %s NPU backend failed a GEMM, running it on the GPU", backend->name());
-        return false;
+        return 0;
     }
     VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d batch %d -> npu (%s)", s.transA ? 'T' : 'N', s.transB ? 'T' : 'N', g.m, g.n,
                      g.k, g.batch, backend->name());
-    return true;
+    return g.batch;
 }
 
 cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
@@ -309,7 +433,19 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     GemmParams p{};
     if (!scalar(h, g.alpha, g.compute, p.alpha) || !scalar(h, g.beta, g.compute, p.beta))
         return CUBLAS_STATUS_INVALID_VALUE;
-    if (g.k > 0 && runNpu(h, g, p.alpha, p.beta)) return CUBLAS_STATUS_SUCCESS;
+    if (g.k > 0) {
+        const int done = runNpu(h, g, p.alpha, p.beta);
+        if (done == g.batch) return CUBLAS_STATUS_SUCCESS;
+        if (done > 0) {  // the rest of the batch on the GPU
+            Gemm rest = g;
+            rest.a = static_cast<const char*>(g.a) + done * g.strideA * (long long)typeSize(g.ta);
+            rest.b = static_cast<const char*>(g.b) + done * g.strideB * (long long)typeSize(g.tb);
+            rest.c = static_cast<char*>(g.c) + done * g.strideC * (long long)typeSize(g.tc);
+            rest.batch = g.batch - done;
+            rest.npu = false;
+            return run(h, rest);
+        }
+    }
     p.a = reinterpret_cast<uint64_t>(g.a);
     p.b = reinterpret_cast<uint64_t>(g.b);
     p.c = reinterpret_cast<uint64_t>(g.c);

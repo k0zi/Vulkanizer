@@ -1,0 +1,112 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// The GPU side of the zero-copy NPU path (plan.md 7.3), one batch entry per dispatch:
+//  - pack (default): an operand into the NPU kernel's buffer, dst[c * dstLd + r] = op(X)[r][c] for
+//    op(X) rows x cols (X column-major, leading dimension ld; op = transpose with kTrans), zero for
+//    r >= rows or c >= cols, over the whole dstRows x dstLd buffer (row-major), converted to dst's type;
+//  - kEpilogue: the NPU's row-major result D (cols x rows, leading dimension ld) into the column-major
+//    C (rows x cols, leading dimension dstLd): C[i + j * dstLd] = alpha * D[j * ld + i] + beta * C[..]
+//    (C is not read when beta is 0).
+// Workgroup 64 x 4. Epilogue: one element per thread, x along i (contiguous in D). Pack: a 64 x 64
+// tile of dst per workgroup (x: 64-column blocks of dst, y: 64-row blocks), transposed through shared
+// memory when kTrans, so that both the reads and the writes are contiguous along x.
+
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
+
+// Device addresses arrive without their top bits (see vk/device.h); the hardware wants them
+// canonical. The device's address bits 63..47 (vk::Device::addressHighBits), specialization constant 5.
+layout(constant_id = 5) const uint kAddressHigh = 0xFFFF8000u;
+uint64_t canon(uint64_t a) {  // on the high word alone
+    uvec2 w = unpackUint2x32(a);
+    w.y |= kAddressHigh;
+    return packUint2x32(w);
+}
+
+layout(push_constant, std430) uniform Params {
+    uint64_t src, dst;
+    int64_t ld, dstLd;
+    int rows, cols, dstRows;
+    float alpha, beta;
+    uint flags;  // typeSrc | typeDst << 2 | kTrans | kEpilogue
+} p;
+
+const uint kTrans = 0x10u, kEpilogue = 0x20u;
+const uint kF32 = 0u, kF16 = 1u, kBF16 = 2u;
+
+float load(uint64_t base, int64_t index, uint type) {
+    if (type == kF32) return F32(canon(base + uint64_t(index) * 4ul)).v;
+    const uint bits = uint(U16(canon(base + uint64_t(index) * 2ul)).v);
+    if (type == kBF16) return uintBitsToFloat(bits << 16);
+    return unpackHalf2x16(bits).x;
+}
+
+uint roundToBits(float f, bool brain) {
+    const uint u = floatBitsToUint(f);
+    if (brain) return isnan(f) ? 0x7FC0u : (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+    // f32 -> f16, round to nearest even
+    const uint sign = (u >> 16) & 0x8000u, a = u & 0x7FFFFFFFu;
+    if (a > 0x7F800000u) return sign | 0x7E00u;
+    if (a >= 0x477FF000u) return sign | 0x7C00u;
+    uint h;
+    if (a < 0x38800000u) {  // subnormal half
+        const uint e = a >> 23;
+        if (e < 102u) return sign;
+        const uint mant = (a & 0x7FFFFFu) | 0x800000u, s = 126u - e;
+        h = mant >> s;
+        const uint rem = mant & ((1u << s) - 1u), half_ = 1u << (s - 1u);
+        if (rem > half_ || (rem == half_ && (h & 1u) != 0u)) ++h;
+    } else {
+        const uint x = a - (112u << 23);
+        h = x >> 13;
+        const uint rem = x & 0x1FFFu;
+        if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) ++h;
+    }
+    return sign | h;
+}
+
+void store(uint64_t base, int64_t index, uint type, float v) {
+    if (type == kF32) F32(canon(base + uint64_t(index) * 4ul)).v = v;
+    else U16(canon(base + uint64_t(index) * 2ul)).v = uint16_t(roundToBits(v, type == kBF16));
+}
+
+shared float tile[64][65];
+
+void main() {
+    const uint typeSrc = p.flags & 3u, typeDst = (p.flags >> 2) & 3u;
+    if ((p.flags & kEpilogue) != 0u) {
+        const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+        if (x >= p.rows || y >= p.cols) return;
+        const int64_t c = int64_t(x) + int64_t(y) * p.dstLd;
+        float v = p.alpha * load(p.src, int64_t(y) * p.ld + x, typeSrc);
+        if (p.beta != 0.0) v += p.beta * load(p.dst, c, typeDst);
+        store(p.dst, c, typeDst, v);
+        return;
+    }
+    const int tx = int(gl_LocalInvocationID.x), ty = int(gl_LocalInvocationID.y);
+    const int r0 = int(gl_WorkGroupID.x) * 64, c0 = int(gl_WorkGroupID.y) * 64;
+    const bool trans = (p.flags & kTrans) != 0u;
+    if (trans) {  // op(X)[r][c] = X[c + r * ld]: read along c, write along r
+        for (int j = ty; j < 64; j += 4) {
+            const int r = r0 + j, c = c0 + tx;
+            tile[j][tx] = r < p.rows && c < p.cols ? load(p.src, int64_t(c) + int64_t(r) * p.ld, typeSrc) : 0.0;
+        }
+        barrier();
+    }
+    const int r = r0 + tx;
+    if (int64_t(r) >= p.dstLd) return;
+    for (int j = ty; j < 64; j += 4) {
+        const int c = c0 + j;
+        if (c >= p.dstRows) break;
+        float v;
+        if (trans) v = tile[tx][j];
+        else v = r < p.rows && c < p.cols ? load(p.src, int64_t(r) + int64_t(c) * p.ld, typeSrc) : 0.0;
+        store(p.dst, int64_t(c) * p.dstLd + r, typeDst, v);
+    }
+}

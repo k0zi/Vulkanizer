@@ -6,6 +6,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 
 namespace vulkanizer::npu {
 
@@ -38,7 +40,17 @@ Mode parseMode(const char* value) {
 }
 
 Mode mode() {
-    static const Mode m = parseMode(std::getenv("VULKANIZER_NPU"));
+    static std::mutex mutex;
+    static std::string last;
+    static Mode m = Mode::Off;
+    static bool parsed = false;
+    const char* v = std::getenv("VULKANIZER_NPU");
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!parsed || last != (v ? v : "")) {
+        last = v ? v : "";
+        m = parseMode(v);
+        parsed = true;
+    }
     return m;
 }
 

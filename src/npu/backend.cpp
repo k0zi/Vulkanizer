@@ -6,6 +6,7 @@
 #include "common/log.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -48,9 +49,45 @@ public:
         return true;
     }
 
+    // Zero copy on the host: f32 buffers of exactly the shape (lhs n x k, rhs k x m, result n x m),
+    // grown as needed. Buffers handed out earlier stay valid: they are kept until the backend goes.
+    bool canStage() const override { return true; }
+
+    bool stage(const GemmShape& s, Staging& out) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t lhs = size_t(s.n * s.k) * 4, rhs = size_t(s.k * s.m) * 4, result = size_t(s.n * s.m) * 4;
+        if (staged_.empty() || staged_.back()[0].size() < lhs || staged_.back()[1].size() < rhs ||
+            staged_.back()[2].size() < result)
+            staged_.push_back({HostPages(lhs), HostPages(rhs), HostPages(result)});
+        const auto& b = staged_.back();
+        out = {DType::F32, DType::F32, s.n, s.k, s.m, b[0].data(), b[1].data(), b[2].data(), b[0].size(), b[1].size(),
+               b[2].size()};
+        return true;
+    }
+
+    bool runStaged(const Staging& st) override {
+        // VULKANIZER_NPU_CPU_FAIL_AT=n (tests): the n-th run fails, for the GPU fallback of a batch's rest
+        if (const char* f = std::getenv("VULKANIZER_NPU_CPU_FAIL_AT"); f && ++runs_ == std::atoi(f)) return false;
+        const auto* l = static_cast<const float*>(st.lhs);
+        const auto* r = static_cast<const float*>(st.rhs);
+        auto* o = static_cast<float*>(st.result);
+        for (int64_t i = 0; i < st.m; ++i) {
+            float* row = o + i * st.n;
+            std::fill(row, row + st.n, 0.0f);
+            for (int64_t p = 0; p < st.k; ++p) {
+                const float x = l[i * st.k + p];
+                const float* rr = r + p * st.n;
+                for (int64_t j = 0; j < st.n; ++j) row[j] += x * rr[j];
+            }
+        }
+        return true;
+    }
+
 private:
     std::mutex mutex_;
     std::vector<float> lhs_, rhs_, out_;
+    std::vector<std::array<HostPages, 3>> staged_;
+    int runs_ = 0;
 };
 
 std::unique_ptr<Backend> create() {

@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,7 @@ namespace vulkanizer::npu {
 // (everything the backend supports, regardless of size).
 enum class Mode { Off, Auto, Force };
 Mode parseMode(const char* value);
-Mode mode();  // parsed once from VULKANIZER_NPU
+Mode mode();  // from VULKANIZER_NPU, re-read when it changes (a process may switch it, e.g. the benchmark)
 
 enum class Vendor { AmdXdna, IntelVpu, Unknown };
 
@@ -83,6 +84,18 @@ Target route(const GemmShape& shape, Mode mode, const Policy& policy, int64_t vo
 // Where the time of one gemm() went, in seconds: packing the operands into the device's layout and
 // type (incl. zero padding and the copy to the device), the device run, and writing C (copy back,
 // alpha / beta).
+// Zero-copy operation (plan.md 7.3): the kernel's own buffers, in host memory that the NPU and the GPU
+// both map (anonymous pages: the NPU driver takes them as user pointer buffers, Vulkan through
+// VK_EXT_external_memory_host). The GPU packs the operands into lhs / rhs (row-major lhs m x k, rhs
+// k x n of type `in`, zero padded) and reads the result (m x n of type `out`); for C^T =
+// op(B)^T op(A)^T, lhs takes op(B)^T and rhs op(A)^T (see host.h).
+struct Staging {
+    DType in = DType::BF16, out = DType::F32;
+    int64_t m = 0, k = 0, n = 0;
+    void *lhs = nullptr, *rhs = nullptr, *result = nullptr;
+    size_t lhsBytes = 0, rhsBytes = 0, resultBytes = 0;  // page multiples
+};
+
 struct GemmTimes {
     double pack = 0, run = 0, epilogue = 0;
 };
@@ -95,11 +108,22 @@ public:
     // shape is not supported.
     virtual int64_t volume(const GemmShape& shape) const = 0;
     bool supports(const GemmShape& shape) const { return volume(shape) > 0; }
-    // The breakdown of the last successful gemm() (zeros if the backend does not measure).
+    // The breakdown of the last successful gemm() or runStaged() (zeros if the backend does not measure).
     virtual GemmTimes lastTimes() const { return {}; }
+    // Zero copy: whether the backend has stage() / runStaged(); stage() picks the kernel for one batch
+    // entry of `shape` and returns its buffers (they stay valid for the backend's lifetime), runStaged()
+    // runs it on what the caller put into them. The caller serializes stage..runStaged..reading out
+    // against other users of the backend through lockStaging().
+    virtual bool canStage() const { return false; }
+    virtual bool stage(const GemmShape& shape, Staging& out) { return false; }
+    virtual bool runStaged(const Staging& staging) { return false; }
+    std::mutex& lockStaging() { return stagingMutex_; }
     // Runs the GEMM on host-addressable memory and returns when C is written; false: not done
     // (C untouched), the caller falls back to the GPU.
     virtual bool gemm(const GemmArgs& args) = 0;
+
+private:
+    std::mutex stagingMutex_;
 };
 
 // The process's backend, created on first use: nullptr with VULKANIZER_NPU=off, without an NPU

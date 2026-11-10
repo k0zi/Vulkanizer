@@ -52,6 +52,14 @@ set_tests_properties(cublas_coopmat PROPERTIES ENVIRONMENT "VULKANIZER_COOPMAT=1
 # the same with every GEMM the NPU hook takes on the host reference backend (plan.md 7.)
 add_test(NAME cublas_npu COMMAND cublas)
 set_tests_properties(cublas_npu PROPERTIES ENVIRONMENT "VULKANIZER_NPU=force;VULKANIZER_NPU_BACKEND=cpu")
+# ... through the host copying path instead of zero copy (7.1 / 7.3)
+add_test(NAME cublas_npu_copy COMMAND cublas)
+set_tests_properties(cublas_npu_copy PROPERTIES ENVIRONMENT
+  "VULKANIZER_NPU=force;VULKANIZER_NPU_BACKEND=cpu;VULKANIZER_NPU_ZERO_COPY=0")
+# ... with the 14th NPU run failing: the 4th entry of the first batched GEMM (batch 7), whose rest goes to the GPU
+add_test(NAME cublas_npu_fail COMMAND cublas)
+set_tests_properties(cublas_npu_fail PROPERTIES ENVIRONMENT
+  "VULKANIZER_NPU=force;VULKANIZER_NPU_BACKEND=cpu;VULKANIZER_NPU_CPU_FAIL_AT=14")
 vulkanizer_cuda_test(cusolver)
 target_link_libraries(cusolver PRIVATE vulkanizer_cusolver)
 vulkanizer_cuda_test(cufft)

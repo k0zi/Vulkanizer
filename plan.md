@@ -60,7 +60,7 @@ Hátra, javasolt sorrendben:
 3. Nyitott részfeladat: külön copy queue (5.4) – integrált GPU-n és GPU-korlátos tg mellett kevés haszonnal.
 4. **6. fázis**: a korlátok feloldása (PyTorch/ComfyUI → bináris kompatibilitás → teljesítmény → teljesség); a nem
    clean-room feladatok külön, eltéve: [plan_non_clean.md](plan_non_clean.md).
-5. **7. fázis**: NPU offload (2026-11-10: váz, XDNA bring-up és mérés kész; következik a 7.3 zero-copy).
+5. **7. fázis**: NPU offload (2026-11-10: váz, XDNA bring-up, mérés és zero-copy kész; következik a 7.4 aszinkron végrehajtás).
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -887,7 +887,7 @@ GLSL GEMM kernelek            vulkanizerGetHostPointer (A, B, C host címe, UMA)
 | Alapértelmezés | `VULKANIZER_NPU=off`: a 7.2 mérése szerint a másolós út a GPU memóriájából sosem nyer; a 7.3 után újramérni, és ha ott nyer, `auto` |
 | Pontosság | f32 bemenet csak `CUBLAS_COMPUTE_32F_FAST_16BF` mellett megy bf16-ra; f16 bemenet csak f16-os kernellel (a bf16-nak 3 bittel kevesebb mantisszája van); egyébként GPU |
 | Elrendezés | A cuBLAS oszlopfolytonos, az NPU-kernelek sorfolytonosak: C^T = op(B)^T op(A)^T (lhs n×k, rhs k×m, eredmény n×m), alpha/beta a hoston (`npu/host.h`) |
-| Memória | 7.1: másolás a host címről (integrált GPU: a Vulkan memória host-visible) XRT bufferekbe; 7.3: dma-buf, CPU nélkül |
+| Memória | 7.1: másolás a host címről (integrált GPU: a Vulkan memória host-visible) XRT bufferekbe; 7.3: a kernel bufferei anonim lapok, amelyeket az XRT userptr BO-ként, a GPU `cuMemHostRegister`-rel (`VK_EXT_external_memory_host`) lát; a csomagolás és az epilógus GPU-shader (`force` mód) |
 | Szinkron | 7.1: `cuStreamSynchronize`, majd blokkoló NPU-futás (stream capture alatt GPU); 7.4: aszinkron, timeline semaphore-ral |
 | Kernelek | mlir-aie (IRON) által előre fordított `xclbin` + utasítás-sorozat méretosztályonként, a repón kívül (`VULKANIZER_NPU_KERNELS`); a legkisebb, amibe belefér, nullákkal kitöltve |
 | Build | Az XRT opcionális: `-DVULKANIZER_NPU_XRT=ON` (`find_package(XRT)`); nélküle csak a felderítés, a policy és a CPU-referencia fordul |
@@ -974,11 +974,57 @@ GLSL GEMM kernelek            vulkanizerGetHostPointer (A, B, C host címe, UMA)
   - Eltérés a „kész, ha”-tól: az alapértelmezés **`off` marad**. Az `auto` csak cache-elt host-memóriás GEMM-en nyerne,
     ami valódi alkalmazásban ritka, és bekapcsolva minden NPU-s gépen betöltené az XRT-t (kernelek nélkül
     figyelmeztetéssel). A 7.3 után újramérni.
-- [ ] **7.3** Zero-copy: a Vulkan memória dma-buf exportja (`VK_EXT_external_memory_dma_buf`; ma csak `OPAQUE_FD` van,
+- [x] **7.3** Zero-copy (2026-11-10; dma-buf helyett közös anonim lapokkal): a Vulkan memória dma-buf exportja (`VK_EXT_external_memory_dma_buf`; ma csak `OPAQUE_FD` van,
   az IPC-hez) és XRT-importja. Mivel az NPU-kernel sorfolytonos, saját típusú, kitöltött operandust vár, a csomagolás
   (transzponálás, bf16, kitöltés) egy Vulkan shader egy exportált staging bufferbe, az alpha/beta epilógus is shader:
   a CPU kimarad. Kivétel nélküli eset (TN, bf16, ld = K, nincs kitöltés: transformer projekciók) csomagolás nélkül.
   Kész, ha: nincs host-memcpy az úton; mérve a 7.1-hez képest.
+  - Megosztás: kipróbálva (Ryzen AI 9 HX 370, amdxdna, XRT 2.25, RADV): az XRT BO lapjai (DRM mmap) nem importálhatók
+    Vulkanba (`cuMemHostRegister` → `NOT_SUPPORTED`), a Vulkan-leképezett memória (`cuMemAllocHost`) nem lehet XRT userptr
+    BO (`CREATE_BO` → `EFAULT`); közönséges anonim lapokat (`mmap`) viszont mindkettő elfogad. Ezért a kernel bufferei
+    (lhs, rhs, out) `npu::HostPages`-ben vannak, az XRT userptr BO-ként, a cuBLAS `cuMemHostRegister`-rel látja őket
+    (egyszer regisztrálva, a lapok a backend élettartamáig megmaradnak). dma-buf nem kellett.
+  - Interfész: `Backend::canStage / stage / runStaged` (`npu::Staging`: a kernel méretei, típusai, a bufferek címe), a
+    `cpu` backendnek is (f32, pontos méretű bufferek), így NPU nélkül is tesztelhető.
+  - cuBLAS (`runNpuStaged`): batch-elemenként `npu.comp` csomagol (op(B)^T → lhs, op(A)^T → rhs; bf16-ra kerekítve,
+    a kitöltés nullázva, a transzponálás 64×64-es shared-memory csempékben), `cuStreamSynchronize`, `runStaged`,
+    `npu.comp` epilógus (alpha/beta) C-be; a végén még egy szinkron (a result buffert a következő GEMM felülírhatja).
+    Ha egy elem hibázik, a kész elemek maradnak, a batch maradéka a GPU-n fut (`Gemm::npu = false`) – így beta ≠ 0
+    mellett is helyes. A host nem olvassa az operandusokat, ezért nem kell host-leképezett memória sem.
+  - xdna: legfeljebb `VULKANIZER_NPU_MAX_LOADED` (alap 4) kernel tart hardver-kontextust (LRU); ha az NPU nem ad
+    többet (`CREATE_HWCTX` → `EINVAL`, két backenddel egy folyamatban előjött), a többit elengedi és újra próbál.
+  - `mode()` a környezeti változót hívásonként nézi (ha változott, újraolvassa): a mérőeszköz egy folyamaton belül vált.
+  - Tesztek: `cublas_npu` (cpu, zero-copy), `cublas_npu_copy` (cpu, `VULKANIZER_NPU_ZERO_COPY=0`), `cublas_npu_fail`
+    (cpu, `VULKANIZER_NPU_CPU_FAIL_AT=14`: a 7 elemű batch 4. eleme hibázik, 3 NPU + 4 GPU); a teljes készlet (27) zöld,
+    az xdna-val futtatott `cublas*` is.
+  - Mérés (`vulkanizer-npu-bench`, Release, medián ms; zc = `cublasGemmEx` `force` módban, a GPU memóriájából):
+
+    | Alak | GPU | zc | GPU / zc | másolós, wc (7.1) | másolós, pinned (run) |
+    |---|---|---|---|---|---|
+    | 256³ NN | 0,30 | 0,38 | 0,77 | 0,86 | 0,15 (0,10) |
+    | 512³ NN | 0,55 | 0,64 | 0,85 | 3,9 | 0,46 (0,24) |
+    | 1024³ NN | 1,5 | 2,0–4,9 | 0,36–0,75 | 16 | 2,0 (1,1) |
+    | 2048³ NN | 7,3 | 13–23 | 0,32–0,61 | 64 | 12,9 (8,5) |
+    | 4096³ NN | 37 | 80–90 | 0,41 | 264 | 72 (57) |
+    | proj 2048→2048, 512 tok TN | 3,8 | 4,5 | 0,85 | 62 | 10,7 (2,7) |
+    | proj 4096→4096, 512 tok TN | 8,6 | 15 | 0,57 | 227 | 39 (9,4) |
+    | proj 4096→4096, 2048 tok TN | 25 | 43 | 0,58 | 294 | 66 (31) |
+    | attn QKᵀ 32 fej TN | 3,4 | 14,7 | 0,23 | 31 | 8,7 (3,6) |
+    | attn PV 32 fej NN | 3,3 | 13,2 | 0,25 | 79 | 10,1 (5,5) |
+
+    Az eredmény egyezik a GPU-éval (≤ 2e-6 relatív). Debug-bontás (`VULKANIZER_LOG=debug`, „npu zero copy: …”):
+    1024³: GPU-csomagolás ~0,45 ms, NPU ~1,2 ms (ebből XRT sync ~0,12), epilógus ~0,35 ms; 4096×512×4096 TN: csomagolás
+    22 → 5,6 ms a csempés transzponálással.
+  - Tanulságok: (1) a zero-copy a GPU memóriájából 3–15×-ese a 7.1-es másolásnak, a host-memcpy eltűnt. (2) A GPU-nál
+    mégsem gyorsabb: az NPU-futás 1024³ fölött maga is lassabb, alatta pedig a GEMM-enkénti két host-oldali szinkron
+    (csomagolás után, epilógus után) a GPU üresjárata miatt 0,1–1 ms-ot (ritkán 3+ ms-ot) szór – egy azonos második
+    epilógus ugyanígy, tehát nem az NPU-írta memória a lassú. Ezt a 7.4 szünteti meg (szemafor, host-körút nélkül).
+    (3) Batch-elt kis GEMM-eknél elemenként fizetjük ezt: egy batch-elt NPU-kernel kellene (7.6).
+  - Döntés: a zero-copy csak `VULKANIZER_NPU=force` mellett fut (`VULKANIZER_NPU_ZERO_COPY=0`: másolós); az `auto`
+    a 7.2 szabálya szerint marad (cache-elt host-operandus, másolós út, 256³–512³), az alapértelmezés `off`.
+  - Nem készült el: a „csomagolás nélküli” eset (TN, bf16, ld = K): az operandus a Vulkan device memóriájában van, amit
+    az NPU nem lát; ehhez a device memória dma-buf exportja és XRT-importja kellene – csak akkor érdemes, ha a 7.4 után
+    a csomagolás számít.
 - [ ] **7.4** Aszinkron, stream-sorrendű végrehajtás: a `runNpu` nem vár. A stream eddigi munkája egy timeline
   semaphore-értéket jelez, egy NPU-munkaszál erre vár, futtat, majd egy host-oldali `vkSignalSemaphore`-ral enged tovább;
   a stream következő submitja erre vár. Driver-kiterjesztés kell hozzá (pl. `vulkanizerStreamEnqueueExternal`), graph
@@ -1053,6 +1099,9 @@ fix költsége (~100 µs nagyságrend, mérendő) miatt a kis GEMM-ek sosem éri
 | `VULKANIZER_NPU_MIN_MNK` | `auto` módban az NPU-hoz legalább ennyi m·n·k·batch kell (alap: 2^24, egy 256³ GEMM) |
 | `VULKANIZER_NPU_MAX_MNK` | `auto` módban legfeljebb ennyi m·n·k·batch (alap: 2^27, egy 512³ GEMM; fölötte a GPU gyorsabb, 7.2) |
 | `VULKANIZER_NPU_MAX_PADDING` | `auto` módban a kiválasztott kernel m·n·k-ja legfeljebb ennyiszerese a feladaténak (alap: 2) |
+| `VULKANIZER_NPU_ZERO_COPY` | `force` módban a zero-copy út (7.3: a GPU csomagol); `0`: a másolós út (7.1) |
+| `VULKANIZER_NPU_MAX_LOADED` | Egyszerre legfeljebb ennyi NPU-kernel tart hardver-kontextust (alap: 4, LRU) |
+| `VULKANIZER_NPU_CPU_FAIL_AT` | Teszthez: a `cpu` backend n-edik zero-copy futása hibázik (a batch maradékának GPU-tartalékútja) |
 | `VULKANIZER_NPU_MIN_DIM` | `auto` módban m és n legalább ennyi (alap: 64; a mátrix-vektor szorzás GPU-n marad) |
 | `VULKANIZER_NPU_KERNELS` | Az NPU GEMM-kernelek (`gemm_<in>_<out>_<M>x<K>x<N>.xclbin` + `.insts.bin`) könyvtára (alap: `$XDG_DATA_HOME/vulkanizer/npu`) |
 | `VULKANIZER_GEMM_F32` | `1` = a cuBLAS `COMPUTE_16F` GEMM-ek is f32 szorzással futnak (alapból packed f16, ha az eszköz tud f16 aritmetikát) |

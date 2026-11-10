@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 namespace vulkanizer::npu {
@@ -177,6 +180,29 @@ void epilogue(const void* d, DType dt, int64_t dLd, float alpha, float beta, voi
             if (beta != 0) v += beta * load(c, ct, i + j * ldc);
             store(c, ct, i + j * ldc, v);
         }
+}
+
+HostPages::HostPages(size_t bytes) {
+    const size_t page = size_t(sysconf(_SC_PAGESIZE));
+    const size_t size = (std::max<size_t>(bytes, 1) + page - 1) / page * page;
+    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) throw std::bad_alloc();
+    data_ = p, size_ = size;
+}
+
+HostPages::HostPages(HostPages&& o) noexcept : data_(o.data_), size_(o.size_) { o.data_ = nullptr, o.size_ = 0; }
+
+HostPages& HostPages::operator=(HostPages&& o) noexcept {
+    if (this != &o) {
+        this->~HostPages();
+        data_ = o.data_, size_ = o.size_;
+        o.data_ = nullptr, o.size_ = 0;
+    }
+    return *this;
+}
+
+HostPages::~HostPages() {
+    if (data_) munmap(data_, size_);
 }
 
 }  // namespace vulkanizer::npu

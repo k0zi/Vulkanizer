@@ -2,11 +2,12 @@
 //   vulkanizer-npu-bench                      the default shapes
 //   vulkanizer-npu-bench NN 1024 1024 1024 1  one shape: op(A) op(B) m n k batch (cuBLAS, column-major)
 //
-// GPU: cublasGemmEx / cublasGemmStridedBatchedEx on device memory, timed to cuCtxSynchronize.
-// NPU: the backend's gemm() on the host addresses of the same buffers, as the cuBLAS hook does
-// (write-combined on RADV: slow host reads), and again on cached pinned host memory; the NPU time is
-// split into pack (layout, bf16, padding, copy in), run and epilogue (copy out, alpha / beta). GFLOP/s and
-// gpu/np use the faster of the two NPU memories; relerr: max |C_npu - C_gpu| / max |C_gpu|.
+// gpu: cublasGemmEx / cublasGemmStridedBatchedEx on device memory (VULKANIZER_NPU=off), timed to
+// cuCtxSynchronize. zc: the same call with VULKANIZER_NPU=force, i.e. the zero-copy path (plan.md 7.3:
+// the GPU packs into the NPU kernel's buffers and writes C from its result). copy: the host copying
+// path (7.1) through the backend directly, on the host addresses of the device buffers (write-combined
+// on RADV) and on cached pinned memory, the latter split into pack / run / epi (run: the NPU alone).
+// relerr: max |C_zc - C_gpu| / max |C_gpu|.
 // "pad" is the kernel's m * n * k over the shape's. Times are medians, in ms.
 
 #include <cublas_v2.h>
@@ -102,7 +103,9 @@ NpuRun runNpu(npu::Backend& backend, const npu::GemmArgs& args) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    setenv("VULKANIZER_NPU", "off", 1);  // the cuBLAS calls below are the GPU side
+    // cuBLAS creates its NPU backend on the first GEMM, unless the mode is off then.
+    setenv("VULKANIZER_NPU", "force", 1);
+    unsetenv("VULKANIZER_NPU_ZERO_COPY");
     std::vector<Case> cases;
     if (argc == 6) {
         const std::string ops = argv[1];
@@ -150,9 +153,9 @@ int main(int argc, char** argv) {
 
     std::printf("GPU: %s, NPU: %s %s (%s); bf16 x bf16 -> f32, median ms\n", devName, npu::vendorName(devices[0].vendor),
                 devices[0].generation.c_str(), backend->name());
-    std::printf("%-27s %-4s %5s %5s %5s %3s %5s | %8s %7s | %8s %7s | %8s %7s %7s %7s | %7s %6s %8s\n", "case", "op", "m",
-                "n", "k", "b", "pad", "gpu", "GFLOP/s", "npu(wc)", "pack", "npu(pin)", "pack", "run", "epi", "GFLOP/s",
-                "gpu/np", "relerr");
+    std::printf("%-27s %-4s %5s %5s %5s %3s %5s | %8s %7s | %8s %7s %6s | %8s | %8s %7s %7s %7s | %8s\n", "case", "op",
+                "m", "n", "k", "b", "pad", "gpu", "GFLOP/s", "zc", "GFLOP/s", "gpu/zc", "copy(wc)", "copy(pin)", "pack",
+                "run", "epi", "relerr");
 
     std::mt19937 rng(1);
     std::uniform_real_distribution<float> dist(-1, 1);
@@ -174,7 +177,7 @@ int main(int argc, char** argv) {
         CK(cuMemsetD8(dC, 0, bytesC));
 
         const float alpha = 1, beta = 0;
-        const auto gpu = [&] {
+        const auto gemm = [&] {
             const cublasOperation_t ta = c.transA ? CUBLAS_OP_T : CUBLAS_OP_N, tb = c.transB ? CUBLAS_OP_T : CUBLAS_OP_N;
             if (c.batch == 1)
                 CK(cublasGemmEx(handle, ta, tb, c.m, c.n, c.k, &alpha, reinterpret_cast<void*>(dA), CUDA_R_16BF, lda,
@@ -187,10 +190,24 @@ int main(int argc, char** argv) {
                                               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
             CK(cuCtxSynchronize());
         };
-        gpu();
-        const double gpuTime = median(repeat(gpu));
+        // zero copy first: the first GEMM of the process creates cuBLAS's NPU backend
+        setenv("VULKANIZER_NPU", "force", 1);
+        gemm();
+        const double zcTime = median(repeat(gemm));
+        std::vector<float> zcC(sC * c.batch);
+        CK(cuMemcpyDtoH(zcC.data(), dC, bytesC));
+        setenv("VULKANIZER_NPU", "off", 1);
+        CK(cuMemsetD8(dC, 0, bytesC));
+        gemm();
+        const double gpuTime = median(repeat(gemm));
         std::vector<float> gpuC(sC * c.batch);
         CK(cuMemcpyDtoH(gpuC.data(), dC, bytesC));
+        double maxErr = 0, maxRef = 0;
+        for (size_t i = 0; i < zcC.size(); ++i) {
+            maxErr = std::max(maxErr, double(std::fabs(zcC[i] - gpuC[i])));
+            maxRef = std::max(maxRef, double(std::fabs(gpuC[i])));
+        }
+        const double relErr = maxRef > 0 ? maxErr / maxRef : maxErr;
 
         npu::GemmArgs args;
         args.shape = {c.transA, c.transB, c.m, c.n, c.k, c.batch, npu::DType::BF16, npu::DType::BF16, npu::DType::F32, false};
@@ -202,7 +219,6 @@ int main(int argc, char** argv) {
         const double flop = 2.0 * c.m * c.n * c.k * c.batch;
 
         NpuRun wc, pinned;
-        double relErr = -1;
         if (volume > 0) {
             int cached = 0;
             void *hA, *hB, *hC;
@@ -211,16 +227,6 @@ int main(int argc, char** argv) {
             CK(vulkanizerGetHostPointer(dC, bytesC, &hC, &cached));
             args.a = hA, args.b = hB, args.c = hC;
             wc = runNpu(*backend, args);
-            if (wc.ok) {
-                std::vector<float> npuC(sC * c.batch);
-                std::memcpy(npuC.data(), hC, bytesC);
-                double maxErr = 0, maxRef = 0;
-                for (size_t i = 0; i < npuC.size(); ++i) {
-                    maxErr = std::max(maxErr, double(std::fabs(npuC[i] - gpuC[i])));
-                    maxRef = std::max(maxRef, double(std::fabs(gpuC[i])));
-                }
-                relErr = maxRef > 0 ? maxErr / maxRef : maxErr;
-            }
             void *pA, *pB, *pC;
             CK(cuMemAllocHost(&pA, bytesA));
             CK(cuMemAllocHost(&pB, bytesB));
@@ -244,18 +250,21 @@ int main(int argc, char** argv) {
         else
             std::printf("%5s ", "-");
         std::printf("| %8.3f %7.0f | ", gpuTime * 1e3, flop / gpuTime / 1e9);
-        if (!wc.ok) {
-            std::printf("%s\n", volume > 0 ? "npu failed" : "no npu kernel");
+        if (volume <= 0) {
+            std::printf("no npu kernel\n");
             continue;
         }
-        const double best = std::min(wc.total, pinned.ok ? pinned.total : wc.total);
-        std::printf("%8.3f %7.3f | ", wc.total * 1e3, wc.t.pack * 1e3);
+        std::printf("%8.3f %7.0f %6.2f | ", zcTime * 1e3, flop / zcTime / 1e9, gpuTime / zcTime);
+        if (wc.ok)
+            std::printf("%8.3f | ", wc.total * 1e3);
+        else
+            std::printf("%8s | ", "-");
         if (pinned.ok)
             std::printf("%8.3f %7.3f %7.3f %7.3f | ", pinned.total * 1e3, pinned.t.pack * 1e3, pinned.t.run * 1e3,
                         pinned.t.epilogue * 1e3);
         else
             std::printf("%8s %7s %7s %7s | ", "-", "-", "-", "-");
-        std::printf("%7.0f %6.2f %8.1e\n", flop / best / 1e9, gpuTime / best, relErr);
+        std::printf("%8.1e\n", relErr);
     }
     cublasDestroy(handle);
     return 0;
