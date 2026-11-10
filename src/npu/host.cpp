@@ -1,6 +1,8 @@
 #include "npu/host.h"
 
+#include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace vulkanizer::npu {
 
@@ -77,15 +79,98 @@ void store(void* base, DType t, int64_t index, float v) {
     }
 }
 
+namespace {
+
+// Converts n elements from src (type st) to dst (type dt), dst elements dstStride apart.
+void convert(const char* src, DType st, int64_t n, char* dst, DType dt, int64_t dstStride) {
+    const size_t de = dtypeSize(dt);
+    if (st == dt && dstStride == 1) {
+        std::memcpy(dst, src, size_t(n) * de);
+        return;
+    }
+    if (st == dt && de == 2) {
+        const auto* s = reinterpret_cast<const uint16_t*>(src);
+        auto* d = reinterpret_cast<uint16_t*>(dst);
+        for (int64_t i = 0; i < n; ++i) d[i * dstStride] = s[i];
+        return;
+    }
+    if (st == DType::F32 && dt == DType::BF16) {
+        const auto* s = reinterpret_cast<const float*>(src);
+        auto* d = reinterpret_cast<uint16_t*>(dst);
+        for (int64_t i = 0; i < n; ++i) d[i * dstStride] = floatToBf16(s[i]);
+        return;
+    }
+    for (int64_t i = 0; i < n; ++i) store(dst, dt, i * dstStride, load(src, st, i));
+}
+
+}  // namespace
+
+// The source is read in whole contiguous runs (memcpy into a cached scratch buffer first): device
+// memory is often write-combined on the host, where element-wise reads are ~100x slower.
 void packTransposed(const void* x, DType xt, int64_t ld, bool trans, int64_t rows, int64_t cols, void* dst, DType dt,
                     int64_t dstLd) {
-    for (int64_t c = 0; c < cols; ++c)
-        for (int64_t r = 0; r < rows; ++r)
-            store(dst, dt, c * dstLd + r, load(x, xt, trans ? c + r * ld : r + c * ld));
+    const size_t xe = dtypeSize(xt), de = dtypeSize(dt);
+    const char* src = static_cast<const char*>(x);
+    char* out = static_cast<char*>(dst);
+    if (!trans) {  // column c of X is contiguous, and so is row c of dst
+        std::vector<char> tmp(size_t(rows) * xe);
+        for (int64_t c = 0; c < cols; ++c) {
+            const char* col = src + size_t(c * ld) * xe;
+            if (xt == dt) {
+                std::memcpy(out + size_t(c * dstLd) * de, col, size_t(rows) * xe);
+                continue;
+            }
+            std::memcpy(tmp.data(), col, tmp.size());
+            convert(tmp.data(), xt, rows, out + size_t(c * dstLd) * de, dt, 1);
+        }
+        return;
+    }
+    // op(X)[r][c] = X[c + r * ld]: row r of op(X) is a contiguous run of X; blocks of kBlock of them
+    // are read, then written out kBlock contiguous elements of each dst row at a time.
+    constexpr int64_t kBlock = 64;
+    std::vector<char> tmp(size_t(kBlock * cols) * xe);
+    for (int64_t r0 = 0; r0 < rows; r0 += kBlock) {
+        const int64_t nr = std::min(kBlock, rows - r0);
+        for (int64_t r = 0; r < nr; ++r)
+            std::memcpy(tmp.data() + size_t(r * cols) * xe, src + size_t((r0 + r) * ld) * xe, size_t(cols) * xe);
+        if (xt == dt && xe == 2) {  // transpose kBlock x kBlock tiles: both sides stay in L1
+            const auto* t = reinterpret_cast<const uint16_t*>(tmp.data());
+            auto* o = reinterpret_cast<uint16_t*>(out);
+            for (int64_t c0 = 0; c0 < cols; c0 += kBlock)
+                for (int64_t c = c0; c < std::min(cols, c0 + kBlock); ++c)
+                    for (int64_t r = 0; r < nr; ++r) o[c * dstLd + r0 + r] = t[r * cols + c];
+            continue;
+        }
+        for (int64_t c = 0; c < cols; ++c)
+            for (int64_t r = 0; r < nr; ++r)
+                store(out, dt, c * dstLd + r0 + r, load(tmp.data(), xt, r * cols + c));
+    }
+}
+
+void zeroPadding(void* dst, size_t elem, int64_t rows, int64_t cols, int64_t ld, int64_t allRows) {
+    char* d = static_cast<char*>(dst);
+    if (cols < ld)
+        for (int64_t r = 0; r < rows; ++r) std::memset(d + size_t(r * ld + cols) * elem, 0, size_t(ld - cols) * elem);
+    if (rows < allRows) std::memset(d + size_t(rows * ld) * elem, 0, size_t((allRows - rows) * ld) * elem);
 }
 
 void epilogue(const void* d, DType dt, int64_t dLd, float alpha, float beta, void* c, DType ct, int64_t ldc, int64_t m,
               int64_t n) {
+    const size_t de = dtypeSize(dt), ce = dtypeSize(ct);
+    if (beta == 0 && dt == ct && alpha == 1) {
+        for (int64_t j = 0; j < n; ++j)
+            std::memcpy(static_cast<char*>(c) + size_t(j * ldc) * ce, static_cast<const char*>(d) + size_t(j * dLd) * de,
+                        size_t(m) * ce);
+        return;
+    }
+    if (beta == 0 && dt == DType::F32 && ct == DType::F32) {
+        for (int64_t j = 0; j < n; ++j) {
+            const float* s = static_cast<const float*>(d) + j * dLd;
+            float* o = static_cast<float*>(c) + j * ldc;
+            for (int64_t i = 0; i < m; ++i) o[i] = alpha * s[i];
+        }
+        return;
+    }
     for (int64_t j = 0; j < n; ++j)
         for (int64_t i = 0; i < m; ++i) {
             float v = alpha * load(d, dt, j * dLd + i);

@@ -9,3 +9,8 @@ target_link_libraries(vulkanizer-ptxc PRIVATE vulkanizer_core)
 
 add_executable(vulkanizer-bandwidth vulkanizer_bandwidth.cpp)
 target_link_libraries(vulkanizer-bandwidth PRIVATE vulkanizer_cuda)
+
+if(VULKANIZER_NPU_XRT)
+  add_executable(vulkanizer-npu-bench vulkanizer_npu_bench.cpp)
+  target_link_libraries(vulkanizer-npu-bench PRIVATE vulkanizer_npu vulkanizer_cuda vulkanizer_cublas)
+endif()

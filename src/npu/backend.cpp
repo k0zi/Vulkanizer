@@ -20,7 +20,7 @@ namespace {
 class CpuBackend final : public Backend {
 public:
     const char* name() const override { return "cpu"; }
-    bool supports(const GemmShape&) const override { return true; }
+    int64_t volume(const GemmShape& s) const override { return s.m * s.n * s.k; }
 
     bool gemm(const GemmArgs& g) override {
         const GemmShape& s = g.shape;

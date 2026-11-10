@@ -36,25 +36,43 @@ static void testMode() {
 }
 
 static void testRoute() {
-    const Policy p;  // 2^27, 64
-    GemmShape big;
-    big.m = big.n = big.k = 1024;
+    const Policy p;  // 2^24 .. 2^27, 64, 2x padding
+    GemmShape big;  // 512^3 = 2^27, the largest the auto mode takes
+    big.m = big.n = big.k = 512;
+    const int64_t bigVolume = int64_t(1) << 27;
     GemmShape small;
     small.m = small.n = small.k = 128;
+    const int64_t smallVolume = 128 * 128 * 128;
+    GemmShape huge;
+    huge.m = huge.n = huge.k = 1024;
+    const int64_t hugeVolume = int64_t(1) << 30;
     GemmShape gemv;
     gemv.m = 4096, gemv.n = 1, gemv.k = 4096;
-    EXPECT(route(big, Mode::Off, p, true) == Target::Gpu);
-    EXPECT(route(big, Mode::Auto, p, false) == Target::Gpu);
-    EXPECT(route(big, Mode::Auto, p, true) == Target::Npu);
-    EXPECT(route(small, Mode::Auto, p, true) == Target::Gpu);
-    EXPECT(route(small, Mode::Force, p, true) == Target::Npu);
-    EXPECT(route(gemv, Mode::Auto, p, true) == Target::Gpu);
+    EXPECT(route(big, Mode::Off, p, bigVolume) == Target::Gpu);
+    EXPECT(route(big, Mode::Auto, p, 0) == Target::Gpu);
+    EXPECT(route(big, Mode::Auto, p, bigVolume) == Target::Npu);
+    EXPECT(route(small, Mode::Auto, p, smallVolume) == Target::Gpu);
+    EXPECT(route(small, Mode::Force, p, smallVolume) == Target::Npu);
+    EXPECT(route(huge, Mode::Auto, p, hugeVolume) == Target::Gpu);
+    EXPECT(route(huge, Mode::Force, p, hugeVolume) == Target::Npu);
+    EXPECT(route(gemv, Mode::Auto, p, 4096 * 64 * 4096) == Target::Gpu);
     GemmShape batched = small;  // 128^3 * 64 = 2^27
     batched.batch = 64;
-    EXPECT(route(batched, Mode::Auto, p, true) == Target::Npu);
+    EXPECT(route(batched, Mode::Auto, p, smallVolume) == Target::Npu);
+    batched.batch = 65;
+    EXPECT(route(batched, Mode::Auto, p, smallVolume) == Target::Gpu);
     GemmShape empty = big;
     empty.k = 0;
-    EXPECT(route(empty, Mode::Force, p, true) == Target::Gpu);
+    EXPECT(route(empty, Mode::Force, p, bigVolume) == Target::Gpu);
+    // write-combined operands: GPU in auto mode, NPU when forced
+    GemmShape uncached = big;
+    uncached.cached = false;
+    EXPECT(route(uncached, Mode::Auto, p, bigVolume) == Target::Gpu);
+    EXPECT(route(uncached, Mode::Force, p, bigVolume) == Target::Npu);
+    // padding: 2x is fine, more stays on the GPU in auto mode (force takes it anyway)
+    EXPECT(route(big, Mode::Auto, p, 2 * bigVolume) == Target::Npu);
+    EXPECT(route(big, Mode::Auto, p, 2 * bigVolume + 1) == Target::Gpu);
+    EXPECT(route(big, Mode::Force, p, 8 * bigVolume) == Target::Npu);
 }
 
 static void writeFile(const fs::path& file, const char* text) {

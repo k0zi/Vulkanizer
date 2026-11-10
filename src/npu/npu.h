@@ -46,6 +46,9 @@ struct GemmShape {
     DType a = DType::F32, b = DType::F32, c = DType::F32;
     // The caller accepts bf16 products for f32 inputs (CUBLAS_COMPUTE_32F_FAST_16BF).
     bool reducedPrecision = false;
+    // A, B and C are in cached host memory; false: write-combined (device memory on RADV), whose
+    // host reads made the copying path slower than the GPU on every measured shape (plan.md 7.2).
+    bool cached = true;
 };
 
 struct GemmArgs {
@@ -59,24 +62,41 @@ struct GemmArgs {
     int64_t ldc = 0, strideC = 0;
 };
 
-// Thresholds of the auto mode. VULKANIZER_NPU_MIN_MNK: m * n * k * batch at least this (default
-// 2^27, a 512^3 GEMM); VULKANIZER_NPU_MIN_DIM: m and n at least this (default 64; matrix-vector
-// products stay on the GPU).
+// Thresholds of the auto mode, from the measurements in plan.md 7.2 (copying path, XDNA2 vs Radeon
+// 890M): the NPU won from cached memory between 256^3 and 512^3, not above. VULKANIZER_NPU_MIN_MNK /
+// _MAX_MNK: m * n * k * batch in this range (default 2^24 .. 2^27); VULKANIZER_NPU_MIN_DIM: m and n
+// at least this (default 64; matrix-vector products stay on the GPU).
 struct Policy {
-    int64_t minMnk = int64_t(1) << 27;
+    int64_t minMnk = int64_t(1) << 24;
+    int64_t maxMnk = int64_t(1) << 27;
     int64_t minDim = 64;
+    // VULKANIZER_NPU_MAX_PADDING: the backend's padded m * n * k (Backend::volume) at most this many
+    // times the shape's (default 2).
+    double maxPadding = 2;
 };
 Policy policy();  // parsed once from the environment
 
 enum class Target { Gpu, Npu };
-// The decision for one GEMM; `supported`: the backend can run this shape.
-Target route(const GemmShape& shape, Mode mode, const Policy& policy, bool supported);
+// The decision for one GEMM; `volume`: the backend's Backend::volume for it (0: not supported).
+Target route(const GemmShape& shape, Mode mode, const Policy& policy, int64_t volume);
+
+// Where the time of one gemm() went, in seconds: packing the operands into the device's layout and
+// type (incl. zero padding and the copy to the device), the device run, and writing C (copy back,
+// alpha / beta).
+struct GemmTimes {
+    double pack = 0, run = 0, epilogue = 0;
+};
 
 class Backend {
 public:
     virtual ~Backend() = default;
     virtual const char* name() const = 0;
-    virtual bool supports(const GemmShape& shape) const = 0;
+    // The m * n * k the backend computes per batch entry for this shape, padding included; 0: the
+    // shape is not supported.
+    virtual int64_t volume(const GemmShape& shape) const = 0;
+    bool supports(const GemmShape& shape) const { return volume(shape) > 0; }
+    // The breakdown of the last successful gemm() (zeros if the backend does not measure).
+    virtual GemmTimes lastTimes() const { return {}; }
     // Runs the GEMM on host-addressable memory and returns when C is written; false: not done
     // (C untouched), the caller falls back to the GPU.
     virtual bool gemm(const GemmArgs& args) = 0;

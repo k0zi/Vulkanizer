@@ -264,16 +264,13 @@ bool runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
     s.m = g.m, s.n = g.n, s.k = g.k, s.batch = g.batch;
     s.a = dtype(g.ta), s.b = dtype(g.tb), s.c = dtype(g.tc);
     s.reducedPrecision = g.compute == CUBLAS_COMPUTE_32F_FAST_16BF;
-    if (npu::route(s, npu::mode(), npu::policy(), backend->supports(s)) != npu::Target::Npu) return false;
-    CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
-    if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return false;
     // Each operand's host address over all its batches: column-major rows x cols, leading dimension ld.
     const auto host = [&](const void* p, cudaDataType t, long long rows, long long cols, int ld, long long stride, void*& out) {
         const size_t elem = t == CUDA_R_32F ? 4 : 2;
         const size_t bytes = size_t((g.batch - 1) * stride + (cols - 1) * ld + rows) * elem;
         int cached = 0;
         if (vulkanizerGetHostPointer(CUdeviceptr(p), bytes, &out, &cached) != CUDA_SUCCESS) return false;
-        if (!cached) VULKANIZER_WARN_ONCE("cublas: NPU operands in write-combined memory: slow host reads");
+        s.cached = s.cached && cached;
         return true;
     };
     void *ha, *hb, *hc;
@@ -281,6 +278,10 @@ bool runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
         !host(g.b, g.tb, s.transB ? g.n : g.k, s.transB ? g.k : g.n, g.ldb, g.strideB, hb) ||
         !host(g.c, g.tc, g.m, g.n, g.ldc, g.strideC, hc))
         return false;
+    if (npu::route(s, npu::mode(), npu::policy(), backend->volume(s)) != npu::Target::Npu) return false;
+    CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
+    if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return false;
+    if (!s.cached) VULKANIZER_WARN_ONCE("cublas: NPU operands in write-combined memory: slow host reads");
     a.alpha = alpha, a.beta = beta;
     a.a = ha, a.lda = g.lda, a.strideA = g.strideA;
     a.b = hb, a.ldb = g.ldb, a.strideB = g.strideB;

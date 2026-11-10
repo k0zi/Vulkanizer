@@ -28,6 +28,7 @@
 #include <xrt/experimental/xrt_xclbin.h>
 #endif
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -109,7 +110,12 @@ public:
 
     const char* name() const override { return "xdna"; }
 
-    bool supports(const GemmShape& s) const override { return pick(s) != nullptr; }
+    int64_t volume(const GemmShape& s) const override {
+        const KernelFile* f = pick(s);
+        return f ? f->m * f->k * f->n : 0;
+    }
+
+    GemmTimes lastTimes() const override { return times_; }
 
     bool gemm(const GemmArgs& g) override {
         const GemmShape& s = g.shape;
@@ -126,35 +132,50 @@ public:
             // batch entries the results are staged (n x m each) and C is written after the last run.
             const bool stage = s.batch > 1 && g.beta != 0.0f;
             std::vector<char> staged(stage ? size_t(s.batch * s.n * s.m) * so : 0);
+            using Clock = std::chrono::steady_clock;
+            const auto since = [](Clock::time_point& t) {
+                const Clock::time_point now = Clock::now();
+                const double d = std::chrono::duration<double>(now - t).count();
+                t = now;
+                return d;
+            };
+            GemmTimes times;
+            Clock::time_point t = Clock::now();
             for (int64_t i = 0; i < s.batch; ++i) {
                 // Zero padding: the kernel's M x K x N is at least n x k x m.
-                std::memset(lhs, 0, size_t(f->m * f->k) * dtypeSize(f->in));
-                std::memset(rhs, 0, size_t(f->k * f->n) * dtypeSize(f->in));
+                zeroPadding(lhs, dtypeSize(f->in), s.n, s.k, f->k, f->m);
+                zeroPadding(rhs, dtypeSize(f->in), s.k, s.m, f->n, f->k);
                 packTransposed(static_cast<const char*>(g.b) + i * g.strideB * int64_t(sb), s.b, g.ldb, s.transB, s.k, s.n,
                                lhs, f->in, f->k);
                 packTransposed(static_cast<const char*>(g.a) + i * g.strideA * int64_t(sa), s.a, g.lda, s.transA, s.m, s.k,
                                rhs, f->in, f->n);
                 k.lhs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 k.rhs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                times.pack += since(t);
                 xrt::run run = k.kernel(kOpcode, k.instr, k.instrWords, k.lhs, k.rhs, k.out, k.tmp, k.trace);
                 const ert_cmd_state state = run.wait();
                 if (state != ERT_CMD_STATE_COMPLETED) {
                     VULKANIZER_ERROR("npu: %s ended in state %d", f->xclbin.filename().c_str(), int(state));
                     return false;
                 }
+                times.run += since(t);
                 k.out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
                 if (stage) {
                     char* dst = staged.data() + size_t(i * s.n * s.m) * so;
                     for (int64_t r = 0; r < s.n; ++r)
                         std::memcpy(dst + size_t(r * s.m) * so, out + size_t(r * f->n) * so, size_t(s.m) * so);
+                    times.epilogue += since(t);
                     continue;
                 }
                 epilogue(out, f->out, f->n, g.alpha, g.beta, static_cast<char*>(g.c) + i * g.strideC * int64_t(sc), s.c,
                          g.ldc, s.m, s.n);
+                times.epilogue += since(t);
             }
             for (int64_t i = 0; stage && i < s.batch; ++i)
                 epilogue(staged.data() + size_t(i * s.n * s.m) * so, f->out, s.m, g.alpha, g.beta,
                          static_cast<char*>(g.c) + i * g.strideC * int64_t(sc), s.c, g.ldc, s.m, s.n);
+            times.epilogue += since(t);
+            times_ = times;
             return true;
         } catch (const std::exception& e) {
             VULKANIZER_ERROR("npu: %s: %s", f->xclbin.filename().c_str(), e.what());
@@ -210,6 +231,7 @@ private:
     std::vector<KernelFile> files_;
     std::mutex mutex_;
     std::map<std::string, Loaded> loaded_;
+    GemmTimes times_;
 };
 
 }  // namespace
