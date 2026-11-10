@@ -460,6 +460,29 @@ bool pointerAttribute(const ApiScope& s, const PointerInfo& info, CUdeviceptr pt
 
 }  // namespace
 
+CUresult CUDAAPI vulkanizerGetHostPointer(CUdeviceptr ptr, size_t bytes, void** host, int* cached) {
+    VULKANIZER_TRACE_API();
+    if (!host) return CUDA_ERROR_INVALID_VALUE;
+    ApiScope s;
+    if (CUresult r = enterContext(s)) return r;
+    HostMemoryInfo h;
+    if (findHostMemory(ptr, h)) {  // one address for both sides
+        if (bytes > h.base + h.size - ptr) return CUDA_ERROR_NOT_SUPPORTED;
+        *host = reinterpret_cast<void*>(ptr);
+        if (cached) *cached = 1;
+        return CUDA_SUCCESS;
+    }
+    AllocRef ref;
+    if (!findAllocation(*s.slot, ptr, bytes, ref)) {
+        std::vector<AllocPiece> pieces;
+        return findPieces(*s.slot, ptr, bytes, pieces) ? CUDA_ERROR_NOT_SUPPORTED : CUDA_ERROR_INVALID_VALUE;
+    }
+    if (!ref.buffer->mapped) return CUDA_ERROR_NOT_SUPPORTED;
+    *host = static_cast<char*>(ref.buffer->mapped) + ref.offset;
+    if (cached) *cached = ref.buffer->hostCached;
+    return CUDA_SUCCESS;
+}
+
 CUresult CUDAAPI cuPointerGetAttribute(void* data, CUpointer_attribute attribute, CUdeviceptr ptr) {
     VULKANIZER_TRACE_API();
     if (!data) return CUDA_ERROR_INVALID_VALUE;

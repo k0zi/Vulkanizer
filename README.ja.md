@@ -230,6 +230,27 @@ nvJitLink のリンク呼び出しがドライバの `cuLink*` に回され、�
 バージョンを返さないため、Numba は LTO-IR ではなく PTX を生成します。CuPy は動きません：CUDA ランタイムを静的に
 リンクしているためです（制限事項を参照）。
 
+### 8. Strata
+
+[Strata](https://github.com/Niko1221/Strata) の CUDA エンジン（PC で Qwen3.8-Flash-Next と Qwen3.6-35B-A3B を実行）は `run_strata.sh` で Vulkan 上で動きます:
+
+```sh
+./run_strata.sh models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf                    # サーバー: OpenAI/Anthropic API + Web ページ (127.0.0.1:8080)
+./run_strata.sh --engine models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --bench-pp 64 --bench-tg 8   # エンジンのみ、計測
+./run_strata.sh --build-only                                              # ビルドのみ
+```
+
+スクリプトはチェックアウトを変更しません（`--strata-dir`、既定は `~/Develop/GitHub/Strata`）。エンジンを
+`.work/strata-build` に PTX（`compute_61`、Strata の `STRATA_EXPERIMENTAL_SM60` コードパス）としてビルドし、Vulkanizer の
+cuBLAS とランタイムにリンクします。トークナイザー（Qwen3.6）または pack（Flash-Next）を `.work/strata-data` に書き出し、
+チェックアウトの `.venv` から Strata 自身の `serve/server.py` を起動します。`--` の後の引数はエンジンに渡されます。
+
+内蔵 AMD Radeon（RADV RENOIR、RAM 41 GB）、Qwen3.6-35B-A3B UD-Q4_K_XL、`--expert-vram 1` での計測: プロンプト 4 tok/s、
+生成 1.2-1.5 tok/s。内蔵 GPU では VRAM もシステム RAM で、さらにエンジンはすべてのエキスパートを RAM にも保持します
+（このモデルで 18.75 GiB）。約 25 GB の空きが必要です。`--expert-vram GiB` で GPU の割り当てを制限できます。K-quant MMQ
+ライブラリ（`libstrata_kq.so`）は NVIDIA の静的ランタイムをリンクしているため起動せず、それらのエキスパートはエンジンの
+FP16 プロンプトパスを使います。
+
 ### 便利な環境変数
 
 | 変数 | 効果 |

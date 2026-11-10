@@ -1,5 +1,5 @@
 add_executable(vulkanizer-info vulkanizer_info.cpp)
-target_link_libraries(vulkanizer-info PRIVATE vulkanizer_core)
+target_link_libraries(vulkanizer-info PRIVATE vulkanizer_core vulkanizer_npu)
 
 add_executable(vulkanizer-check vulkanizer_check.cpp)
 target_link_libraries(vulkanizer-check PRIVATE vulkanizer_core)

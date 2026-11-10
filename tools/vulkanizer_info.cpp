@@ -1,7 +1,8 @@
-// Lists the Vulkan devices Vulkanizer can use, including CPU implementations.
+// Lists the Vulkan devices Vulkanizer can use, including CPU implementations, and the NPUs.
 //   vulkanizer-info          human-readable summary
 //   vulkanizer-info --names  one device name per line (for scripts)
 
+#include "npu/npu.h"
 #include "vk/instance.h"
 
 #include <cstdio>
@@ -44,5 +45,19 @@ int main(int argc, char** argv) {
         std::printf("    device-local    %.1f GiB (max allocation %.1f GiB)\n",
                     double(d.deviceLocalBytes) / (1ull << 30), double(d.maxMemoryAllocationSize) / (1ull << 30));
     }
+    if (namesOnly) return 0;
+
+    namespace npu = vulkanizer::npu;
+    const auto npus = npu::detect();
+    if (npus.empty()) std::printf("NPU: none\n");
+    for (const npu::DeviceInfo& n : npus)
+        std::printf("NPU: %s%s%s, %s (driver %s, %04x:%04x)\n", npu::vendorName(n.vendor), n.generation.empty() ? "" : " ",
+                    n.generation.c_str(), n.node.c_str(), n.driver.empty() ? "none" : n.driver.c_str(), n.pciVendor,
+                    n.pciDevice);
+    const npu::Mode mode = npu::mode();
+    const npu::Backend* backend = npu::backend();
+    std::printf("NPU offload: %s, backend %s\n",
+                mode == npu::Mode::Off ? "off (VULKANIZER_NPU)" : mode == npu::Mode::Auto ? "auto" : "force",
+                backend ? backend->name() : "none");
     return 0;
 }

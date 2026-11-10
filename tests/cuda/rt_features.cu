@@ -34,6 +34,13 @@ __global__ void affine(float* data, Affine a, int n) {
     if (i < n) data[i * a.stride] = data[i * a.stride] * a.scale + a.offset;
 }
 
+// Busy work for the query test; the result is written so it is not optimized away.
+__global__ void spin(float* data, int iterations) {
+    float x = threadIdx.x;
+    for (int i = 0; i < iterations; ++i) x = x * 0.999f + 1.0f;
+    if (x == -1.0f) data[0] = x;
+}
+
 __global__ void fill2d(unsigned* out, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -113,6 +120,45 @@ int main() {
     EXPECT(cudaGetLastError() == cudaSuccess);
     EXPECT(cudaSetDevice(42) == cudaErrorInvalidDevice);
     EXPECT(cudaGetLastError() == cudaErrorInvalidDevice);
+
+    // an unfinished query is a status: cudaErrorNotReady is returned but not kept for cudaGetLastError
+    // (a long kernel, queried right after its launch: the answer may be either)
+    for (int round = 0; round < 3; ++round) {
+        spin<<<smCount * 4, 256, 0, s>>>(d, 1 << 16);
+        CHECK(cudaEventRecord(stop, s));
+        const cudaError_t q = cudaEventQuery(stop);
+        EXPECT(q == cudaSuccess || q == cudaErrorNotReady);
+        const cudaError_t sq = cudaStreamQuery(s);
+        EXPECT(sq == cudaSuccess || sq == cudaErrorNotReady);
+        EXPECT(cudaPeekAtLastError() == cudaSuccess);
+        EXPECT(cudaGetLastError() == cudaSuccess);
+        CHECK(cudaStreamSynchronize(s));
+        CHECK(cudaEventQuery(stop));
+    }
+
+    // cudaFuncGetName (the mangled name), cudaInitDevice, cudaOccupancyMaxActiveClusters
+    const char* name = nullptr;
+    CHECK(cudaFuncGetName(&name, affine));
+    EXPECT(name && std::strstr(name, "affine"));
+    CHECK(cudaInitDevice(0, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0));
+    EXPECT(cudaInitDevice(42, 0, 0) == cudaErrorInvalidDevice);
+    (void) cudaGetLastError();
+    cudaLaunchConfig_t lc{};
+    lc.gridDim = dim3(1);
+    lc.blockDim = dim3(256);
+    int clusters = -1;
+    CHECK(cudaOccupancyMaxActiveClusters(&clusters, affine, &lc));
+    EXPECT(clusters >= smCount);
+    cudaLaunchAttribute ca[1];
+    ca[0].id = cudaLaunchAttributeClusterDimension;
+    ca[0].val.clusterDim.x = 2;
+    ca[0].val.clusterDim.y = 1;
+    ca[0].val.clusterDim.z = 1;
+    lc.gridDim = dim3(2);
+    lc.attrs = ca;
+    lc.numAttrs = 1;
+    CHECK(cudaOccupancyMaxActiveClusters(&clusters, affine, &lc));
+    EXPECT(clusters == 0);  // no thread block clusters on Vulkan
 
     CHECK(cudaEventDestroy(start));
     CHECK(cudaEventDestroy(stop));

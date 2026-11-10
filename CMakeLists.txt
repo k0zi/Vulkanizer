@@ -13,6 +13,7 @@ endif()
 
 option(VULKANIZER_BUILD_TESTS "Build the test suite" ON)
 option(VULKANIZER_ASAN "Build with AddressSanitizer" OFF)
+option(VULKANIZER_NPU_XRT "AMD XDNA NPU backend through XRT (plan.md 7.; needs XRT installed)" OFF)
 option(VULKANIZER_EXPORT_TABLES "cuGetExportTable probes for statically linked CUDA runtimes (shelved, plan.md 6.5)" OFF)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

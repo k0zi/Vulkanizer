@@ -78,8 +78,10 @@ cudaError_t toCudaError(CUresult r) {
 }
 
 // Records non-success results for cudaGetLastError / cudaPeekAtLastError.
+// cudaErrorNotReady (an unfinished stream or event query) is a status, not an error: the real runtime
+// leaves cudaGetLastError untouched, and programs poll cudaEventQuery and then check for launch errors.
 cudaError_t record(cudaError_t e) {
-    if (e != cudaSuccess) t_lastError = e;
+    if (e != cudaSuccess && e != cudaErrorNotReady) t_lastError = e;
     return e;
 }
 cudaError_t record(CUresult r) { return record(toCudaError(r)); }
@@ -413,6 +415,16 @@ cudaError_t CUDARTAPI cudaFuncGetAttributes(cudaFuncAttributes* attr, const void
     attr->ptxVersion = get(CU_FUNC_ATTRIBUTE_PTX_VERSION);
     attr->binaryVersion = get(CU_FUNC_ATTRIBUTE_BINARY_VERSION);
     attr->maxDynamicSharedSizeBytes = get(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES);
+    return cudaSuccess;
+}
+
+// The mangled name, as the real runtime returns it.
+cudaError_t CUDARTAPI cudaFuncGetName(const char** name, const void* func) {
+    VULKANIZER_TRACE_API();
+    if (!name || !func) return record(cudaErrorInvalidValue);
+    Kernel* k = findKernel(func);
+    if (!k) return record(cudaErrorInvalidDeviceFunction);
+    *name = k->name.c_str();
     return cudaSuccess;
 }
 
@@ -903,6 +915,21 @@ cudaError_t CUDARTAPI cudaSetDeviceFlags(unsigned int flags) {
     return cudaSuccess;
 }
 
+// Initializes a device's primary context without making it current; the scheduling flags, like
+// cudaSetDeviceFlags', have no effect.
+cudaError_t CUDARTAPI cudaInitDevice(int device, unsigned int deviceFlags, unsigned int flags) {
+    VULKANIZER_TRACE_API();
+    const int previous = t_device;
+    t_device = device;
+    const cudaError_t e = enter();
+    t_device = previous;
+    if (e) return record(e);
+    if (previous != device) {
+        if (cudaError_t back = enter()) return record(back);
+    }
+    return cudaSuccess;
+}
+
 cudaError_t CUDARTAPI cudaGetDeviceFlags(unsigned int* flags) {
     ENTER();
     if (!flags) return record(cudaErrorInvalidValue);
@@ -949,6 +976,24 @@ cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(int
 cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks, const void* func, int blockSize,
                                                                    size_t dynamicSMemSize) {
     return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, func, blockSize, dynamicSMemSize, 0);
+}
+
+// The driver's answer: clusters of more than one block never fit (0).
+cudaError_t CUDARTAPI cudaOccupancyMaxActiveClusters(int* numClusters, const void* func,
+                                                     const cudaLaunchConfig_t* config) {
+    ENTER();
+    if (!numClusters || !config) return record(cudaErrorInvalidValue);
+    if (config->numAttrs && !config->attrs) return record(cudaErrorInvalidValue);
+    Kernel* k = findKernel(func);
+    if (!k) return record(cudaErrorInvalidDeviceFunction);
+    CUfunction f;
+    if (cudaError_t e = resolve(k, f)) return record(e);
+    // cudaLaunchAttribute is laid out as CUlaunchAttribute, with the same attribute ids.
+    CUlaunchConfig c{config->gridDim.x,  config->gridDim.y,  config->gridDim.z,
+                     config->blockDim.x, config->blockDim.y, config->blockDim.z,
+                     unsigned(config->dynamicSmemBytes),     config->stream,
+                     reinterpret_cast<CUlaunchAttribute*>(config->attrs), config->numAttrs};
+    return record(cuOccupancyMaxActiveClusters(numClusters, f, &c));
 }
 
 // ---- extended launches ------------------------------------------------------------------------

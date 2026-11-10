@@ -2,6 +2,17 @@
 add_library(vulkanizer_common STATIC common/log.cpp common/sha256.cpp)
 target_include_directories(vulkanizer_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# NPU offload (plan.md 7.): detection, routing policy, host reference backend; the AMD XDNA backend
+# only with -DVULKANIZER_NPU_XRT=ON (XRT's CMake package, e.g. /opt/xilinx/xrt/share/cmake).
+add_library(vulkanizer_npu STATIC npu/detect.cpp npu/route.cpp npu/host.cpp npu/backend.cpp)
+target_link_libraries(vulkanizer_npu PUBLIC vulkanizer_common)
+if(VULKANIZER_NPU_XRT)
+  find_package(XRT REQUIRED HINTS /opt/xilinx/xrt/share/cmake)
+  target_sources(vulkanizer_npu PRIVATE npu/xdna.cpp)
+  target_compile_definitions(vulkanizer_npu PUBLIC VULKANIZER_NPU_XRT)
+  target_link_libraries(vulkanizer_npu PRIVATE XRT::xrt_coreutil)
+endif()
+
 find_program(GLSLC glslc HINTS ${Vulkan_GLSLC_EXECUTABLE} REQUIRED)
 set(vk_gen ${CMAKE_CURRENT_BINARY_DIR}/vk)
 foreach(probe fma_probe fma_probe_f64)
@@ -155,7 +166,7 @@ function(vulkanizer_cublas suffix major version outdir)
   endforeach()
   add_library(vulkanizer_cublas${suffix} SHARED cublas/cublas.cpp cublas/cublas_stubs.cpp ${cublas_shaders})
   add_library(vulkanizer_cublaslt${suffix} SHARED cublas/cublasLt.cpp ${cublas_gen}/epilogue.comp.inc)
-  target_link_libraries(vulkanizer_cublas${suffix} PRIVATE vulkanizer_common vulkanizer_linalg vulkanizer_cuda)
+  target_link_libraries(vulkanizer_cublas${suffix} PRIVATE vulkanizer_common vulkanizer_linalg vulkanizer_npu vulkanizer_cuda)
   target_link_libraries(vulkanizer_cublaslt${suffix} PRIVATE vulkanizer_common vulkanizer_cuda vulkanizer_cublas${suffix})
   foreach(pair "vulkanizer_cublas${suffix};cublas" "vulkanizer_cublaslt${suffix};cublasLt")
     list(GET pair 0 target)

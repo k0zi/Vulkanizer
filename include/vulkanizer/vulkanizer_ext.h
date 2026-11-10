@@ -32,6 +32,14 @@ typedef enum VulkanizerFeature {
 // *value = 1 if the current context's device has the feature, else 0 (sizes: the size, 0 if none).
 CUresult CUDAAPI vulkanizerGetFeature(VulkanizerFeature feature, int* value);
 
+// The host address of device memory [ptr, ptr + bytes) where the host can reach it directly
+// (host-visible, coherent memory: integrated GPUs; pinned, managed and registered host memory),
+// for work that runs on the CPU side, such as the NPU offload. *cached = 1 if host reads are
+// cached (otherwise write-combined: slow to read). CUDA_ERROR_NOT_SUPPORTED if the range is not
+// mapped or spans several allocations, CUDA_ERROR_INVALID_VALUE if it is not device memory. The
+// caller orders the access against the GPU (cuStreamSynchronize).
+CUresult CUDAAPI vulkanizerGetHostPointer(CUdeviceptr ptr, size_t bytes, void** host, int* cached);
+
 #ifdef __cplusplus
 }
 #endif

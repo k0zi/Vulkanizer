@@ -223,6 +223,26 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 会转到驱动的 `cuLink*`，其链接结果在这里是 PTX；nvJitLink 不报告版本，因此 Numba 生成 PTX 而不是 LTO-IR。CuPy 无法运行：
 它静态链接了 CUDA 运行时（见“限制”）。
 
+### 8. Strata
+
+[Strata](https://github.com/Niko1221/Strata) 的 CUDA 引擎（在 PC 上运行 Qwen3.8-Flash-Next 和 Qwen3.6-35B-A3B）通过 `run_strata.sh` 在 Vulkan 上运行：
+
+```sh
+./run_strata.sh models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf                    # 服务器：OpenAI/Anthropic API + 网页，地址 127.0.0.1:8080
+./run_strata.sh --engine models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --bench-pp 64 --bench-tg 8   # 只运行引擎，测速
+./run_strata.sh --build-only                                              # 只编译
+```
+
+脚本不修改源码目录（`--strata-dir`，默认 `~/Develop/GitHub/Strata`）：它把引擎编译到 `.work/strata-build`，生成 PTX
+（`compute_61`，使用 Strata 的 `STRATA_EXPERIMENTAL_SM60` 代码路径），链接 Vulkanizer 的 cuBLAS 和运行时；把分词器
+（Qwen3.6）或 pack（Flash-Next）写入 `.work/strata-data`，并用源码目录的 `.venv` 启动 Strata 自带的 `serve/server.py`。
+`--` 之后的参数传给引擎。
+
+在集成 AMD Radeon（RADV RENOIR，41 GB 内存）上测得，Qwen3.6-35B-A3B UD-Q4_K_XL，`--expert-vram 1`：提示 4 tok/s，
+生成 1.2-1.5 tok/s。集成显卡的显存也是系统内存，而引擎还会把所有专家再放一份在内存中（此模型 18.75 GiB）：需要约 25 GB
+空闲内存。`--expert-vram GiB` 限制 GPU 的份额。K-quant MMQ 库（`libstrata_kq.so`）链接了 NVIDIA 的静态运行时，无法启动；
+这些专家走引擎的 FP16 提示路径。
+
 ### 常用环境变量
 
 | 变量 | 作用 |

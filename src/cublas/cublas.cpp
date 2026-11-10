@@ -8,6 +8,7 @@
 
 #include "common/log.h"
 #include "linalg/linalg.h"
+#include "npu/npu.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -247,6 +248,53 @@ cublasStatus_t runF64(cublasHandle_t h, const Gemm& g) {
                : CUBLAS_STATUS_EXECUTION_FAILED;
 }
 
+// The NPU offload (src/npu, plan.md 7.): a GEMM the policy sends to the NPU, on matrices the host
+// reaches directly (integrated GPUs). Synchronous: waits for the stream, then for the NPU. true:
+// done; false: not taken, the GPU path runs it.
+bool runNpu(cublasHandle_t h, const Gemm& g, float alpha, float beta) {
+    namespace npu = vulkanizer::npu;
+    npu::Backend* backend = npu::backend();
+    if (!backend || g.pointerArrays || g.strideA < 0 || g.strideB < 0 || g.strideC < 0) return false;
+    const auto dtype = [](cudaDataType t) {
+        return t == CUDA_R_32F ? npu::DType::F32 : t == CUDA_R_16F ? npu::DType::F16 : npu::DType::BF16;
+    };
+    npu::GemmArgs a;
+    npu::GemmShape& s = a.shape;
+    s.transA = g.transa != CUBLAS_OP_N, s.transB = g.transb != CUBLAS_OP_N;
+    s.m = g.m, s.n = g.n, s.k = g.k, s.batch = g.batch;
+    s.a = dtype(g.ta), s.b = dtype(g.tb), s.c = dtype(g.tc);
+    s.reducedPrecision = g.compute == CUBLAS_COMPUTE_32F_FAST_16BF;
+    if (npu::route(s, npu::mode(), npu::policy(), backend->supports(s)) != npu::Target::Npu) return false;
+    CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
+    if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return false;
+    // Each operand's host address over all its batches: column-major rows x cols, leading dimension ld.
+    const auto host = [&](const void* p, cudaDataType t, long long rows, long long cols, int ld, long long stride, void*& out) {
+        const size_t elem = t == CUDA_R_32F ? 4 : 2;
+        const size_t bytes = size_t((g.batch - 1) * stride + (cols - 1) * ld + rows) * elem;
+        int cached = 0;
+        if (vulkanizerGetHostPointer(CUdeviceptr(p), bytes, &out, &cached) != CUDA_SUCCESS) return false;
+        if (!cached) VULKANIZER_WARN_ONCE("cublas: NPU operands in write-combined memory: slow host reads");
+        return true;
+    };
+    void *ha, *hb, *hc;
+    if (!host(g.a, g.ta, s.transA ? g.k : g.m, s.transA ? g.m : g.k, g.lda, g.strideA, ha) ||
+        !host(g.b, g.tb, s.transB ? g.n : g.k, s.transB ? g.k : g.n, g.ldb, g.strideB, hb) ||
+        !host(g.c, g.tc, g.m, g.n, g.ldc, g.strideC, hc))
+        return false;
+    a.alpha = alpha, a.beta = beta;
+    a.a = ha, a.lda = g.lda, a.strideA = g.strideA;
+    a.b = hb, a.ldb = g.ldb, a.strideB = g.strideB;
+    a.c = hc, a.ldc = g.ldc, a.strideC = g.strideC;
+    if (cuStreamSynchronize(h->stream) != CUDA_SUCCESS) return false;  // earlier GPU writes to A, B, C
+    if (!backend->gemm(a)) {
+        VULKANIZER_WARN_ONCE("cublas: the %s NPU backend failed a GEMM, running it on the GPU", backend->name());
+        return false;
+    }
+    VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d batch %d -> npu (%s)", s.transA ? 'T' : 'N', s.transB ? 'T' : 'N', g.m, g.n,
+                     g.k, g.batch, backend->name());
+    return true;
+}
+
 cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
     if (g.m < 0 || g.n < 0 || g.k < 0 || g.batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
@@ -260,6 +308,7 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     GemmParams p{};
     if (!scalar(h, g.alpha, g.compute, p.alpha) || !scalar(h, g.beta, g.compute, p.beta))
         return CUBLAS_STATUS_INVALID_VALUE;
+    if (g.k > 0 && runNpu(h, g, p.alpha, p.beta)) return CUBLAS_STATUS_SUCCESS;
     p.a = reinterpret_cast<uint64_t>(g.a);
     p.b = reinterpret_cast<uint64_t>(g.b);
     p.c = reinterpret_cast<uint64_t>(g.c);

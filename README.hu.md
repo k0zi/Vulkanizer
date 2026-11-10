@@ -232,6 +232,27 @@ A linkere az nvJitLink, ami natív kódot adna: a `run_torch.sh` (és a `vulkani
 linkhívásai a driver `cuLink*`-jához mennek, aminek a linkelt képe itt PTX, az nvJitLink pedig nem ad verziót, így a
 Numba LTO-IR helyett PTX-et ad. A CuPy nem fut: statikusan linkeli a CUDA runtime-ot (lásd a korlátoknál).
 
+### 8. Strata
+
+A [Strata](https://github.com/Niko1221/Strata) CUDA motorja (Qwen3.8-Flash-Next és Qwen3.6-35B-A3B egy PC-n) a `run_strata.sh`-val fut Vulkanon:
+
+```sh
+./run_strata.sh models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf                    # szerver: OpenAI/Anthropic API + weboldal a 127.0.0.1:8080-on
+./run_strata.sh --engine models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --bench-pp 64 --bench-tg 8   # csak a motor, mérés
+./run_strata.sh --build-only                                              # csak fordítás
+```
+
+A szkript nem módosítja a checkoutot (`--strata-dir`, alapból `~/Develop/GitHub/Strata`): a motort a
+`.work/strata-build`-be fordítja PTX-re (`compute_61`, a Strata `STRATA_EXPERIMENTAL_SM60` kódútjaival) a Vulkanizer
+cuBLAS-a és runtime-ja ellen, a tokenizert (Qwen3.6) vagy a packot (Flash-Next) a `.work/strata-data`-ba írja, és a
+checkout `.venv`-jéből a Strata saját `serve/server.py`-ját indítja. A `--` utáni argumentumok a motorhoz mennek.
+
+Mérve integrált AMD Radeonon (RADV RENOIR, 41 GB RAM), Qwen3.6-35B-A3B UD-Q4_K_XL, `--expert-vram 1`: prompt 4 tok/s,
+generálás 1,2-1,5 tok/s. Integrált GPU-n a VRAM is rendszer-RAM, és a motor minden expertet a RAM-ban is tart (ennél a
+modellnél 18,75 GiB): kb. 25 GB-nak szabadnak kell lennie. A `--expert-vram GiB` korlátozza a GPU részét. A K-quant
+MMQ könyvtár (`libstrata_kq.so`) az NVIDIA statikus runtime-ját linkeli, és nem indul el; ezek az expertek a motor
+FP16 prompt-útján futnak.
+
 ### Hasznos környezeti változók
 
 | Változó | Hatás |

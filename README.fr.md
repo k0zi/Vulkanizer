@@ -237,6 +237,27 @@ les appels d’édition de liens de nvJitLink vont au `cuLink*` du pilote, dont 
 ne rapporte aucune version, si bien que Numba produit du PTX plutôt que du LTO-IR. CuPy ne fonctionne pas : il lie le
 runtime CUDA statiquement (voir Limitations).
 
+### 8. Strata
+
+Le moteur CUDA de [Strata](https://github.com/Niko1221/Strata) (Qwen3.8-Flash-Next et Qwen3.6-35B-A3B sur un PC) tourne sur Vulkan avec `run_strata.sh` :
+
+```sh
+./run_strata.sh models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf                    # serveur : API OpenAI/Anthropic + page web sur 127.0.0.1:8080
+./run_strata.sh --engine models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --bench-pp 64 --bench-tg 8   # le moteur seul, une mesure
+./run_strata.sh --build-only                                              # compilation seule
+```
+
+Le script ne modifie pas le checkout (`--strata-dir`, par défaut `~/Develop/GitHub/Strata`) : il compile le moteur dans
+`.work/strata-build` en PTX (`compute_61` avec les chemins de code `STRATA_EXPERIMENTAL_SM60` de Strata) contre le cuBLAS
+et le runtime de Vulkanizer, écrit le tokenizer (Qwen3.6) ou le pack (Flash-Next) dans `.work/strata-data` et lance le
+`serve/server.py` de Strata depuis le `.venv` du checkout. Les arguments après `--` vont au moteur.
+
+Mesuré sur une AMD Radeon intégrée (RADV RENOIR, 41 Go de RAM), Qwen3.6-35B-A3B UD-Q4_K_XL, `--expert-vram 1` :
+prompt 4 tok/s, génération 1,2-1,5 tok/s. Sur un GPU intégré, la VRAM est aussi de la RAM système, et le moteur garde en
+plus chaque expert en RAM (18,75 Gio pour ce modèle) : il faut environ 25 Go libres. `--expert-vram Gio` limite la part
+du GPU. La bibliothèque MMQ K-quant (`libstrata_kq.so`) lie le runtime statique de NVIDIA et ne démarre pas ; ces experts
+passent par le chemin FP16 du prompt du moteur.
+
 ### Variables d’environnement utiles
 
 | Variable | Effet |
