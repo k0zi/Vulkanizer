@@ -6,7 +6,8 @@
 // mlir-aie (IRON, programming_examples/basic/matrix_multiplication) into
 //   <dir>/gemm_<in>_<out>_<M>x<K>x<N>.xclbin  and  <dir>/gemm_<in>_<out>_<M>x<K>x<N>.insts.bin
 // in: bf16 (later i8), out: f32 or bf16; row-major lhs M x K, rhs K x N, result M x N; host
-// signature (opcode 3, instructions, count, lhs, rhs, out) as in the mlir-aie host examples.
+// signature (opcode 3, instructions, count, lhs, rhs, out, tmp, trace) as in the mlir-aie host
+// examples (programming_examples/basic/matrix_multiplication/test.cpp; tmp and trace unused, 1 B / 4 B).
 // <dir>: VULKANIZER_NPU_KERNELS, else $XDG_DATA_HOME/vulkanizer/npu (~/.local/share/...).
 //
 // A GEMM takes the smallest kernel that holds it, zero-padded (C^T = op(B)^T op(A)^T, see host.h).
@@ -56,7 +57,7 @@ struct KernelFile {
 struct Loaded {
     xrt::hw_context context;
     xrt::kernel kernel;
-    xrt::bo instr, lhs, rhs, out;
+    xrt::bo instr, lhs, rhs, out, tmp, trace;
     uint32_t instrWords = 0;
 };
 
@@ -120,7 +121,11 @@ public:
             auto* lhs = k.lhs.map<char*>();
             auto* rhs = k.rhs.map<char*>();
             auto* out = k.out.map<char*>();
-            const size_t sa = dtypeSize(s.a), sb = dtypeSize(s.b), sc = dtypeSize(s.c);
+            const size_t sa = dtypeSize(s.a), sb = dtypeSize(s.b), sc = dtypeSize(s.c), so = dtypeSize(f->out);
+            // On failure C must stay untouched when the GPU redoes it reading C (beta != 0): with several
+            // batch entries the results are staged (n x m each) and C is written after the last run.
+            const bool stage = s.batch > 1 && g.beta != 0.0f;
+            std::vector<char> staged(stage ? size_t(s.batch * s.n * s.m) * so : 0);
             for (int64_t i = 0; i < s.batch; ++i) {
                 // Zero padding: the kernel's M x K x N is at least n x k x m.
                 std::memset(lhs, 0, size_t(f->m * f->k) * dtypeSize(f->in));
@@ -131,16 +136,25 @@ public:
                                rhs, f->in, f->n);
                 k.lhs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
                 k.rhs.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                xrt::run run = k.kernel(kOpcode, k.instr, k.instrWords, k.lhs, k.rhs, k.out);
+                xrt::run run = k.kernel(kOpcode, k.instr, k.instrWords, k.lhs, k.rhs, k.out, k.tmp, k.trace);
                 const ert_cmd_state state = run.wait();
                 if (state != ERT_CMD_STATE_COMPLETED) {
                     VULKANIZER_ERROR("npu: %s ended in state %d", f->xclbin.filename().c_str(), int(state));
-                    return false;  // TODO(N1): C may be partly written for batch > 1
+                    return false;
                 }
                 k.out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                if (stage) {
+                    char* dst = staged.data() + size_t(i * s.n * s.m) * so;
+                    for (int64_t r = 0; r < s.n; ++r)
+                        std::memcpy(dst + size_t(r * s.m) * so, out + size_t(r * f->n) * so, size_t(s.m) * so);
+                    continue;
+                }
                 epilogue(out, f->out, f->n, g.alpha, g.beta, static_cast<char*>(g.c) + i * g.strideC * int64_t(sc), s.c,
                          g.ldc, s.m, s.n);
             }
+            for (int64_t i = 0; stage && i < s.batch; ++i)
+                epilogue(staged.data() + size_t(i * s.n * s.m) * so, f->out, s.m, g.alpha, g.beta,
+                         static_cast<char*>(g.c) + i * g.strideC * int64_t(sc), s.c, g.ldc, s.m, s.n);
             return true;
         } catch (const std::exception& e) {
             VULKANIZER_ERROR("npu: %s: %s", f->xclbin.filename().c_str(), e.what());
@@ -182,6 +196,8 @@ private:
                  xrt::bo(device_, size_t(f.m * f.k) * dtypeSize(f.in), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3)),
                  xrt::bo(device_, size_t(f.k * f.n) * dtypeSize(f.in), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4)),
                  xrt::bo(device_, size_t(f.m * f.n) * dtypeSize(f.out), XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5)),
+                 xrt::bo(device_, 1, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(6)),
+                 xrt::bo(device_, 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(7)),
                  uint32_t(words.size())};
         l.instr.write(words.data());
         l.instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -206,7 +222,10 @@ std::unique_ptr<Backend> createXdnaBackend(const DeviceInfo& info) {
         return nullptr;
     }
     try {
-        xrt::device device(0u);  // TODO(N1): the XRT index of `info` when there are several
+        // XRT opens by PCI address (the accel node's parent device), so the right NPU is used when there are several.
+        std::error_code ec;
+        const fs::path pci = fs::canonical(fs::path("/sys/class/accel") / info.accel / "device", ec);
+        xrt::device device = ec ? xrt::device(0u) : xrt::device(pci.filename().string());
         VULKANIZER_INFO("npu: xdna backend, %zu kernels from %s", files.size(), dir.c_str());
         return std::make_unique<XdnaBackend>(std::move(device), std::move(files));
     } catch (const std::exception& e) {

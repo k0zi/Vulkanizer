@@ -908,7 +908,7 @@ GLSL GEMM kernelek            vulkanizerGetHostPointer (A, B, C host címe, UMA)
     `cublas_npu`-ban 43 GEMM megy a hookon át (`VULKANIZER_LOG=debug` → `-> npu (cpu)`), a maradék 8 (pointer-tömbös
     batch, k = 0) GPU-n. A RADV device memóriája write-combined (`hostCached` = 0): a host-olvasás lassú, ezért a 7.2
     mérésénél külön nézni, és ha dominál, a 7.3 (zero-copy) előrébb jön.
-- [ ] **7.1** XDNA bring-up, másolós út.
+- [x] **7.1** XDNA bring-up, másolós út (2026-11-10).
   - Gép: `ls /dev/accel`, `lsmod | grep amdxdna` (a driver a 6.14-es kerneltől in-tree), NPU firmware
     (`/lib/firmware/amdnpu/`), XRT + az amdxdna XRT-pluginja (`github.com/amd/xdna-driver`, vagy disztró-csomag, ha van),
     `xrt-smi examine` látja az NPU-t. `build/bin/vulkanizer-info` → `NPU: AMD XDNA XDNA1/XDNA2, /dev/accel/accel0`.
@@ -919,6 +919,18 @@ GLSL GEMM kernelek            vulkanizerGetHostPointer (A, B, C host címe, UMA)
   - `xdna.cpp` TODO-k: az XRT include-ok és a `group_id`-k ellenőrzése a használt mlir-aie host-példájával (a kernel
     szignatúrája verziónként változik: opcode, instr, n, a, b, c, esetleg tmp/trace bufferek); az XRT-eszközindex az
     `accelN`-ből; batch > 1 hibánál részben írt C (előbb mind lefut, aztán epilógus); `-Wall` tisztán.
+  - Állás (2026-11-10, Ryzen AI 9 HX 370, XDNA2 `RyzenAI-npu4` aie2p 6×8, XRT 2.25, NPU FW 1.1.2.64, kernel 7.0):
+    `-DVULKANIZER_NPU_XRT=ON` figyelmeztetés nélkül fordul. Javítva: a mlir-aie `886d932` kernele 8 argumentumot vár
+    (… out, tmp, trace; `group_id(6/7)`). `tools/build_npu_kernels.sh` kész (mlir-aie `886d932` + llvm-aie wheel
+    rögzítve, venv a `~/.cache/vulkanizer`-ben; npu2: 8 oszlop, csempe 64×64×32 → M % 512, K % 64, N % 256).
+    `gemm_bf16_f32_512x512x512` a hardveren: max. abs. hiba 1,3e-5 a CPU-referenciához képest (|C| ≤ 33,6), kitöltött
+    500×300×200 is jó; ~5 ms/GEMM a Debug-build csomagolásával együtt (a 7.2 méri rendesen).
+    `VULKANIZER_NPU=force VULKANIZER_NPU_BACKEND=xdna ./test.sh -R "cublas|npu"` zöld, 4 GEMM megy az NPU-n; a teljes
+    tesztkészlet (25) zöld. 1024³: max. abs. hiba 3,4e-5 (|C| ≤ 50), 2048³: 9,2e-5 (|C| ≤ 77), ~17 ill. ~72 ms/GEMM
+    a Debug-csomagolással együtt. Batch = 3, beta ≠ 0, mind a 4 transzponálás, ld/stride-hézagokkal: egyezik a CPU-val.
+    Az XRT az eszközt a PCI-címén nyitja (`/sys/class/accel/accelN/device`). Batch > 1 és beta ≠ 0 mellett az
+    eredmények előbb pufferbe kerülnek, C csak a végén íródik (hibánál érintetlen, a GPU-út helyesen újraszámol).
+    A design megkötése M % 512 (két csempesor egyszerre), ezért M = 256-hoz a script 32 magas magcsempét használ.
   - Kész, ha: `-DVULKANIZER_NPU_XRT=ON` fordul; `VULKANIZER_NPU=force VULKANIZER_NPU_BACKEND=xdna ./test.sh -R cublas`
     zöld (a nem támogatott alakok GPU-n); egy 1024³ bf16 → f32 GEMM tűrésen belül; `VULKANIZER_LOG=info` mutatja a betöltött kernelt.
 - [ ] **7.2** Mérés és küszöbök: `tools/vulkanizer_npu_bench.cpp` (GEMM alakok: négyzetes 256–4096, transformer
