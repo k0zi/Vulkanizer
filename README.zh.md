@@ -12,6 +12,7 @@
 
 可直接替换 `libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so`、`libcusparse.so` 和 `libcurand.so`：在 Vulkan
 计算之上实现 CUDA Driver API 与 Runtime API（以及 cuBLAS 的 GEMM 系列、稠密与稀疏线性代数、FFT 和随机数），让 CUDA 程序无需 NVIDIA 显卡即可在任何支持 Vulkan 1.2 的 GPU（AMD、Intel、llvmpipe）上运行。
+在配备 AMD XDNA NPU（Ryzen AI）的机器上，cuBLAS 的 GEMM 也可以在 NPU 上运行：见 [AMD NPU](#9-amd-npu-xdna)。
 计划、架构与阶段：[plan.md](plan.md)（匈牙利语）。
 
 ## 环境要求
@@ -243,6 +244,31 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 空闲内存。`--expert-vram GiB` 限制 GPU 的份额。K-quant MMQ 库（`libstrata_kq.so`）链接了 NVIDIA 的静态运行时，无法启动；
 这些专家走引擎的 FP16 提示路径。
 
+### 9. AMD NPU (XDNA)
+
+在配备 XDNA NPU 的 Ryzen 上（Ryzen 7040/8040「Phoenix/Hawk Point」：XDNA1；Ryzen AI 300「Strix/Krackan」：XDNA2），
+Vulkanizer 的 cuBLAS 可以把 GEMM（`cublasGemmEx`、`cublasGemmStridedBatchedEx`、`cublasLtMatmul`）放到 NPU 而不是 GPU 上运行。
+NPU 只能运行预编译的固定形状内核，因此由 cuBLAS 逐个 GEMM 决定；PTX 内核始终留在 GPU 上，没有 NPU 的机器行为不变。
+需要 `amdxdna` 内核驱动（自 Linux 6.14 起已并入内核）及 NPU 固件，以及带 amdxdna 插件的 XRT（`xrt-smi examine` 能看到 NPU）。
+
+```sh
+./build.sh --release -- -DVULKANIZER_NPU_XRT=ON   # XRT 后端（不开启时只有检测和 CPU 参考实现）
+build/bin/vulkanizer-info                          # 也会列出 NPU：NPU: AMD XDNA ..., /dev/accel/accel0
+tools/build_npu_kernels.sh                         # mlir-aie GEMM 内核（256³..4096³，bf16 -> f32）放到 ~/.local/share/vulkanizer/npu
+VULKANIZER_NPU=force ./run.sh ./my_cuda_app        # 内核能处理的 GEMM 全部在 NPU 上运行
+build/bin/vulkanizer-npu-bench                     # GPU 与 NPU 耗时对比
+```
+
+- `VULKANIZER_NPU=off`（默认）、`auto`（仅用于实测更快的情况：操作数位于带缓存的主机内存、约 256³–512³ 的 GEMM）、
+  `force`（内核支持的全部 GEMM）。`force` 下走零拷贝、异步路径：GPU 把操作数打包到 NPU 可见的内存中，NPU 在驱动线程上按
+  stream 顺序运行，cuBLAS 调用立即返回；CUDA graph 捕获期间同样可用。
+- `VULKANIZER_NPU_SPLIT=<0..0.9>`（配合 `force`）：拆分大型 GEMM，这一比例在 NPU 上运行，其余部分同时在 GPU 上运行。
+- 内核计算 bf16 × bf16 → f32：f32 输入只有在 `CUBLAS_COMPUTE_32F_FAST_16BF` 下才会送往 NPU，其他类型留在 GPU 上。GEMM
+  会填充到能容纳它的最小内核。NPU 出错时，GEMM 改在 GPU 或主机上计算，结果仍然正确。
+- 在 Ryzen AI 9 HX 370（Radeon 890M + XDNA2）上实测：NPU 仅在 512³ 左右快于 GPU（1.2–1.3×）；从 1024³ 起以及批量 attention
+  GEMM 上 GPU 更快，把一个 GEMM 拆给两者也不会更快，因为它们共享内存带宽。因此默认关闭：收益主要是减轻 GPU 负担和节能。
+  暂不支持 Intel NPU。详情与测量数据：[plan.md，第 7 阶段](plan.md)。
+
 ### 常用环境变量
 
 | 变量 | 作用 |
@@ -310,6 +336,8 @@ CUDA_HOME=$PWD/.work/numba-cf ./run_torch.sh --env .work/numba-cf script.py
 | `build/bin/vulkanizer-info` | 列出 Vulkanizer 能看到的 Vulkan 设备 |
 | `build/bin/vulkanizer-ptxc` | 离线 PTX → SPIR-V：`vulkanizer-ptxc k.ptx --list`、`-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | 复制带宽（HtoD/DtoH/DtoD，可分页与锁页）和分配开销：`vulkanizer-bandwidth [MiB]` |
+| `tools/build_npu_kernels.sh` | 用 mlir-aie 构建 AMD NPU 的 GEMM 内核：`tools/build_npu_kernels.sh [MxKxN ...\|--all]` |
+| `build/bin/vulkanizer-npu-bench` | GPU 与 NPU 的 GEMM 耗时对比（需 `-DVULKANIZER_NPU_XRT=ON` 构建） |
 
 示例：
 
@@ -338,6 +366,7 @@ src/cusparse          libcusparse.so.12（GLSL 编写的 SpMV/SpMM/SDDMM/SpSV/cs
 src/curand            libcurand.so.10（GLSL 编写的 XORWOW/MRG32k3a/Philox/Sobol；Sobol 数据：tools/gen_sobol_table.sh），include/curand/curand.h
 src/nccl              libnccl.so.2（同一台机器各 rank 之间的集合通信），include/nccl/nccl.h
 src/nvrtc             LD_AUDIT 库：让 NVRTC 交出 PTX 而不是 cubin（PyTorch 的 jiterator），nvJitLink 改用 cuLink* 链接（Numba）
+src/npu               把 cuBLAS GEMM 卸载到 NPU：检测（sysfs）、路由策略、AMD XDNA 后端（XRT）
 tests/                Driver API 测试 + 内部 Vulkan 测试
 tests/cuda            用 nvcc 编译的 Runtime API 程序
 tests/cudart_abi      clean-room 运行时类型与官方头文件的 ABI 一致性检查

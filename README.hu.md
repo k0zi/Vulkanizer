@@ -14,6 +14,7 @@ A `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so`, `libcufft.so`,
 közvetlen helyettesítője: a CUDA Driver és Runtime API-t (és a cuBLAS GEMM-családját, a sűrű és ritka lineáris algebrát,
 az FFT-t és a véletlenszámokat) Vulkan compute-ra építve valósítja meg, így a CUDA-programok NVIDIA-kártya nélkül
 futnak, bármely Vulkan 1.2-es GPU-n (AMD, Intel, llvmpipe).
+AMD XDNA NPU-val (Ryzen AI) rendelkező gépen a cuBLAS GEMM-jei az NPU-n is futhatnak: lásd [AMD NPU](#9-amd-npu-xdna).
 Terv, architektúra és fázisok: [plan.md](plan.md).
 
 ## Követelmények
@@ -253,6 +254,37 @@ modellnél 18,75 GiB): kb. 25 GB-nak szabadnak kell lennie. A `--expert-vram GiB
 MMQ könyvtár (`libstrata_kq.so`) az NVIDIA statikus runtime-ját linkeli, és nem indul el; ezek az expertek a motor
 FP16 prompt-útján futnak.
 
+### 9. AMD NPU (XDNA)
+
+XDNA NPU-s Ryzenen (Ryzen 7040/8040 „Phoenix/Hawk Point”: XDNA1; Ryzen AI 300 „Strix/Krackan”: XDNA2) a Vulkanizer
+cuBLAS-a a GEMM-eket (`cublasGemmEx`, `cublasGemmStridedBatchedEx`, `cublasLtMatmul`) a GPU helyett az NPU-n is
+futtathatja. Az NPU csak előre fordított, rögzített alakú kerneleket futtat, ezért a döntés GEMM-enként, a cuBLAS-ban
+születik; a PTX-kernelek mindig a GPU-n maradnak, az NPU nélküli gépek pedig ugyanúgy működnek, mint eddig. Kell hozzá
+az `amdxdna` kernel-driver (a Linux 6.14 óta in-tree) az NPU firmware-ével, és az XRT az amdxdna-pluginnal
+(az `xrt-smi examine` látja az NPU-t).
+
+```sh
+./build.sh --release -- -DVULKANIZER_NPU_XRT=ON   # az XRT-backend (nélküle csak a felderítés és a CPU-referencia)
+build/bin/vulkanizer-info                          # az NPU-t is kiírja: NPU: AMD XDNA ..., /dev/accel/accel0
+tools/build_npu_kernels.sh                         # mlir-aie GEMM-kernelek (256³..4096³, bf16 -> f32) a ~/.local/share/vulkanizer/npu-ba
+VULKANIZER_NPU=force ./run.sh ./my_cuda_app        # minden GEMM, amire van kernel, az NPU-n fut
+build/bin/vulkanizer-npu-bench                     # GPU és NPU idők összevetve
+```
+
+- `VULKANIZER_NPU=off` (alapértelmezés), `auto` (csak ott, ahol mérve gyorsabb volt: cache-elt host-memóriás operandusok,
+  kb. 256³–512³-es GEMM-ek), `force` (minden, amit a kernelek tudnak). `force` mellett az út zero-copy és aszinkron: a GPU
+  az NPU által is látott memóriába csomagolja az operandusokat, az NPU a stream sorrendjében, egy driver-szálon fut, a
+  cuBLAS-hívás azonnal visszatér; CUDA graph capture alatt is működik.
+- `VULKANIZER_NPU_SPLIT=<0..0.9>` (`force` mellett): egy nagy GEMM felosztva fut, ekkora része az NPU-n, közben a
+  maradéka a GPU-n.
+- A kernelek bf16 × bf16 → f32-t számolnak: f32 bemenet csak `CUBLAS_COMPUTE_32F_FAST_16BF` mellett megy az NPU-ra, a
+  többi típus a GPU-n marad. A GEMM a legkisebb kernelre töltődik ki, amibe belefér. Ha az NPU hibázik, a GEMM a GPU-n
+  vagy a hoston számolódik, az eredmény helyes marad.
+- Ryzen AI 9 HX 370-en (Radeon 890M + XDNA2) mérve: az NPU csak 512³ körül gyorsabb a GPU-nál (1,2–1,3×); 1024³-tól és a
+  batch-elt attention-GEMM-eken a GPU nyer, és egy GEMM megosztása a kettő között sem gyorsabb, mert ugyanazon a
+  memória-sávszélességen osztoznak. Ezért alapból ki van kapcsolva: a nyereség főleg a tehermentesített GPU és az energia.
+  Intel NPU-t még nem támogat. Részletek és mérések: [plan.md, 7. fázis](plan.md).
+
 ### Hasznos környezeti változók
 
 | Változó | Hatás |
@@ -331,6 +363,8 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
 | `build/bin/vulkanizer-info` | Kilistázza a Vulkanizer által látott Vulkan eszközöket |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | Másolási sávszélesség (HtoD/DtoH/DtoD, lapozható és pinned) és foglalási költség: `vulkanizer-bandwidth [MiB]` |
+| `tools/build_npu_kernels.sh` | Lefordítja az AMD NPU GEMM-kerneleit mlir-aie-vel: `tools/build_npu_kernels.sh [MxKxN ...\|--all]` |
+| `build/bin/vulkanizer-npu-bench` | GPU és NPU GEMM-idők összevetve (`-DVULKANIZER_NPU_XRT=ON`-nal fordul) |
 
 Példák:
 
@@ -359,6 +393,7 @@ src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 GLSL-ben)
 src/curand            libcurand.so.10 (XORWOW/MRG32k3a/Philox/Sobol GLSL-ben; Sobol-adatok: tools/gen_sobol_table.sh), include/curand/curand.h
 src/nccl              libnccl.so.2 (kollektívák egy gép rangjai között), include/nccl/nccl.h
 src/nvrtc             LD_AUDIT könyvtár: az NVRTC cubin helyett PTX-et ad (a PyTorch jiteratorához), az nvJitLink cuLink*-kal linkel (Numba)
+src/npu               a cuBLAS GEMM-ek NPU-ra küldése: felderítés (sysfs), útválasztási policy, AMD XDNA backend (XRT)
 tests/                Driver API tesztek + belső Vulkan teszt
 tests/cuda            nvcc-vel fordított Runtime API programok
 tests/cudart_abi      a clean-room runtime típusok ABI-egyezése a hivatalos headerekkel

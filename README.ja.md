@@ -13,6 +13,7 @@
 `libcuda.so`、`libcudart.so`、`libcublas.so`、`libcusolver.so`、`libcufft.so`、`libcusparse.so`、`libcurand.so` のドロップイン
 置き換えです。CUDA Driver API と Runtime API（および cuBLAS の GEMM 系、密行列・疎行列の線形代数、FFT、乱数生成）を Vulkan コンピュート上に実装しており、CUDA プログラムを NVIDIA カードなしで、
 Vulkan 1.2 対応の任意の GPU（AMD、Intel、llvmpipe）で実行できます。
+AMD XDNA NPU（Ryzen AI）を搭載したマシンでは、cuBLAS の GEMM を NPU でも実行できます：[AMD NPU](#9-amd-npu-xdna) を参照。
 計画・アーキテクチャ・フェーズ：[plan.md](plan.md)（ハンガリー語）。
 
 ## 必要環境
@@ -251,6 +252,35 @@ cuBLAS とランタイムにリンクします。トークナイザー（Qwen3.6
 ライブラリ（`libstrata_kq.so`）は NVIDIA の静的ランタイムをリンクしているため起動せず、それらのエキスパートはエンジンの
 FP16 プロンプトパスを使います。
 
+### 9. AMD NPU (XDNA)
+
+XDNA NPU 搭載の Ryzen（Ryzen 7040/8040「Phoenix/Hawk Point」：XDNA1、Ryzen AI 300「Strix/Krackan」：XDNA2）では、
+Vulkanizer の cuBLAS が GEMM（`cublasGemmEx`、`cublasGemmStridedBatchedEx`、`cublasLtMatmul`）を GPU の代わりに NPU で実行できます。
+NPU はプリコンパイルされた固定形状のカーネルしか実行できないため、判断は cuBLAS で GEMM ごとに行います。PTX カーネルは常に
+GPU に残り、NPU のないマシンの動作は従来どおりです。`amdxdna` カーネルドライバ（Linux 6.14 以降はカーネルに同梱）と NPU
+ファームウェア、amdxdna プラグイン付きの XRT が必要です（`xrt-smi examine` で NPU が見えること）。
+
+```sh
+./build.sh --release -- -DVULKANIZER_NPU_XRT=ON   # XRT バックエンド（なしの場合は検出と CPU リファレンスのみ）
+build/bin/vulkanizer-info                          # NPU も表示：NPU: AMD XDNA ..., /dev/accel/accel0
+tools/build_npu_kernels.sh                         # mlir-aie の GEMM カーネル（256³..4096³、bf16 -> f32）を ~/.local/share/vulkanizer/npu へ
+VULKANIZER_NPU=force ./run.sh ./my_cuda_app        # カーネルが対応する GEMM はすべて NPU で実行
+build/bin/vulkanizer-npu-bench                     # GPU と NPU の時間比較
+```
+
+- `VULKANIZER_NPU=off`（既定）、`auto`（計測で速かった場合のみ：キャッシュ付きホストメモリ上のオペランド、約 256³–512³ の
+  GEMM）、`force`（カーネルが対応するものすべて）。`force` ではゼロコピーかつ非同期です：GPU がオペランドを NPU から見える
+  メモリへパックし、NPU はドライバスレッド上でストリーム順に実行され、cuBLAS 呼び出しはすぐに戻ります。CUDA グラフの
+  キャプチャ中も動作します。
+- `VULKANIZER_NPU_SPLIT=<0..0.9>`（`force` 時）：大きな GEMM を分割し、その割合を NPU で、残りを同時に GPU で実行します。
+- カーネルは bf16 × bf16 → f32 で計算します：f32 入力は `CUBLAS_COMPUTE_32F_FAST_16BF` のときだけ NPU へ送られ、その他の型は
+  GPU に残ります。GEMM は収まる最小のカーネルまでパディングされます。NPU が失敗した場合は GPU またはホストで計算され、
+  結果は正しいままです。
+- Ryzen AI 9 HX 370（Radeon 890M + XDNA2）での計測：NPU が GPU より速いのは 512³ 前後（1.2–1.3×）のみで、1024³ 以上と
+  バッチ化された attention GEMM では GPU が勝ちます。両者はメモリ帯域を共有するため、GEMM を分割しても速くなりません。
+  そのため既定では無効で、利点は主に GPU の負荷軽減と省電力です。Intel NPU にはまだ対応していません。詳細と計測結果：
+  [plan.md、フェーズ 7](plan.md)。
+
 ### 便利な環境変数
 
 | 変数 | 効果 |
@@ -328,6 +358,8 @@ FP16 プロンプトパスを使います。
 | `build/bin/vulkanizer-info` | Vulkanizer から見える Vulkan デバイスを一覧表示 |
 | `build/bin/vulkanizer-ptxc` | オフラインの PTX → SPIR-V：`vulkanizer-ptxc k.ptx --list`、`-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | コピー帯域幅（HtoD/DtoH/DtoD、ページング可能とピン留め）と割り当てコスト：`vulkanizer-bandwidth [MiB]` |
+| `tools/build_npu_kernels.sh` | mlir-aie で AMD NPU の GEMM カーネルをビルド：`tools/build_npu_kernels.sh [MxKxN ...\|--all]` |
+| `build/bin/vulkanizer-npu-bench` | GPU と NPU の GEMM 時間比較（`-DVULKANIZER_NPU_XRT=ON` でビルド） |
 
 例：
 
@@ -356,6 +388,7 @@ src/cusparse          libcusparse.so.12（GLSL による SpMV/SpMM/SDDMM/SpSV/cs
 src/curand            libcurand.so.10（GLSL による XORWOW/MRG32k3a/Philox/Sobol。Sobol データ：tools/gen_sobol_table.sh）、include/curand/curand.h
 src/nccl              libnccl.so.2（1 台のマシンのランク間の集合通信）、include/nccl/nccl.h
 src/nvrtc             LD_AUDIT ライブラリ：NVRTC に cubin ではなく PTX を渡させる（PyTorch の jiterator）、nvJitLink は cuLink* でリンク（Numba）
+src/npu               cuBLAS GEMM の NPU へのオフロード：検出（sysfs）、ルーティングポリシー、AMD XDNA バックエンド（XRT）
 tests/                Driver API のテストと内部 Vulkan テスト
 tests/cuda            nvcc でコンパイルした Runtime API のプログラム
 tests/cudart_abi      クリーンルームのランタイム型と公式ヘッダとの ABI 一致チェック

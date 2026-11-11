@@ -14,6 +14,7 @@ Drop-in `libcuda.so`, `libcudart.so`, `libcublas.so`, `libcusolver.so`, `libcuff
 `libcurand.so`: implements the CUDA Driver and Runtime API (and the cuBLAS GEMM family, dense and sparse linear algebra,
 FFTs and random numbers) on top of Vulkan compute, so CUDA programs run without an NVIDIA card, on any Vulkan 1.2 GPU
 (AMD, Intel, llvmpipe).
+On a machine with an AMD XDNA NPU (Ryzen AI), cuBLAS GEMMs can also run on the NPU: see [AMD NPU](#9-amd-npu-xdna).
 Plan, architecture and phases: [plan.md](plan.md) (in Hungarian).
 
 ## Requirements
@@ -251,6 +252,36 @@ in RAM as well (18.75 GiB for this model): about 25 GB has to be free. `--expert
 K-quant MMQ library (`libstrata_kq.so`) links NVIDIA's static runtime and does not start; those experts take the
 engine's FP16 prompt path.
 
+### 9. AMD NPU (XDNA)
+
+On a Ryzen with an XDNA NPU (Ryzen 7040/8040 "Phoenix/Hawk Point": XDNA1; Ryzen AI 300 "Strix/Krackan": XDNA2),
+Vulkanizer's cuBLAS can run GEMMs (`cublasGemmEx`, `cublasGemmStridedBatchedEx`, `cublasLtMatmul`) on the NPU instead of
+the GPU. The NPU only runs precompiled, fixed-shape kernels, so the decision is made per GEMM in cuBLAS; PTX kernels always
+stay on the GPU, and every machine without an NPU behaves as before. It needs the `amdxdna` kernel driver (in-tree since
+Linux 6.14) with the NPU firmware, and XRT with the amdxdna plugin (`xrt-smi examine` sees the NPU).
+
+```sh
+./build.sh --release -- -DVULKANIZER_NPU_XRT=ON   # the XRT backend (without it: detection and the CPU reference only)
+build/bin/vulkanizer-info                          # lists the NPU too: NPU: AMD XDNA ..., /dev/accel/accel0
+tools/build_npu_kernels.sh                         # mlir-aie GEMM kernels (256³..4096³, bf16 -> f32) into ~/.local/share/vulkanizer/npu
+VULKANIZER_NPU=force ./run.sh ./my_cuda_app        # every GEMM the kernels can do goes to the NPU
+build/bin/vulkanizer-npu-bench                     # GPU vs NPU timings
+```
+
+- `VULKANIZER_NPU=off` (default), `auto` (only where it was measured faster: operands in cached host memory, GEMMs of
+  about 256³–512³), `force` (everything the kernels support). With `force` the path is zero-copy and asynchronous: the GPU
+  packs the operands into memory the NPU sees, the NPU runs in stream order on a driver thread and the cuBLAS call
+  returns at once; it works under CUDA graph capture too.
+- `VULKANIZER_NPU_SPLIT=<0..0.9>` (with `force`): a large GEMM is split, that share runs on the NPU while the rest runs
+  on the GPU.
+- The kernels are bf16 × bf16 → f32: f32 input goes to the NPU only with `CUBLAS_COMPUTE_32F_FAST_16BF`, other types stay
+  on the GPU. A GEMM is padded to the smallest kernel it fits in. If the NPU fails, the GEMM is computed on the GPU or the
+  host, so the result stays correct.
+- Measured on a Ryzen AI 9 HX 370 (Radeon 890M + XDNA2): the NPU is faster than the GPU only around 512³ (1.2–1.3×);
+  from 1024³ up and on batched attention GEMMs the GPU wins, and splitting a GEMM between the two is not faster either,
+  since they share the memory bandwidth. That is why it is off by default: the gain is mostly a freed GPU and energy.
+  Intel NPUs are not supported yet. Details and measurements: [plan.md, phase 7](plan.md).
+
 ### Useful environment variables
 
 | Variable | Effect |
@@ -330,6 +361,8 @@ Full list: [plan.md, section 4](plan.md).
 | `build/bin/vulkanizer-info` | Lists the Vulkan devices Vulkanizer can see |
 | `build/bin/vulkanizer-ptxc` | Offline PTX → SPIR-V: `vulkanizer-ptxc k.ptx --list`, `-e vecAdd -o k.spv --dis --val` |
 | `build/bin/vulkanizer-bandwidth` | Copy bandwidth (HtoD/DtoH/DtoD, pageable and pinned) and allocation cost: `vulkanizer-bandwidth [MiB]` |
+| `tools/build_npu_kernels.sh` | Builds the AMD NPU GEMM kernels with mlir-aie: `tools/build_npu_kernels.sh [MxKxN ...\|--all]` |
+| `build/bin/vulkanizer-npu-bench` | GPU vs NPU GEMM timings (built with `-DVULKANIZER_NPU_XRT=ON`) |
 
 Examples:
 
@@ -358,6 +391,7 @@ src/cusparse          libcusparse.so.12 (SpMV/SpMM/SDDMM/SpSV/csrgeam2 in GLSL),
 src/curand            libcurand.so.10 (XORWOW/MRG32k3a/Philox/Sobol in GLSL; Sobol data: tools/gen_sobol_table.sh), include/curand/curand.h
 src/nccl              libnccl.so.2 (collectives between the ranks of one machine), include/nccl/nccl.h
 src/nvrtc             LD_AUDIT library: NVRTC hands over PTX instead of a cubin (PyTorch's jiterator), nvJitLink links through cuLink* (Numba)
+src/npu               NPU offload of cuBLAS GEMMs: detection (sysfs), routing policy, AMD XDNA backend (XRT)
 tests/                Driver API tests + internal Vulkan test
 tests/cuda            Runtime API programs compiled with nvcc
 tests/cudart_abi      ABI match of the clean-room runtime types against the official headers
