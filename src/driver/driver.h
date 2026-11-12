@@ -226,6 +226,16 @@ struct VmMapping {
     size_t offset = 0;  // into the allocation
 };
 
+// Staging from one device to another (copyBetweenDevices): the same system memory pages as a buffer
+// of each, split into `chunks` slots of `chunk` bytes used round robin.
+struct PeerLink {
+    vk::Buffer src, dst;  // on the source device; imported on the destination device
+    VkDeviceSize chunk = 0;
+    uint32_t chunks = 0, next = 0;
+    std::vector<uint64_t> used;  // per slot: destination serial of its last copy out of the slot
+    bool failed = false;         // the devices cannot share memory: copies go through the host
+};
+
 struct DeviceSlot {
     CUdevice ordinal = 0;
     const vk::PhysicalDeviceInfo* info = nullptr;
@@ -239,6 +249,9 @@ struct DeviceSlot {
     CUmemPoolHandle_st* currentPool = &defaultPool;
     std::map<CUdeviceptr, VmReservation> reservations;  // keyed by base address
     std::map<CUdeviceptr, VmMapping> mappings;          // keyed by mapped address
+    // cuMemAlloc beyond the device's maxMemoryAllocationSize (RADV: 4 GiB): a reservation with
+    // memory pieces mapped one after another (virtual memory, api_vmm.cpp); base -> size.
+    std::map<CUdeviceptr, size_t> largeAllocations;
     // Device memory of other processes (cuIpcOpenMemHandle), by (exporter pid, memory id): the base
     // of the imported buffer (in `allocations`) and the number of opens.
     struct IpcImport {
@@ -256,6 +269,8 @@ struct DeviceSlot {
     CUresult stickyError = CUDA_SUCCESS;
     vk::Buffer gridWorkspace;  // cooperative launches' {size, barrier} (cooperative groups' grid.sync())
     vk::Buffer heap;           // device-side malloc's heap (ptx/heap.h), made with the first module that uses it
+    // Staging towards other devices (peer.cpp), by destination ordinal; made with the first copy.
+    std::map<CUdevice, std::unique_ptr<PeerLink>> peerLinks;
 };
 
 class Driver {
@@ -333,6 +348,10 @@ struct ApiScope {
     vk::Device* dev = nullptr;
 };
 CUresult enterContext(ApiScope& scope);
+// Waits for all work recorded on `dev` with the driver lock released meanwhile (other threads keep
+// launching, on this device and others), then takes it again. Only where nothing the caller holds
+// from the driver's tables can go away meanwhile, other than through the application freeing it.
+VkResult finishUnlocked(ApiScope& scope, vk::Device& dev);
 
 // The default (0), legacy and per-thread streams, or a live stream of the context.
 bool validStream(CUstream stream);
@@ -355,6 +374,19 @@ bool findPieces(DeviceSlot& slot, CUdeviceptr ptr, size_t bytes, std::vector<All
 // Unified addressing over the devices: the device whose memory holds [ptr, ptr + bytes) (`preferred`
 // first, as separate Vulkan devices' address ranges may overlap), or nullptr. Caller holds the driver lock.
 DeviceSlot* findPiecesOnAnyDevice(DeviceSlot& preferred, CUdeviceptr ptr, size_t bytes, std::vector<AllocPiece>& out);
+
+// Copies between two devices' memory (multi-GPU, peer.cpp): in queue order on both, through
+// staging memory both devices reach (a dma-buf of system memory), without the host touching the
+// data; where the devices cannot share memory, through the host. Returns once recorded, or once
+// done with `sync`. Caller holds the driver lock.
+CUresult copyBetweenDevices(DeviceSlot& to, const std::vector<AllocPiece>& dst, DeviceSlot& from,
+                            const std::vector<AllocPiece>& src, size_t bytes, bool sync);
+// Makes the work recorded on `waiting` from now on wait for `serial` of `other` (a cross-device
+// event wait), without blocking the caller.
+CUresult waitForOtherDevice(vk::Device& waiting, vk::Device& other, uint64_t serial);
+
+// Frees a virtual memory reservation of `slot` (api_vmm.cpp), unmapping what is still mapped in it.
+CUresult freeReservation(DeviceSlot& slot, CUdeviceptr ptr, size_t size);
 
 // The reservation containing ptr, or nullptr.
 VmReservation* findReservation(DeviceSlot& slot, CUdeviceptr ptr);

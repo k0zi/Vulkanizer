@@ -196,7 +196,7 @@ CUresult CUDAAPI cuCtxSynchronize(void) {
     VULKANIZER_TRACE_API();
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
-    if (VkResult vr = s.dev->finish()) return toCuResult(vr);
+    if (VkResult vr = finishUnlocked(s, *s.dev)) return toCuResult(vr);
     return checkDeviceAssert(*s.slot, true);
 }
 

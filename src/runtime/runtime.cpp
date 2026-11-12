@@ -841,7 +841,7 @@ cudaError_t CUDARTAPI cudaMemcpyPeerAsync(void* dst, int dstDevice, const void* 
                                           cudaStream_t stream) {
     ENTER();
     if (dstDevice == srcDevice) return memcpyImpl(dst, src, count, cudaMemcpyDeviceToDevice, stream, true);
-    CUcontext dstCtx, srcCtx;  // between devices: the driver copies through host memory
+    CUcontext dstCtx, srcCtx;  // between devices: the driver stages the copy (peer.cpp)
     if (cudaError_t e = primaryContext(dstDevice, dstCtx)) return record(e);
     if (cudaError_t e = primaryContext(srcDevice, srcCtx)) return record(e);
     return record(cuMemcpyPeerAsync(CUdeviceptr(dst), dstCtx, CUdeviceptr(src), srcCtx, count, stream));
@@ -1943,6 +1943,27 @@ cudaError_t CUDARTAPI cudaMemcpy3D(const cudaMemcpy3DParms* p) {
     if (cudaError_t e = cudaMemcpy3DAsync(p, nullptr)) return e;
     return cudaSuccess;
 }
+
+// Between devices: unified addressing finds each side's device (the devices' addresses are
+// distinct), so this is a 3D copy of kind Default; the driver stages two devices' memory.
+cudaError_t CUDARTAPI cudaMemcpy3DPeerAsync(const cudaMemcpy3DPeerParms* p, cudaStream_t stream) {
+    ENTER();
+    if (!p) return record(cudaErrorInvalidValue);
+    int count = 0;
+    if (cudaError_t e = cudaGetDeviceCount(&count)) return e;
+    if (p->srcDevice < 0 || p->srcDevice >= count || p->dstDevice < 0 || p->dstDevice >= count)
+        return record(cudaErrorInvalidDevice);
+    for (int d : {p->srcDevice, p->dstDevice}) {  // both devices' contexts exist
+        CUcontext ctx;
+        if (cudaError_t e = primaryContext(d, ctx)) return record(e);
+    }
+    const cudaMemcpy3DParms q{p->srcArray, p->srcPos, p->srcPtr, p->dstArray, p->dstPos, p->dstPtr, p->extent,
+                              cudaMemcpyDefault};
+    CUDA_MEMCPY3D c;
+    if (cudaError_t e = toDriverCopy(&q, c)) return record(e);
+    return record(stream ? cuMemcpy3DAsync(&c, stream) : cuMemcpy3D(&c));
+}
+cudaError_t CUDARTAPI cudaMemcpy3DPeer(const cudaMemcpy3DPeerParms* p) { return cudaMemcpy3DPeerAsync(p, nullptr); }
 
 cudaError_t CUDARTAPI cudaCreateTextureObject(cudaTextureObject_t* texObject, const cudaResourceDesc* resDesc,
                                               const cudaTextureDesc* texDesc, const cudaResourceViewDesc* viewDesc) {

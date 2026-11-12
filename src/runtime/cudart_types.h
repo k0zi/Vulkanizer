@@ -367,6 +367,17 @@ struct cudaMemcpy3DParms {
     struct cudaExtent extent;
     cudaMemcpyKind kind;
 };
+struct cudaMemcpy3DPeerParms {
+    cudaArray_t srcArray;
+    struct cudaPos srcPos;
+    struct cudaPitchedPtr srcPtr;
+    int srcDevice;
+    cudaArray_t dstArray;
+    struct cudaPos dstPos;
+    struct cudaPitchedPtr dstPtr;
+    int dstDevice;
+    struct cudaExtent extent;
+};
 enum cudaResourceType {
     cudaResourceTypeArray = 0,
     cudaResourceTypeMipmappedArray = 1,

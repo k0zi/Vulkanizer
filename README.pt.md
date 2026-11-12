@@ -29,7 +29,7 @@ Opcional (nomes de pacotes do Ubuntu):
 | `vulkan-validationlayers` | `./run.sh --validation` |
 | `clang` | Gerar o PTX de teste sem o SDK do CUDA (`tests/data/gen_ptx.sh`) |
 | `ninja-build` | Compilações mais rápidas (`build.sh` o usa automaticamente se estiver presente) |
-| `g++-13` | Compilador host do nvcc (o CUDA 12.9 não aceita o gcc 15) |
+| `g++-13` ou `g++-14` | Compilador host do nvcc (o CUDA 12.9 não aceita o gcc 15) |
 
 Testes compilados com um nvcc real: `tools/setup_cuda.sh` baixa o nvcc e o runtime da NVIDIA, como pacotes
 redistribuíveis, para `.cuda/` (sem driver, sem GPU, sem root). Se `.cuda/` existir, o CMake compila os programas
@@ -284,6 +284,38 @@ build/bin/vulkanizer-npu-bench                     # tempos de GPU e NPU compara
   pois elas dividem a largura de banda da memória. Por isso vem desligado por padrão: o ganho é sobretudo uma GPU
   liberada e energia. NPUs da Intel ainda não são suportadas. Detalhes e medições: [plan.md, fase 7](plan.md).
 
+### 10. Several GPUs (tensor split)
+
+Várias GPUs (por exemplo uma iGPU com 64 GB e duas eGPUs de 16 GB) são dispositivos CUDA separados; não se fundem numa
+única GPU grande, pois um kernel só alcança a memória do seu próprio dispositivo. Ainda assim a memória de todas pode
+ser usada: a aplicação divide o modelo por camadas (llama.cpp `-sm layer`, `-ts`; PyTorch/accelerate `device_map`).
+Cada dispositivo tem seus próprios endereços (o endereçamento unificado funciona entre eles), cópias entre dispositivos
+vão na fila dos dois pela memória do sistema sem que o host toque nos dados (com eGPUs, na velocidade do link:
+2,3 GB/s via USB4), e uma alocação pode ser maior que uma alocação Vulkan (RADV: 4 GiB), de modo que um dispositivo
+pode conter uma parte inteira do modelo. Ordem dos dispositivos: discretas primeiro, depois integradas;
+`CUDA_DEVICE_ORDER=PCI_BUS_ID` ordena pelo endereço PCI.
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1 ./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer   # todas as camadas nas duas eGPUs (divididas pela memória livre)
+./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer \
+    -dev CUDA0,CUDA1,CUDA2 -ts 16,16,6                                                     # a iGPU também: o llama.cpp deixa de fora GPUs integradas ao lado de discretas, a menos que nomeadas
+CUDA_VISIBLE_DEVICES=2,0 ./run.sh ./my_cuda_app                                            # quais dispositivos e em que ordem (índices ou GPU-<uuid>)
+```
+
+Medido com llama.cpp num Ryzen AI 9 HX 370 (iGPU 890M) com duas RX 9060 XT 16 GB em gabinetes USB4,
+Qwen3.6-35B-A3B Q5_K_XL (25 GiB, mais do que cabe numa eGPU):
+
+| Dispositivos | `-ts` | pp512 t/s | tg128 t/s |
+|---|---|---|---|
+| 890M sozinha | – | 23 | 5,9 |
+| 2× RX 9060 XT (eGPU) | auto | 437 | 39,7 |
+| 2× RX 9060 XT + 890M | 16/16/6 | 191 | 19,1 |
+| 2× RX 9060 XT + 890M | 16/16/40 | 46 | 8,4 |
+
+As camadas rodam uma após a outra e a parte do dispositivo mais lento dita o ritmo: inclua a iGPU só se o modelo não
+couber sem ela, e dê a ela uma parte pequena. Se o `-ts` colocar numa GPU mais do que sua memória comporta, o driver
+transborda para a memória do sistema e a geração se arrasta (3 t/s aqui).
+
 ### Variáveis de ambiente úteis
 
 | Variável | Efeito |
@@ -325,10 +357,12 @@ Lista completa: [plan.md, seção 4](plan.md).
   entre processos está concluído assim que é registrado (registrá-lo espera pelo dispositivo).
 - NCCL (`libnccl.so.2`, o backend "nccl" do `torch.distributed`: DDP, FSDP) funciona entre os ranks de uma máquina,
   que podem compartilhar uma GPU; com mais de um rank os dados passam pela memória do host.
-- Várias GPUs são dispositivos separados: `cudaMemcpyPeer` e as cópias comuns entre ponteiros de dois dispositivos
-  (endereçamento unificado, p. ex. `tensor.to("cuda:1")` do PyTorch) passam pela memória do host, mas um kernel nunca
-  acessa a memória de outra GPU (sem acesso entre pares). Lançamentos cooperativos (`grid.sync()`) funcionam até o
-  número de blocos que cabem ao mesmo tempo na GPU.
+- Várias GPUs são dispositivos CUDA separados, cada um com seus próprios endereços (o endereçamento unificado funciona
+  entre eles): um kernel nunca acessa a memória de outra GPU (sem acesso entre pares), então é a aplicação que divide
+  um modelo (veja [Várias GPUs](#10-several-gpus-tensor-split)). Cópias entre dois dispositivos (`cudaMemcpyPeer`,
+  cópias comuns entre ponteiros de dois dispositivos, p. ex. `tensor.to("cuda:1")` do PyTorch) vão na fila dos dois
+  dispositivos pela memória do sistema, sem que o host toque nos dados. Lançamentos cooperativos (`grid.sync()`)
+  funcionam até o número de blocos que cabem ao mesmo tempo na GPU.
 - A memória managed, fixada (pinned) e registrada é memória do host que a GPU usa no lugar, no mesmo endereço;
   a memória managed nunca migra para a GPU (numa GPU integrada é a mesma memória de qualquer forma).
 - A memória do host registrada (`cuMemHostRegister`) que é um mapeamento próprio (`mmap`) num endereço onde a GPU pode

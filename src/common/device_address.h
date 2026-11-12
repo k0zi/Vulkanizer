@@ -16,4 +16,14 @@ namespace vulkanizer::common {
 // and the GPU, as CUDA's pinned, registered and managed memory do.
 constexpr uint64_t kAddressMask = 0x0000FFFFFFFFFFFFull;
 
+// Several devices (multi-GPU): every Vulkan device has an address space of its own, so two GPUs
+// hand out the same buffer addresses. For unified addressing (cudaMemcpyDefault,
+// cudaPointerGetAttributes) device n's addresses carry n in bits 55..48 (vk::Device::addressTag()),
+// where its bits 63..48 are all set anyway: the kernels' OR sets those bits again, so the tag never
+// reaches the GPU. Device 0 has no tag; devices whose buffers live in the lower half (llvmpipe: CPU
+// pointers, unique in the process already) neither. Bits 63..56 stay free for the PTX compiler's
+// generic shared/local tags; host memory used in place keeps its host address on every device.
+constexpr unsigned kAddressTagShift = 48;
+constexpr uint64_t kAddressTagMask = 0x00FF000000000000ull;
+
 }  // namespace vulkanizer::common

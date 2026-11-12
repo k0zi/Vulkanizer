@@ -50,6 +50,12 @@ const uint32_t kGemmCoop16Spirv[] = {
 const uint32_t kGemmCoop16HSpirv[] = {
 #include "gemm_coopmat16_h.comp.inc"
 };
+const uint32_t kGemmCoop16SSpirv[] = {
+#include "gemm_coopmat16s.comp.inc"
+};
+const uint32_t kGemmCoop16SHSpirv[] = {
+#include "gemm_coopmat16s_h.comp.inc"
+};
 const uint32_t kGemmCoop8Spirv[] = {
 #include "gemm_coopmat8.comp.inc"
 };
@@ -159,8 +165,11 @@ struct cublasContext {
     int float16 = -1;  // device has f16 arithmetic (-1: not queried yet)
     // gemm_coopmat.comp, indexed by f16 C; its matrix size S (0: no cooperative matrices, -1: not
     // queried yet) and the subgroup size (a workgroup is 4 subgroups)
-    CUfunction gemmCoop[2] = {};
-    int coopSize = -1, subgroupSize = 0;
+    // indexed by bit 0 = f16 C, bit 1 = 64 x 64 tiles (S = 16 only)
+    CUfunction gemmCoop[4] = {};
+    int coopSize = -1, subgroupSize = 0, multiprocessors = 0;
+    int coopFaster = -1;  // gemm_coopmat beats the tiled kernel on this device (-1: not measured yet)
+    int forcePath = 0;    // while measuring: 1 = cooperative matrices, 2 = the tiled kernel
     CUfunction npu = nullptr;  // npu.comp: packing and epilogue of the zero-copy NPU path
     CUfunction trsm = nullptr;
 };
@@ -539,6 +548,66 @@ bool runSplit(cublasHandle_t h, const Gemm& g, float alpha, float beta, cublasSt
     return true;
 }
 
+cublasStatus_t run(cublasHandle_t h, const Gemm& g);
+
+// Whether the cooperative matrix kernel is faster than the tiled one on the handle's device. Not a
+// given: on RDNA4 it is about twice as fast, on RDNA3.5 (Radeon 890M) three times slower. Measured
+// once per device, on a 1024^3 f16 product of scratch memory on a stream of its own (both kernels
+// timed by events after a warm-up launch). VULKANIZER_GEMM_COOP=0/1 decides instead.
+bool coopFaster(cublasHandle_t h) {
+    if (h->coopFaster >= 0) return h->coopFaster > 0;
+    if (const char* env = std::getenv("VULKANIZER_GEMM_COOP"); env && *env) return (h->coopFaster = std::strcmp(env, "0") != 0) > 0;
+    static std::mutex mutex;
+    static std::map<CUdevice, bool> measured;
+    std::lock_guard<std::mutex> lock(mutex);
+    CUdevice dev = 0;
+    if (cuCtxGetDevice(&dev) != CUDA_SUCCESS) return (h->coopFaster = 1) > 0;
+    if (auto it = measured.find(dev); it != measured.end()) return (h->coopFaster = it->second) > 0;
+
+    constexpr int kN = 1024;
+    bool coop = true;  // kept if the measurement fails
+    CUdeviceptr a = 0, b = 0, c = 0;
+    CUstream stream = nullptr;
+    CUevent ev[3] = {};
+    const CUstream userStream = h->stream;
+    const cublasPointerMode_t userMode = h->pointerMode;
+    float ms[2] = {};
+    bool ok = cuMemAlloc(&a, size_t(kN) * kN * 2) == CUDA_SUCCESS && cuMemAlloc(&b, size_t(kN) * kN * 2) == CUDA_SUCCESS &&
+              cuMemAlloc(&c, size_t(kN) * kN * 4) == CUDA_SUCCESS && cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING) == CUDA_SUCCESS;
+    for (CUevent& e : ev) ok = ok && cuEventCreate(&e, CU_EVENT_DEFAULT) == CUDA_SUCCESS;
+    if (ok) {
+        ok = cuMemsetD16Async(a, 0x3c00, size_t(kN) * kN, stream) == CUDA_SUCCESS &&
+             cuMemsetD16Async(b, 0x3c00, size_t(kN) * kN, stream) == CUDA_SUCCESS;
+        h->stream = stream;
+        h->pointerMode = CUBLAS_POINTER_MODE_HOST;
+        const float one = 1, zero = 0;
+        Gemm g{CUBLAS_OP_T, CUBLAS_OP_N, kN, kN, kN, &one, reinterpret_cast<void*>(a), CUDA_R_16F, kN, 0,
+               reinterpret_cast<void*>(b), CUDA_R_16F, kN, 0, &zero, reinterpret_cast<void*>(c), CUDA_R_32F, kN, 0,
+               1, false, CUBLAS_COMPUTE_32F, false};
+        for (int path = 1; ok && path <= 2; ++path) {
+            h->forcePath = path;
+            ok = run(h, g) == CUBLAS_STATUS_SUCCESS && cuEventRecord(ev[0], stream) == CUDA_SUCCESS;  // warm-up
+            for (int i = 0; ok && i < 3; ++i) ok = run(h, g) == CUBLAS_STATUS_SUCCESS;
+            ok = ok && cuEventRecord(ev[path], stream) == CUDA_SUCCESS && cuEventSynchronize(ev[path]) == CUDA_SUCCESS &&
+                 cuEventElapsedTime(&ms[path - 1], ev[0], ev[path]) == CUDA_SUCCESS;
+        }
+        h->forcePath = 0;
+        h->stream = userStream;
+        h->pointerMode = userMode;
+        if (ok) coop = ms[0] <= ms[1];
+        if (stream) cuStreamSynchronize(stream);
+    }
+    VULKANIZER_DEBUG("gemm: cooperative matrices %.3f ms, tiled %.3f ms (1024^3 f16, 3 runs): %s", ms[0], ms[1],
+                     ok ? (coop ? "cooperative matrices" : "tiled") : "measurement failed, cooperative matrices");
+    for (CUevent e : ev)
+        if (e) cuEventDestroy(e);
+    if (stream) cuStreamDestroy(stream);
+    for (CUdeviceptr p : {a, b, c})
+        if (p) cuMemFree(p);
+    measured[dev] = coop;
+    return (h->coopFaster = coop) > 0;
+}
+
 cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (!h) return CUBLAS_STATUS_NOT_INITIALIZED;
     if (g.m < 0 || g.n < 0 || g.k < 0 || g.batch < 0) return CUBLAS_STATUS_INVALID_VALUE;
@@ -628,8 +697,8 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     const auto aligned = [](const void* ptr, long long stride, int ld) {
         return (reinterpret_cast<uintptr_t>(ptr) & 15) == 0 && stride % 8 == 0 && ld % 8 == 0;
     };
-    const bool fast = g.transa != CUBLAS_OP_N && g.transb == CUBLAS_OP_N && ta == 1 && tb == 1 && tc != 2 &&
-                      !g.pointerArrays && aligned(g.a, g.strideA, g.lda) && aligned(g.b, g.strideB, g.ldb);
+    bool fast = h->forcePath != 2 && g.transa != CUBLAS_OP_N && g.transb == CUBLAS_OP_N && ta == 1 && tb == 1 &&
+                tc != 2 && !g.pointerArrays && aligned(g.a, g.strideA, g.lda) && aligned(g.b, g.strideB, g.ldb);
     // CUBLAS_COMPUTE_16F permits f16 arithmetic: packed f16 products where the device has it.
     if (fast && h->float16 < 0 && vulkanizerGetFeature(VULKANIZER_FEATURE_FLOAT16_ARITHMETIC, &h->float16) != CUDA_SUCCESS)
         h->float16 = 0;
@@ -640,7 +709,13 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
             4 * h->subgroupSize > 1024)
             h->coopSize = 0;
     }
-    const bool coop = fast && h->coopSize > 0;
+    // Where the device has them and they are the faster kernel there (coopFaster); otherwise the
+    // tiled kernel takes products of a full tile, which beats gemm_f16_tn on such devices.
+    bool coop = fast && h->coopSize > 0;
+    if (coop && h->forcePath == 0 && !coopFaster(h)) {
+        coop = false;
+        fast = g.m < int(kFastTile) || g.n < int(kFastTile);
+    }
     const bool f16Math = fast && !coop && h->float16 > 0 &&
                          (g.compute == CUBLAS_COMPUTE_16F || g.compute == CUBLAS_COMPUTE_32F_FAST_16F) &&
                          !std::getenv("VULKANIZER_GEMM_F32");
@@ -666,16 +741,29 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
                  (vec(g.b, g.strideB, g.ldb, tb, alongKB ? g.k : g.n) ? 128u : 0u);
     }
     if (coop) {
-        CUfunction& fn = h->gemmCoop[tc == 1 ? 1 : 0];
+        // 128 x 128 tiles (2 x 2 subgroups of 4 x 4 matrices); 64 x 64 ones (2 x 2 matrices) where that
+        // leaves compute units idle: about 3x faster for a 1000 x 77 product, 1.5x slower for large ones.
+        const bool s16 = h->coopSize == 16, halfC = tc == 1;
+        if (!h->multiprocessors) {
+            CUdevice dev = 0;
+            if (cuCtxGetDevice(&dev) != CUDA_SUCCESS ||
+                cuDeviceGetAttribute(&h->multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) != CUDA_SUCCESS)
+                h->multiprocessors = 1;
+        }
+        const long long bigTiles = (long long)((g.m + 127) / 128) * ((g.n + 127) / 128) * g.batch;
+        const bool small = s16 && bigTiles < h->multiprocessors;
+        CUfunction& fn = h->gemmCoop[(halfC ? 1 : 0) | (small ? 2 : 0)];
         if (!fn) {
-            const bool s16 = h->coopSize == 16, halfC = tc == 1;
-            const uint32_t* code = s16 ? (halfC ? kGemmCoop16HSpirv : kGemmCoop16Spirv) : (halfC ? kGemmCoop8HSpirv : kGemmCoop8Spirv);
-            const size_t words = (s16 ? (halfC ? sizeof kGemmCoop16HSpirv : sizeof kGemmCoop16Spirv)
-                                      : (halfC ? sizeof kGemmCoop8HSpirv : sizeof kGemmCoop8Spirv)) / 4;
+            const uint32_t* code = small ? (halfC ? kGemmCoop16SHSpirv : kGemmCoop16SSpirv)
+                                   : s16 ? (halfC ? kGemmCoop16HSpirv : kGemmCoop16Spirv)
+                                         : (halfC ? kGemmCoop8HSpirv : kGemmCoop8Spirv);
+            const size_t words = (small ? (halfC ? sizeof kGemmCoop16SHSpirv : sizeof kGemmCoop16SSpirv)
+                                  : s16 ? (halfC ? sizeof kGemmCoop16HSpirv : sizeof kGemmCoop16Spirv)
+                                        : (halfC ? sizeof kGemmCoop8HSpirv : sizeof kGemmCoop8Spirv)) / 4;
             if (vulkanizerCreateSpirvFunction(&fn, code, words, "main", sizeof(GemmParams)) != CUDA_SUCCESS)
                 return CUBLAS_STATUS_INTERNAL_ERROR;
         }
-        const unsigned tile = 4 * unsigned(h->coopSize);  // 2 x 2 subgroups of 2 x 2 matrices
+        const unsigned tile = (small ? 4 : 8) * unsigned(h->coopSize);
         const unsigned gx = (unsigned(g.m) + tile - 1) / tile, gy = (unsigned(g.n) + tile - 1) / tile;
         for (int first = 0; first < g.batch; first += int(kMaxGridZ)) {
             p.batchOffset = first;

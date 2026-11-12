@@ -94,7 +94,7 @@ static CUresult copyPieces(vk::Device& dev, const std::vector<AllocPiece>& src, 
 // Unified addressing: each side is device memory if it falls inside an allocation (device memory,
 // or host memory the device accesses) of the current context's device or of another one, other host
 // memory otherwise. `dstDevice` and `srcDevice` require that side to be device memory (cuMemcpyHtoD
-// and the like). Between two devices the data goes through the host, as in cuMemcpyPeer.
+// and the like). Between two devices: copyBetweenDevices, as cuMemcpyPeer.
 static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_t bytes, bool sync,
                             bool dstDevice = false, bool srcDevice = false) {
     if (bytes == 0) return CUDA_SUCCESS;
@@ -104,11 +104,7 @@ static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_
     DeviceSlot* srcSlot = findPiecesOnAnyDevice(*s.slot, src, bytes, sr);
     const bool dstDev = dstSlot != nullptr, srcDev = srcSlot != nullptr;
     if ((dstDevice && !dstDev) || (srcDevice && !srcDev)) return CUDA_ERROR_INVALID_VALUE;
-    if (dstDev && srcDev && dstSlot != srcSlot) {
-        std::vector<char> staging(bytes);
-        if (CUresult r = readPieces(*srcSlot->vk, sr, staging.data())) return r;
-        return writePieces(*dstSlot->vk, d, staging.data());
-    }
+    if (dstDev && srcDev && dstSlot != srcSlot) return copyBetweenDevices(*dstSlot, d, *srcSlot, sr, bytes, sync);
     if (dstDev && srcDev) {
         vk::Device& dev = *dstSlot->vk;
         // From pinned or managed memory into device memory while the device is idle (inputs uploaded
@@ -124,7 +120,12 @@ static CUresult copyUnified(ApiScope& s, CUdeviceptr dst, CUdeviceptr src, size_
         return copyPieces(dev, sr, d, sync);
     }
     if (dstDev) return writePieces(*dstSlot->vk, d, reinterpret_cast<const void*>(src));
-    if (srcDev) return readPieces(*srcSlot->vk, sr, reinterpret_cast<void*>(dst));
+    if (srcDev) {
+        // The read waits for the work recorded before it: that wait without the driver lock (the pieces
+        // stay valid: table entries do not move, and freeing them meanwhile is the application's race).
+        if (VkResult vr = finishUnlocked(s, *srcSlot->vk)) return toCuResult(vr);
+        return readPieces(*srcSlot->vk, sr, reinterpret_cast<void*>(dst));
+    }
     std::memmove(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src), bytes);
     return CUDA_SUCCESS;
 }
@@ -136,10 +137,46 @@ CUresult CUDAAPI cuMemGetInfo_v2(size_t* free, size_t* total) {
     if (!free || !total) return CUDA_ERROR_INVALID_VALUE;
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
-    // TODO: VK_EXT_memory_budget for real numbers.
-    const size_t capacity = static_cast<size_t>(s.slot->info->deviceLocalBytes);
-    *total = capacity;
-    *free = capacity > s.slot->allocatedBytes ? capacity - s.slot->allocatedBytes : 0;
+    VkDeviceSize f = 0, t = 0;
+    s.dev->memoryInfo(s.slot->allocatedBytes, f, t);
+    *free = static_cast<size_t>(f);
+    *total = static_cast<size_t>(t);
+    return CUDA_SUCCESS;
+}
+
+// An allocation larger than one Vulkan allocation can be (RADV: 4 GiB; a large model's weights on one
+// device): virtual memory, one contiguous address range with memory pieces of at most that size
+// mapped one after another. cuMemFree takes it apart again.
+static CUresult allocateLarge(ApiScope& s, CUdeviceptr* dptr, size_t bytesize) {
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = s.slot->ordinal;
+    size_t g = 0;
+    if (CUresult r = cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM)) return r;
+    const size_t size = (bytesize + g - 1) / g * g;
+    const size_t limit = s.slot->info->maxMemoryAllocationSize ? s.slot->info->maxMemoryAllocationSize : size;
+    const size_t piece = std::max(g, limit / g * g);
+    CUdeviceptr base = 0;
+    if (CUresult r = cuMemAddressReserve(&base, size, 0, 0, 0)) return r;
+    for (size_t at = 0; at < size; at += piece) {
+        const size_t n = std::min(piece, size - at);
+        CUmemGenericAllocationHandle h = 0;
+        CUresult r = cuMemCreate(&h, n, &prop, 0);
+        if (r == CUDA_SUCCESS) {
+            r = cuMemMap(base + at, n, 0, h, 0);
+            cuMemRelease(h);  // the mapping keeps the memory
+        }
+        if (r != CUDA_SUCCESS) {
+            if (at) cuMemUnmap(base, at);
+            cuMemAddressFree(base, size);
+            return r;
+        }
+    }
+    s.slot->largeAllocations[base] = size;
+    VULKANIZER_DEBUG("cuMemAlloc(%zu) -> 0x%llx (virtual memory, pieces of %zu bytes)", bytesize,
+                     static_cast<unsigned long long>(base), piece);
+    *dptr = base;
     return CUDA_SUCCESS;
 }
 
@@ -148,6 +185,9 @@ CUresult CUDAAPI cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     if (!dptr || bytesize == 0) return CUDA_ERROR_INVALID_VALUE;
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
+    if (s.slot->info->maxMemoryAllocationSize && bytesize > s.slot->info->maxMemoryAllocationSize &&
+        s.dev->features().sparseBuffers)
+        return allocateLarge(s, dptr, bytesize);
     vk::Buffer buf;
     VkResult vr = s.dev->allocateBuffer(bytesize, buf);
     if (vr != VK_SUCCESS) {
@@ -163,6 +203,25 @@ CUresult CUDAAPI cuMemAlloc_v2(CUdeviceptr* dptr, size_t bytesize) {
     return CUDA_SUCCESS;
 }
 
+// A cuMemAlloc'd allocation of `slot` at dptr: freed, or CUDA_ERROR_NOT_FOUND.
+static CUresult freeAllocation(DeviceSlot& slot, CUdeviceptr dptr) {
+    if (auto large = slot.largeAllocations.find(dptr); large != slot.largeAllocations.end()) {
+        const size_t size = large->second;
+        slot.largeAllocations.erase(large);
+        return freeReservation(slot, dptr, size);
+    }
+    auto it = slot.allocations.find(dptr);
+    if (it == slot.allocations.end()) return CUDA_ERROR_NOT_FOUND;
+    slot.allocatedBytes -= it->second.size;
+    if (auto pool = slot.poolAllocations.find(dptr); pool != slot.poolAllocations.end()) {
+        if (pool->second) pool->second->usedBytes -= it->second.size;
+        slot.poolAllocations.erase(pool);
+    }
+    slot.vk->freeBuffer(it->second);
+    slot.allocations.erase(it);
+    return CUDA_SUCCESS;
+}
+
 CUresult CUDAAPI cuMemFree_v2(CUdeviceptr dptr) {
     VULKANIZER_TRACE_API();
     ApiScope s;
@@ -170,16 +229,16 @@ CUresult CUDAAPI cuMemFree_v2(CUdeviceptr dptr) {
     if (dptr == 0) return CUDA_SUCCESS;
     if (CUresult r = freeManaged(s, dptr); r != CUDA_ERROR_NOT_FOUND) return r;  // cuMemAllocManaged memory
     if (releaseGraphMemory(*s.slot, dptr)) return CUDA_SUCCESS;  // graph memory its graph still owns
-    auto it = s.slot->allocations.find(dptr);
-    if (it == s.slot->allocations.end()) return CUDA_ERROR_INVALID_VALUE;
-    s.slot->allocatedBytes -= it->second.size;
-    if (auto pool = s.slot->poolAllocations.find(dptr); pool != s.slot->poolAllocations.end()) {
-        if (pool->second) pool->second->usedBytes -= it->second.size;
-        s.slot->poolAllocations.erase(pool);
+    if (CUresult r = freeAllocation(*s.slot, dptr); r != CUDA_ERROR_NOT_FOUND) return r;
+    // Unified addressing: another device's memory, freed whatever the current device (as in CUDA;
+    // llama.cpp frees every device's cuBLAS workspace from one).
+    Driver& d = Driver::get();
+    for (int i = 0; i < d.deviceCount(); ++i) {
+        DeviceSlot* other = d.slot(i);
+        if (other == s.slot || !other->vk) continue;
+        if (CUresult r = freeAllocation(*other, dptr); r != CUDA_ERROR_NOT_FOUND) return r;
     }
-    s.dev->freeBuffer(it->second);
-    s.slot->allocations.erase(it);
-    return CUDA_SUCCESS;
+    return CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuMemGetAddressRange_v2(CUdeviceptr* pbase, size_t* psize, CUdeviceptr dptr) {
@@ -190,6 +249,12 @@ CUresult CUDAAPI cuMemGetAddressRange_v2(CUdeviceptr* pbase, size_t* psize, CUde
     if (it != s.slot->allocations.begin() && dptr - std::prev(it)->first < std::prev(it)->second.size) {
         if (pbase) *pbase = std::prev(it)->first;
         if (psize) *psize = static_cast<size_t>(std::prev(it)->second.size);
+        return CUDA_SUCCESS;
+    }
+    auto large = s.slot->largeAllocations.upper_bound(dptr);  // a large cuMemAlloc
+    if (large != s.slot->largeAllocations.begin() && dptr - std::prev(large)->first < std::prev(large)->second) {
+        if (pbase) *pbase = std::prev(large)->first;
+        if (psize) *psize = std::prev(large)->second;
         return CUDA_SUCCESS;
     }
     auto m = s.slot->mappings.upper_bound(dptr);  // virtual memory: the mapping containing it
@@ -268,12 +333,10 @@ CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevi
     return memcpyAsyncEntry(dstDevice, srcDevice, ByteCount, hStream, true, true);
 }
 
-// Between devices (multi-GPU): through host memory, as separate Vulkan devices share no memory.
-// The read waits for the source device's work so far; the write is queued on the destination
-// device. Within one device it is an ordinary device copy.
-CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice, CUcontext srcContext,
-                              size_t ByteCount) {
-    VULKANIZER_TRACE_API();
+// Between devices (multi-GPU): copyBetweenDevices (peer.cpp), in queue order on both devices; the
+// asynchronous one returns at once. Within one device it is an ordinary device copy.
+static CUresult memcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice, CUcontext srcContext,
+                           size_t ByteCount, bool sync) {
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     if (!validHandle(dstContext) || !validHandle(srcContext)) return CUDA_ERROR_INVALID_CONTEXT;
@@ -283,17 +346,23 @@ CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext, CUdev
     std::vector<AllocPiece> dst, src;
     if (!findPieces(*dstSlot, dstDevice, ByteCount, dst) || !findPieces(*srcSlot, srcDevice, ByteCount, src))
         return CUDA_ERROR_INVALID_VALUE;
-    if (dstSlot == srcSlot) return copyPieces(*dstSlot->vk, src, dst);
-    std::vector<char> staging(ByteCount);
-    if (CUresult r = readPieces(*srcSlot->vk, src, staging.data())) return r;
-    return writePieces(*dstSlot->vk, dst, staging.data());
+    if (dstSlot == srcSlot) return copyPieces(*dstSlot->vk, src, dst, sync);
+    if (CUresult r = Driver::get().ensureDevice(*dstSlot)) return r;
+    if (CUresult r = Driver::get().ensureDevice(*srcSlot)) return r;
+    return copyBetweenDevices(*dstSlot, dst, *srcSlot, src, ByteCount, sync);
+}
+
+CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice, CUcontext srcContext,
+                              size_t ByteCount) {
+    VULKANIZER_TRACE_API();
+    return memcpyPeer(dstDevice, dstContext, srcDevice, srcContext, ByteCount, true);
 }
 
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
                                    CUcontext srcContext, size_t ByteCount, CUstream hStream) {
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
     if (capturingStream(hStream)) return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
-    return cuMemcpyPeer(dstDevice, dstContext, srcDevice, srcContext, ByteCount);
+    return memcpyPeer(dstDevice, dstContext, srcDevice, srcContext, ByteCount, false);
 }
 
 CUresult CUDAAPI cuMemcpyPeerAsync_ptsz(CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
@@ -407,6 +476,13 @@ PointerInfo pointerInfoOn(DeviceSlot& slot, CUdeviceptr ptr) {
         info.base = std::prev(it)->first;
         info.size = std::prev(it)->second.size;
         if (auto p = slot.poolAllocations.find(info.base); p != slot.poolAllocations.end()) info.pool = p->second;
+        return info;
+    }
+    auto large = slot.largeAllocations.upper_bound(ptr);  // a large cuMemAlloc: the whole of it
+    if (large != slot.largeAllocations.begin() && ptr - std::prev(large)->first < std::prev(large)->second) {
+        info.device = true;
+        info.base = std::prev(large)->first;
+        info.size = std::prev(large)->second;
         return info;
     }
     auto m = slot.mappings.upper_bound(ptr);

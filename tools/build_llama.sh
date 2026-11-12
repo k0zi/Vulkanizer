@@ -26,6 +26,10 @@ for arg in "$@"; do
 done
 
 [[ -x "$ROOT/.cuda/bin/nvcc" ]] || { echo "run tools/setup_cuda.sh first" >&2; exit 1; }
+# nvcc 12.9 takes gcc up to 14
+HOST_CXX=""
+for c in g++-13 g++-14 g++-12; do command -v "$c" >/dev/null && { HOST_CXX="$c"; break; }; done
+[[ -n "$HOST_CXX" ]] || { echo "nvcc needs g++ 12, 13 or 14 (e.g. apt install g++-14)" >&2; exit 1; }
 [[ -f "$ROOT/build/lib/libcublas.so" ]] || { echo "run ./build.sh first" >&2; exit 1; }
 if [[ ! -d "$SRC" ]]; then
   mkdir -p "$ROOT/.work"
@@ -37,9 +41,9 @@ fi
 cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE=Release \
   -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_GRAPHS=ON -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA=$FA \
   -DCMAKE_CUDA_ARCHITECTURES=61-virtual \
-  -DCMAKE_CUDA_COMPILER="$ROOT/.cuda/bin/nvcc" -DCMAKE_CUDA_HOST_COMPILER=g++-13 \
+  -DCMAKE_CUDA_COMPILER="$ROOT/.cuda/bin/nvcc" -DCMAKE_CUDA_HOST_COMPILER=$HOST_CXX \
   -DCUDAToolkit_ROOT="$ROOT/.cuda" -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
-  -DCUDA_cublas_LIBRARY="$ROOT/build/lib/libcublas.so" \
+  -DCUDA_cublas_LIBRARY="$ROOT/build/lib/libcublas.so" -DCUDA_cublasLt_LIBRARY="$ROOT/build/lib/libcublasLt.so" \
   -DCMAKE_CUDA_FLAGS="-I$ROOT/include/cublas" -DCMAKE_CXX_FLAGS="-I$ROOT/include/cublas" \
   -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=$TESTS
 targets=(llama-simple llama-completion llama-bench llama-perplexity)

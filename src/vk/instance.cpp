@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <tuple>
 
 namespace vulkanizer::vk {
 
@@ -17,6 +18,63 @@ static bool envFlag(const char* name) {
 static std::string toLower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
+}
+
+static std::vector<std::string> splitList(const std::string& s) {
+    std::vector<std::string> out;
+    size_t at = 0;
+    while (at <= s.size()) {
+        size_t end = s.find(',', at);
+        if (end == std::string::npos) end = s.size();
+        std::string item = s.substr(at, end - at);
+        item.erase(0, item.find_first_not_of(" \t"));
+        item.erase(item.find_last_not_of(" \t") + 1);
+        if (!item.empty()) out.push_back(item);
+        at = end + 1;
+    }
+    return out;
+}
+
+static std::string uuidHex(const uint8_t (&uuid)[VK_UUID_SIZE]) {
+    static const char* digits = "0123456789abcdef";
+    std::string s;
+    for (uint8_t b : uuid) s += digits[b >> 4], s += digits[b & 15];
+    return s;
+}
+
+// CUDA_VISIBLE_DEVICES, as in CUDA: a comma separated list of ordinals (into the list as it would
+// be without the variable) or UUIDs ("GPU-" and a unique prefix of the hex digits, dashes ignored),
+// which also sets the order. The list ends at the first entry that names no device (or one already
+// listed); an empty list hides every device.
+static std::vector<PhysicalDeviceInfo> visibleDevices(const std::vector<PhysicalDeviceInfo>& all, const char* env) {
+    std::vector<PhysicalDeviceInfo> out;
+    std::vector<bool> used(all.size());
+    for (std::string item : splitList(env)) {
+        int index = -1;
+        if (std::all_of(item.begin(), item.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
+            const long v = std::strtol(item.c_str(), nullptr, 10);
+            if (v >= 0 && static_cast<size_t>(v) < all.size()) index = static_cast<int>(v);
+        } else {
+            std::string hex = toLower(item);
+            if (hex.rfind("gpu-", 0) == 0) hex = hex.substr(4);
+            hex.erase(std::remove(hex.begin(), hex.end(), '-'), hex.end());
+            for (size_t i = 0; i < all.size() && !hex.empty(); ++i) {
+                if (uuidHex(all[i].uuid).rfind(hex, 0) != 0) continue;
+                if (index >= 0) {  // ambiguous prefix
+                    index = -1;
+                    break;
+                }
+                index = static_cast<int>(i);
+            }
+        }
+        if (index < 0 || used[index]) {
+            VULKANIZER_INFO("CUDA_VISIBLE_DEVICES: '%s' names no device; the rest of the list is ignored", item.c_str());
+            break;
+        }
+        used[index] = true;
+        out.push_back(all[index]);
+    }
+    return out;
 }
 
 static int typeRank(VkPhysicalDeviceType t) {
@@ -102,9 +160,10 @@ bool Instance::init() {
     std::vector<VkPhysicalDevice> pds(count);
     vkEnumeratePhysicalDevices(instance_, &count, pds.data());
 
+    // VULKANIZER_DEVICE: name substrings, comma separated (any of them matches).
     const char* filterEnv = std::getenv("VULKANIZER_DEVICE");
-    std::string filter = filterEnv ? toLower(filterEnv) : std::string();
-    bool allowCpu = envFlag("VULKANIZER_ALLOW_CPU") || !filter.empty();
+    const std::vector<std::string> filters = splitList(filterEnv ? toLower(filterEnv) : std::string());
+    bool allowCpu = envFlag("VULKANIZER_ALLOW_CPU") || !filters.empty();
 
     for (VkPhysicalDevice pd : pds) {
         PhysicalDeviceInfo info;
@@ -113,16 +172,40 @@ bool Instance::init() {
             VULKANIZER_INFO("skipping Vulkan device '%s': %s", info.name(), whyNot.c_str());
             continue;
         }
-        if (!filter.empty() && toLower(info.name()).find(filter) == std::string::npos) continue;
+        const std::string name = toLower(info.name());
+        if (!filters.empty() && std::none_of(filters.begin(), filters.end(), [&](const std::string& f) {
+                return name.find(f) != std::string::npos;
+            }))
+            continue;
         if (info.isCpu() && !allowCpu) {
             VULKANIZER_INFO("skipping CPU Vulkan device '%s' (set VULKANIZER_ALLOW_CPU=1)", info.name());
             continue;
         }
         devices_.push_back(info);
     }
-    std::stable_sort(devices_.begin(), devices_.end(), [](const PhysicalDeviceInfo& a, const PhysicalDeviceInfo& b) {
-        return typeRank(a.props.deviceType) < typeRank(b.props.deviceType);
-    });
+    // CUDA_DEVICE_ORDER=PCI_BUS_ID orders by PCI address (devices without one last); the default
+    // (FASTEST_FIRST, as in CUDA) is discrete > integrated > virtual > other > cpu.
+    const char* order = std::getenv("CUDA_DEVICE_ORDER");
+    if (order && std::strcmp(order, "PCI_BUS_ID") == 0) {
+        std::stable_sort(devices_.begin(), devices_.end(), [](const PhysicalDeviceInfo& a, const PhysicalDeviceInfo& b) {
+            if (a.hasPciInfo != b.hasPciInfo) return a.hasPciInfo;
+            return std::tie(a.pciDomain, a.pciBus, a.pciDevice) < std::tie(b.pciDomain, b.pciBus, b.pciDevice);
+        });
+    } else {
+        std::stable_sort(devices_.begin(), devices_.end(), [](const PhysicalDeviceInfo& a, const PhysicalDeviceInfo& b) {
+            return typeRank(a.props.deviceType) < typeRank(b.props.deviceType);
+        });
+    }
+    // VULKANIZER_DUPLICATE_DEVICES=n (tests): every device n times, as separate devices (a logical
+    // device each), for multi-GPU code paths on a machine with one GPU.
+    if (const char* env = std::getenv("VULKANIZER_DUPLICATE_DEVICES"); env && std::atoi(env) > 1) {
+        std::vector<PhysicalDeviceInfo> copies;
+        for (const PhysicalDeviceInfo& d : devices_)
+            for (int k = 0; k < std::atoi(env); ++k) copies.push_back(d);
+        devices_ = std::move(copies);
+    }
+    if (const char* env = std::getenv("CUDA_VISIBLE_DEVICES")) devices_ = visibleDevices(devices_, env);
+    for (size_t i = 0; i < devices_.size(); ++i) devices_[i].ordinal = static_cast<uint32_t>(i);
     for (size_t i = 0; i < devices_.size(); ++i)
         VULKANIZER_INFO("device %zu: %s (%s, subgroup %u)", i, devices_[i].name(), devices_[i].typeName(),
                    devices_[i].subgroupSize);
@@ -141,12 +224,15 @@ bool Instance::queryDevice(VkPhysicalDevice pd, PhysicalDeviceInfo& out, std::st
 
     VkPhysicalDeviceVulkan13Properties p13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
     VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     p2.pNext = &p11;
+    p11.pNext = &p12;
     VkPhysicalDeviceShaderIntegerDotProductProperties pdot{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES};
-    if (out.apiVersion >= VK_API_VERSION_1_3) p11.pNext = &p13, p13.pNext = &pdot;
+    if (out.apiVersion >= VK_API_VERSION_1_3) p12.pNext = &p13, p13.pNext = &pdot;
     vkGetPhysicalDeviceProperties2(pd, &p2);
+    out.f16RoundRte = p12.shaderRoundingModeRTEFloat16 && p12.shaderDenormPreserveFloat16;
     out.dot4x8Accelerated = pdot.integerDotProduct4x8BitPackedSignedAccelerated &&
                             pdot.integerDotProduct4x8BitPackedUnsignedAccelerated &&
                             pdot.integerDotProduct4x8BitPackedMixedSignednessAccelerated;

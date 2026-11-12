@@ -283,6 +283,7 @@ compiler::Target targetFor(const DeviceSlot& slot) {
     t.fmaInF64 = envFlag("VULKANIZER_FMA_F64");
     t.exactFtzFma = envFlag("VULKANIZER_EXACT_FMA");
     t.fusedFma64 = f.fusedFma64 || envFlag("VULKANIZER_FAST_FMA");
+    t.halfConvertRte = t.float16 && slot.info->f16RoundRte && !envFlag("VULKANIZER_SOFT_F16_CVT");
     return t;
 }
 

@@ -29,7 +29,7 @@ Opcionális (Ubuntu csomagnevek):
 | `vulkan-validationlayers` | `./run.sh --validation` |
 | `clang` | Teszt-PTX előállítása CUDA SDK nélkül (`tests/data/gen_ptx.sh`) |
 | `ninja-build` | Gyorsabb fordítás (a `build.sh` magától használja, ha megvan) |
-| `g++-13` | Host-fordító az nvcc-hez (a CUDA 12.9 nem fogadja el a gcc 15-öt) |
+| `g++-13` vagy `g++-14` | Host-fordító az nvcc-hez (a CUDA 12.9 nem fogadja el a gcc 15-öt) |
 
 Valódi nvcc-vel fordított tesztek: a `tools/setup_cuda.sh` letölti az NVIDIA nvcc-jét és runtime-ját
 (újraterjeszthető csomagokból) a `.cuda/` könyvtárba (driver, GPU és root nem kell hozzá). Ha a `.cuda/` létezik, a
@@ -285,6 +285,37 @@ build/bin/vulkanizer-npu-bench                     # GPU és NPU idők összevet
   memória-sávszélességen osztoznak. Ezért alapból ki van kapcsolva: a nyereség főleg a tehermentesített GPU és az energia.
   Intel NPU-t még nem támogat. Részletek és mérések: [plan.md, 7. fázis](plan.md).
 
+### 10. Several GPUs (tensor split)
+
+Több GPU (mondjuk egy 64 GB-os iGPU és két 16 GB-os eGPU) külön CUDA-eszköz; nem olvadnak össze egyetlen nagy GPU-vá,
+mert egy kernel csak a saját eszköze memóriáját éri el. Mindegyik memóriája mégis kihasználható: a modellt az
+alkalmazás osztja szét rétegenként (llama.cpp `-sm layer`, `-ts`; PyTorch/accelerate `device_map`). Minden eszköznek
+saját címei vannak (az egységes címzés köztük is működik), az eszközök közti másolás mindkét eszköz sorában,
+rendszermemórián át megy, a host nem nyúl az adathoz (eGPU-nál a link sebességével: USB4-en 2,3 GB/s), és egy
+foglalás nagyobb lehet egy Vulkan-foglalásnál (RADV: 4 GiB), így egy eszköz egy egész modellrészt tárolhat. Az
+eszközök sorrendje: előbb a diszkrétek, aztán az integráltak; `CUDA_DEVICE_ORDER=PCI_BUS_ID` a PCI-cím szerint rendez.
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1 ./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer   # minden réteg a két eGPU-n (a szabad memória arányában)
+./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer \
+    -dev CUDA0,CUDA1,CUDA2 -ts 16,16,6                                                     # az iGPU is: a llama.cpp diszkrét GPU mellett kihagyja az integráltat, ha nincs megnevezve
+CUDA_VISIBLE_DEVICES=2,0 ./run.sh ./my_cuda_app                                            # mely eszközök, milyen sorrendben (sorszámok vagy GPU-<uuid>)
+```
+
+llama.cpp-vel mérve egy Ryzen AI 9 HX 370-en (890M iGPU), két USB4-es házban lévő RX 9060 XT 16 GB-tal,
+Qwen3.6-35B-A3B Q5_K_XL (25 GiB, több, mint ami egy eGPU-ra ráfér):
+
+| Eszközök | `-ts` | pp512 t/s | tg128 t/s |
+|---|---|---|---|
+| 890M egyedül | – | 23 | 5,9 |
+| 2× RX 9060 XT (eGPU) | auto | 437 | 39,7 |
+| 2× RX 9060 XT + 890M | 16/16/6 | 191 | 19,1 |
+| 2× RX 9060 XT + 890M | 16/16/40 | 46 | 8,4 |
+
+A rétegek egymás után futnak, a leglassabb eszköz része szabja meg a tempót: az iGPU-t csak akkor érdemes bevonni, ha
+a modell nélküle nem fér el, és kis részt kapjon. Ha a `-ts` több kerül egy GPU-ra, mint amennyi a memóriájába fér, a
+driver rendszermemóriába tolja a többit, és a generálás vánszorog (itt 3 t/s).
+
 ### Hasznos környezeti változók
 
 | Változó | Hatás |
@@ -325,10 +356,12 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   folyamatközi event a rögzítésekor kész (a rögzítés megvárja az eszközt).
 - Az NCCL (`libnccl.so.2`, a `torch.distributed` „nccl” backendje: DDP, FSDP) egy gép rangjai között működik, akár
   egy GPU-n osztozva; egynél több ranggal az adat a host-memórián megy át.
-- Több GPU külön eszközként működik: a `cudaMemcpyPeer` és a két eszköz pointerei közti sima másolások (egységes
-  címzés, pl. a PyTorch `tensor.to("cuda:1")`-e) host-memórián át mennek, de egy kernel sosem éri el egy másik GPU
-  memóriáját (nincs peer access). A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi egyszerre
-  elfér a GPU-n.
+- Több GPU külön CUDA-eszköz, mindegyik saját címekkel (az egységes címzés köztük is működik): egy kernel sosem éri el
+  egy másik GPU memóriáját (nincs peer access), ezért a modellt az alkalmazás osztja szét (lásd
+  [Több GPU](#10-several-gpus-tensor-split)). A két eszköz közti másolások (`cudaMemcpyPeer`, a két eszköz pointerei közti
+  sima másolások, pl. a PyTorch `tensor.to("cuda:1")`-e) mindkét eszköz sorában, rendszermemórián át mennek, a host
+  nem nyúl az adathoz. A kooperatív indítás (`grid.sync()`) addig a blokkszámig működik, amennyi egyszerre elfér a
+  GPU-n.
 - A managed, a pinned és a regisztrált memória host-memória, amit a GPU helyben, ugyanazon a címen használ; a managed
   memória sosem migrál a GPU-ra (integrált GPU-n ez amúgy is ugyanaz a memória).
 - A regisztrált host-memóriát (`cuMemHostRegister`), ha saját leképezés (`mmap`), és olyan címen van, ahová a GPU

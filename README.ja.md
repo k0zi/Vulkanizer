@@ -28,7 +28,7 @@ CMake ≥ 3.20、C++20 コンパイラ、Vulkan 1.2 以上のドライバ（buff
 | `vulkan-validationlayers` | `./run.sh --validation` |
 | `clang` | CUDA SDK なしでテスト用 PTX を生成（`tests/data/gen_ptx.sh`） |
 | `ninja-build` | ビルドの高速化（存在すれば `build.sh` が自動的に使用） |
-| `g++-13` | nvcc のホストコンパイラ（CUDA 12.9 は gcc 15 を受け付けません） |
+| `g++-13` または `g++-14` | nvcc のホストコンパイラ（CUDA 12.9 は gcc 15 を受け付けません） |
 
 本物の nvcc でコンパイルするテスト：`tools/setup_cuda.sh` は NVIDIA の nvcc とランタイムを再配布可能パッケージとして
 `.cuda/` にダウンロードします（ドライバ、GPU、root 権限は不要）。`.cuda/` があれば、CMake は `tests/cuda/*.cu` の
@@ -281,6 +281,37 @@ build/bin/vulkanizer-npu-bench                     # GPU と NPU の時間比較
   そのため既定では無効で、利点は主に GPU の負荷軽減と省電力です。Intel NPU にはまだ対応していません。詳細と計測結果：
   [plan.md、フェーズ 7](plan.md)。
 
+### 10. Several GPUs (tensor split)
+
+複数の GPU（たとえば 64 GB の iGPU と 16 GB の eGPU 2 台）はそれぞれ独立した CUDA デバイスです。カーネルは自分のデバイスの
+メモリにしかアクセスできないため、1 台の大きな GPU にまとまることはありません。それでも全デバイスのメモリを使えます：
+アプリケーションがモデルをレイヤー単位で分割します（llama.cpp の `-sm layer`、`-ts`、PyTorch/accelerate の `device_map`）。
+各デバイスは独自のアドレスを持ち（統一アドレッシングはデバイス間でも機能します）、デバイス間のコピーは両方のデバイスの
+キューで、システムメモリを経由して行われ、ホストはデータに触れません（eGPU ではリンク速度、USB4 で約 2.3 GB/s）。また
+1 回の割り当ては Vulkan の割り当て上限（RADV：4 GiB）を超えられるので、1 台のデバイスにモデルの一部をまるごと置けます。
+デバイスの順序：ディスクリートが先、統合が後。`CUDA_DEVICE_ORDER=PCI_BUS_ID` で PCI アドレス順になります。
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1 ./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer   # 全レイヤーを 2 台の eGPU に（空きメモリに応じて分割）
+./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer \
+    -dev CUDA0,CUDA1,CUDA2 -ts 16,16,6                                                     # iGPU も使う：llama.cpp はディスクリート GPU があると、指定しない限り統合 GPU を使わない
+CUDA_VISIBLE_DEVICES=2,0 ./run.sh ./my_cuda_app                                            # 使うデバイスと順序（番号または GPU-<uuid>）
+```
+
+Ryzen AI 9 HX 370（890M iGPU）と USB4 ケースに入れた RX 9060 XT 16 GB 2 台で llama.cpp を使って計測、モデルは
+Qwen3.6-35B-A3B Q5_K_XL（25 GiB、eGPU 1 台には収まらない）：
+
+| デバイス | `-ts` | pp512 t/s | tg128 t/s |
+|---|---|---|---|
+| 890M のみ | – | 23 | 5.9 |
+| 2× RX 9060 XT（eGPU） | auto | 437 | 39.7 |
+| 2× RX 9060 XT + 890M | 16/16/6 | 191 | 19.1 |
+| 2× RX 9060 XT + 890M | 16/16/40 | 46 | 8.4 |
+
+レイヤーは順番に実行されるため、最も遅いデバイスの担当分が速度を決めます。iGPU はそれなしではモデルが収まらない場合に
+だけ加え、担当を小さくしてください。`-ts` で GPU のメモリを超える量を割り当てると、ドライバはシステムメモリにあふれさせ、
+生成が極端に遅くなります（ここでは 3 t/s）。
+
 ### 便利な環境変数
 
 | 変数 | 効果 |
@@ -322,9 +353,11 @@ build/bin/vulkanizer-npu-bench                     # GPU と NPU の時間比較
   記録した時点で完了します（記録はデバイスを待ちます）。
 - NCCL（`libnccl.so.2`、`torch.distributed` の "nccl" バックエンド：DDP、FSDP）は 1 台のマシンのランク間で動作し、
   ランクが 1 つの GPU を共有してもかまいません。ランクが複数のときはデータがホストメモリを経由します。
-- 複数の GPU はそれぞれ独立したデバイスです。`cudaMemcpyPeer` と 2 つのデバイスのポインタ間の通常のコピー（統一アドレッシング、例：PyTorch の `tensor.to("cuda:1")`）はホストメモリを経由しますが、カーネルが
-  別の GPU のメモリにアクセスすることはできません（ピアアクセスなし）。協調起動（`grid.sync()`）は、GPU に同時に
-  載るブロック数まで動作します。
+- 複数の GPU はそれぞれ独自のアドレスを持つ独立した CUDA デバイスです（統一アドレッシングはデバイス間でも機能します）。カーネルが
+  別の GPU のメモリにアクセスすることはできない（ピアアクセスなし）ため、モデルの分割はアプリケーションが行います
+  （[複数の GPU](#10-several-gpus-tensor-split) を参照）。2 つのデバイス間のコピー（`cudaMemcpyPeer`、2 つのデバイスのポインタ間の通常のコピー、
+  例：PyTorch の `tensor.to("cuda:1")`）は両方のデバイスのキューで、システムメモリを経由して行われ、ホストはデータに触れません。
+  協調起動（`grid.sync()`）は、GPU に同時に載るブロック数まで動作します。
 - マネージド、ピン留め、登録済みのメモリはホストメモリであり、GPU は同じアドレスでその場で使います。マネージドメモリが
   GPU に移動することはありません（統合 GPU ではいずれにせよ同じメモリです）。
 - 登録済みホストメモリ（`cuMemHostRegister`）が独立したマッピング（`mmap`）で、GPU がメモリを配置できるアドレス

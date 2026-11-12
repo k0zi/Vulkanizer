@@ -95,6 +95,13 @@ CUresult enterContext(ApiScope& scope) {
     return CUDA_SUCCESS;
 }
 
+VkResult finishUnlocked(ApiScope& scope, vk::Device& dev) {
+    if (scope.lock.owns_lock()) scope.lock.unlock();
+    const VkResult r = dev.finish();
+    scope.lock.lock();
+    return r;
+}
+
 bool validStream(CUstream stream) {
     return stream == nullptr || stream == CU_STREAM_LEGACY || stream == CU_STREAM_PER_THREAD || validHandle(stream);
 }

@@ -91,14 +91,36 @@ CUresult copy3D(const Side& src, size_t srcX, size_t srcY, size_t srcZ, const Si
         return async ? cuMemcpyAsync(CUdeviceptr(d), CUdeviceptr(s), n, stream) : cuMemcpy(CUdeviceptr(d), CUdeviceptr(s), n);
     };
     const bool contiguous = sp == width && dp == width && srcX == 0 && dstX == 0 && sh == height && dh == height;
+    auto srcRow = [&](size_t y, size_t z) { return src.base + ((srcZ + z) * sh + srcY + y) * sp + srcX; };
+    auto dstRow = [&](size_t y, size_t z) { return dst.base + ((dstZ + z) * dh + dstY + y) * dp + dstX; };
+    if (!contiguous) {
+        // Between two devices' memory (multi-GPU): every row through one staged copy (peer.cpp)
+        // rather than a copy, and a wait between the devices, per row.
+        ApiScope s;
+        if (CUresult r = enterContext(s)) return r;
+        std::vector<AllocPiece> sp0, dp0;
+        DeviceSlot* from = findPiecesOnAnyDevice(*s.slot, srcRow(0, 0), width, sp0);
+        DeviceSlot* to = findPiecesOnAnyDevice(*s.slot, dstRow(0, 0), width, dp0);
+        if (from && to && from != to) {
+            std::vector<AllocPiece> sAll, dAll, row;
+            size_t at = 0;
+            for (size_t z = 0; z < depth; ++z)
+                for (size_t y = 0; y < height; ++y, at += width) {
+                    for (auto [slot, addr, out] : {std::tuple{from, srcRow(y, z), &sAll}, std::tuple{to, dstRow(y, z), &dAll}}) {
+                        row.clear();
+                        if (!findPieces(*slot, addr, width, row)) return CUDA_ERROR_INVALID_VALUE;
+                        for (AllocPiece& p : row) p.at += at, out->push_back(p);
+                    }
+                }
+            return copyBetweenDevices(*to, dAll, *from, sAll, at, !async);
+        }
+    }
     if (contiguous) {
         return one(dst.base + (dstZ * dh + dstY) * dp, src.base + (srcZ * sh + srcY) * sp, width * height * depth);
     }
     for (size_t z = 0; z < depth; ++z)
         for (size_t y = 0; y < height; ++y)
-            if (CUresult r = one(dst.base + ((dstZ + z) * dh + dstY + y) * dp + dstX,
-                                 src.base + ((srcZ + z) * sh + srcY + y) * sp + srcX, width))
-                return r;
+            if (CUresult r = one(dstRow(y, z), srcRow(y, z), width)) return r;
     return CUDA_SUCCESS;
 }
 
@@ -416,6 +438,40 @@ CUresult CUDAAPI cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D* pCopy, CUstream hStream
         if (CUstream cs = capturingStream(hStream)) return captureCopy3D(cs, *pCopy);
     }
     return copy3DParams(pCopy, true, hStream);
+}
+
+// Between contexts of different devices: with unified addressing (each device's addresses are its
+// own, common/device_address.h) an ordinary 3D copy finds both sides; two devices' memory goes
+// through copyBetweenDevices.
+static CUresult peerTo3D(const CUDA_MEMCPY3D_PEER* p, CUDA_MEMCPY3D& c) {
+    if (!p) return CUDA_ERROR_INVALID_VALUE;
+    if ((p->srcContext && !validHandle(p->srcContext)) || (p->dstContext && !validHandle(p->dstContext)))
+        return CUDA_ERROR_INVALID_CONTEXT;
+    c = CUDA_MEMCPY3D{};
+    c.srcXInBytes = p->srcXInBytes, c.srcY = p->srcY, c.srcZ = p->srcZ, c.srcLOD = p->srcLOD;
+    c.srcMemoryType = p->srcMemoryType, c.srcHost = p->srcHost, c.srcDevice = p->srcDevice;
+    c.srcArray = p->srcArray, c.srcPitch = p->srcPitch, c.srcHeight = p->srcHeight;
+    c.dstXInBytes = p->dstXInBytes, c.dstY = p->dstY, c.dstZ = p->dstZ, c.dstLOD = p->dstLOD;
+    c.dstMemoryType = p->dstMemoryType, c.dstHost = p->dstHost, c.dstDevice = p->dstDevice;
+    c.dstArray = p->dstArray, c.dstPitch = p->dstPitch, c.dstHeight = p->dstHeight;
+    c.WidthInBytes = p->WidthInBytes, c.Height = p->Height, c.Depth = p->Depth;
+    return CUDA_SUCCESS;
+}
+CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER* pCopy) {
+    VULKANIZER_TRACE_API();
+    CUDA_MEMCPY3D c;
+    if (CUresult r = peerTo3D(pCopy, c)) return r;
+    return copy3DParams(&c, false, nullptr);
+}
+CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER* pCopy, CUstream hStream) {
+    VULKANIZER_TRACE_API();
+    CUDA_MEMCPY3D c;
+    if (CUresult r = peerTo3D(pCopy, c)) return r;
+    if (capturingStream(hStream)) return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
+    return copy3DParams(&c, true, hStream);
+}
+CUresult CUDAAPI cuMemcpy3DPeerAsync_ptsz(const CUDA_MEMCPY3D_PEER* pCopy, CUstream hStream) {
+    return cuMemcpy3DPeerAsync(pCopy, hStream);
 }
 
 CUresult CUDAAPI cuMemcpyHtoA_v2(CUarray dstArray, size_t dstOffset, const void* srcHost, size_t ByteCount) {

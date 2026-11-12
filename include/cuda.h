@@ -923,6 +923,23 @@ typedef struct CUDA_MEMCPY3D_st {
     size_t dstPitch, dstHeight;
     size_t WidthInBytes, Height, Depth;
 } CUDA_MEMCPY3D;
+typedef struct CUDA_MEMCPY3D_PEER_st {
+    size_t srcXInBytes, srcY, srcZ, srcLOD;
+    CUmemorytype srcMemoryType;
+    const void* srcHost;
+    CUdeviceptr srcDevice;
+    CUarray srcArray;
+    CUcontext srcContext;
+    size_t srcPitch, srcHeight;
+    size_t dstXInBytes, dstY, dstZ, dstLOD;
+    CUmemorytype dstMemoryType;
+    void* dstHost;
+    CUdeviceptr dstDevice;
+    CUarray dstArray;
+    CUcontext dstContext;
+    size_t dstPitch, dstHeight;
+    size_t WidthInBytes, Height, Depth;
+} CUDA_MEMCPY3D_PEER;
 typedef enum CUresourcetype_enum {
     CU_RESOURCE_TYPE_ARRAY = 0x00,
     CU_RESOURCE_TYPE_MIPMAPPED_ARRAY = 0x01,
@@ -1019,6 +1036,8 @@ CUresult CUDAAPI cuMemcpy2DUnaligned(const CUDA_MEMCPY2D* pCopy);
 CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D* pCopy, CUstream hStream);
 CUresult CUDAAPI cuMemcpy3D(const CUDA_MEMCPY3D* pCopy);
 CUresult CUDAAPI cuMemcpy3DAsync(const CUDA_MEMCPY3D* pCopy, CUstream hStream);
+CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER* pCopy);
+CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER* pCopy, CUstream hStream);
 CUresult CUDAAPI cuMemcpyHtoA(CUarray dstArray, size_t dstOffset, const void* srcHost, size_t ByteCount);
 CUresult CUDAAPI cuMemcpyAtoH(void* dstHost, CUarray srcArray, size_t srcOffset, size_t ByteCount);
 CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset, CUdeviceptr srcDevice, size_t ByteCount);

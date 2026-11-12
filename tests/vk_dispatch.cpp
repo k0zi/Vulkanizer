@@ -60,7 +60,7 @@ int main() {
     } params{da.address, db.address, dc.address, n};
     constexpr uint32_t kParamBytes = 28;
 
-    const uint32_t spec[4] = {256, 1, 1, 0};  // blockDim, dynamic shared words
+    const uint32_t spec[5] = {256, 1, 1, 0, 1};  // blockDim, dynamic shared words, packed blocks
     ComputePipeline pipeline;
     CHECK_VK(dev->createComputePipeline(spirv.data(), spirv.size(), "main", kParamBytes, spec, pipeline));
     CHECK_VK(dev->dispatch(pipeline, (n + 255) / 256, 1, 1, &params, kParamBytes));

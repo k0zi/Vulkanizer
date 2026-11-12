@@ -27,7 +27,7 @@ CMake ≥ 3.20、支持 C++20 的编译器、Vulkan 1.2+ 驱动（bufferDeviceAd
 | `vulkan-validationlayers` | `./run.sh --validation` |
 | `clang` | 无需 CUDA SDK 即可生成测试用 PTX（`tests/data/gen_ptx.sh`） |
 | `ninja-build` | 更快的构建（若已安装，`build.sh` 会自动使用） |
-| `g++-13` | nvcc 的主机编译器（CUDA 12.9 不接受 gcc 15） |
+| `g++-13` 或 `g++-14` | nvcc 的主机编译器（CUDA 12.9 不接受 gcc 15） |
 
 用真正的 nvcc 编译的测试：`tools/setup_cuda.sh` 会把 NVIDIA 的 nvcc 和运行时（可再分发软件包）下载到 `.cuda/`
 （不需要驱动、GPU 或 root 权限）。如果 `.cuda/` 存在，CMake 会用 nvcc 编译 `tests/cuda/*.cu` 中的程序，
@@ -269,6 +269,34 @@ build/bin/vulkanizer-npu-bench                     # GPU 与 NPU 耗时对比
   GEMM 上 GPU 更快，把一个 GEMM 拆给两者也不会更快，因为它们共享内存带宽。因此默认关闭：收益主要是减轻 GPU 负担和节能。
   暂不支持 Intel NPU。详情与测量数据：[plan.md，第 7 阶段](plan.md)。
 
+### 10. Several GPUs (tensor split)
+
+多个 GPU（例如一块 64 GB 的 iGPU 和两块各 16 GB 的 eGPU）是彼此独立的 CUDA 设备；它们不会合并成一块大 GPU，因为内核只能
+访问自己设备的内存。但所有设备的内存仍然都能用上：由应用程序按层拆分模型（llama.cpp `-sm layer`、`-ts`；PyTorch/accelerate
+`device_map`）。每个设备有自己的地址（统一寻址在它们之间可用），设备之间的复制在两个设备的队列中经由系统内存进行，主机不接触
+数据（eGPU 上受链路速度限制：USB4 约 2.3 GB/s），单次分配可以大于一次 Vulkan 分配（RADV：4 GiB），因此一个设备可以容纳一整
+段模型。设备顺序：先独立 GPU，后集成 GPU；`CUDA_DEVICE_ORDER=PCI_BUS_ID` 按 PCI 地址排序。
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1 ./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer   # 所有层放在两块 eGPU 上（按空闲内存拆分）
+./run.sh .work/llama-build/bin/llama-completion -m model.gguf -ngl 99 -sm layer \
+    -dev CUDA0,CUDA1,CUDA2 -ts 16,16,6                                                     # 也用上 iGPU：有独立 GPU 时，llama.cpp 默认不使用集成 GPU，除非显式指定
+CUDA_VISIBLE_DEVICES=2,0 ./run.sh ./my_cuda_app                                            # 使用哪些设备、按什么顺序（序号或 GPU-<uuid>）
+```
+
+在 Ryzen AI 9 HX 370（890M iGPU）加两块装在 USB4 扩展坞中的 RX 9060 XT 16 GB 上用 llama.cpp 测得，模型为
+Qwen3.6-35B-A3B Q5_K_XL（25 GiB，单块 eGPU 放不下）：
+
+| 设备 | `-ts` | pp512 t/s | tg128 t/s |
+|---|---|---|---|
+| 仅 890M | – | 23 | 5.9 |
+| 2× RX 9060 XT（eGPU） | auto | 437 | 39.7 |
+| 2× RX 9060 XT + 890M | 16/16/6 | 191 | 19.1 |
+| 2× RX 9060 XT + 890M | 16/16/40 | 46 | 8.4 |
+
+各层依次运行，最慢设备那一份决定速度：只有在没有 iGPU 就放不下模型时才加入它，并且只给它一小部分。如果 `-ts` 给某块 GPU
+分配的内容超过其内存，驱动会溢出到系统内存，生成速度会变得极慢（这里为 3 t/s）。
+
 ### 常用环境变量
 
 | 变量 | 作用 |
@@ -304,8 +332,10 @@ build/bin/vulkanizer-npu-bench                     # GPU 与 NPU 耗时对比
 - CUDA IPC（`cudaIpc*`、PyTorch 的 `torch.multiprocessing`）可在同一用户的进程之间使用；跨进程事件在记录时即完成（记录会等待设备）。
 - NCCL（`libnccl.so.2`，`torch.distributed` 的 "nccl" 后端：DDP、FSDP）可在同一台机器的各 rank 之间使用，它们也可以共用一块 GPU；
   多于一个 rank 时数据经由主机内存传输。
-- 多个 GPU 是彼此独立的设备：`cudaMemcpyPeer` 以及两个设备指针之间的普通复制（统一寻址，例如 PyTorch 的 `tensor.to("cuda:1")`）都经由主机内存，但内核永远无法访问另一个 GPU 的内存
-  （没有对等访问）。协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
+- 多个 GPU 是彼此独立的 CUDA 设备，各有自己的地址（统一寻址在它们之间同样可用）：内核永远无法访问另一个 GPU 的内存
+  （没有对等访问），因此由应用程序来拆分模型（见[多个 GPU](#10-several-gpus-tensor-split)）。两个设备之间的复制（`cudaMemcpyPeer`、
+  两个设备指针之间的普通复制，例如 PyTorch 的 `tensor.to("cuda:1")`）在两个设备的队列中经由系统内存进行，主机不接触数据。
+  协作启动（`grid.sync()`）在 GPU 能同时容纳的块数以内可用。
 - 托管（managed）、锁页（pinned）和已注册的内存都是主机内存，GPU 在原处以相同的地址使用它们；托管内存从不迁移到 GPU
   （在集成 GPU 上本来就是同一块内存）。
 - 已注册的主机内存（`cuMemHostRegister`）如果是独立的映射（`mmap`），且位于 GPU 可以放置内存的地址（RADV：64 KiB 对齐，

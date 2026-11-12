@@ -87,6 +87,36 @@ int main() {
     CHECK_CU(cuMemFree(a));
     CHECK_CU(cuMemFree(b));
     EXPECT_CU(CUDA_ERROR_INVALID_VALUE, cuMemFree(a));
+
+    // An allocation larger than one Vulkan allocation may be (RADV: 4 GiB): one contiguous range,
+    // copies and memsets across the 4 GiB boundary, the whole range from an interior pointer.
+    size_t freeBytes = 0, totalBytes = 0;
+    CHECK_CU(cuMemGetInfo(&freeBytes, &totalBytes));
+    if (freeBytes > (size_t(7) << 30)) {
+        constexpr size_t big = (size_t(5) << 30) + 12345;
+        CUdeviceptr p = 0;
+        const CUresult r = cuMemAlloc(&p, big);
+        // devices that cannot place buffers at chosen addresses (llvmpipe) have no such allocations
+        if (r == CUDA_ERROR_OUT_OF_MEMORY) {
+            std::printf("large allocation not supported on this device\n");
+        } else {
+            CHECK_CU(r);
+            const CUdeviceptr edge = p + (size_t(4) << 30) - 4096;
+            CHECK_CU(cuMemsetD32(edge, 0x01020304, 2048));  // 8 KiB across the boundary
+            CHECK_CU(cuMemcpyHtoD(p + big - 64 * 4, small.data(), 64 * 4));
+            std::vector<uint32_t> across(2048);
+            CHECK_CU(cuMemcpyDtoH(across.data(), edge, 8192));
+            for (uint32_t w : across) EXPECT(w == 0x01020304);
+            CHECK_CU(cuMemcpyDtoH(back.data(), p + big - 64 * 4, 64 * 4));
+            EXPECT(back[0] == 7 && back[63] == 7);
+            CUdeviceptr rbase = 0;
+            size_t rsize = 0;
+            CHECK_CU(cuMemGetAddressRange(&rbase, &rsize, edge + 8000));
+            EXPECT(rbase == p && rsize >= big);
+            CHECK_CU(cuMemFree(p));
+            EXPECT_CU(CUDA_ERROR_INVALID_VALUE, cuMemFree(p));
+        }
+    }
     CHECK_CU(cuCtxSynchronize());
     CHECK_CU(cuCtxDestroy(ctx));
     CHECK_CU(cuCtxGetCurrent(&current));

@@ -575,6 +575,11 @@ int main() {
          CUBLAS_COMPUTE_32F_FAST_16F, true},
         {"strided f16 tn 16F", T, N, 128, 64, 128, CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, 1.0f, 0.0f, 7,
          CUBLAS_COMPUTE_16F, true},
+        // enough 128 x 128 tiles for the large-tile cooperative matrix kernel on a GPU, with edges
+        {"gemmEx f16 tn large", T, N, 1030, 777, 72, CUDA_R_16F, CUDA_R_16F, CUDA_R_16F, 0.5f, -1.0f, 1,
+         CUBLAS_COMPUTE_32F, true},
+        {"gemmEx f16 tn large f32 C", T, N, 1100, 520, 40, CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, 1.0f, 0.25f, 1,
+         CUBLAS_COMPUTE_32F, true},
         {"gemmEx f16 tn odd ld", T, N, 130, 129, 37, CUDA_R_16F, CUDA_R_16F, CUDA_R_32F, 1.0f, 0.25f, 1},
         {"gemmEx bf16 -> f32", N, N, 50, 70, 90, CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F, 1.0f, 0.0f, 1},
         {"gemmEx f16 x f32", T, N, 33, 31, 100, CUDA_R_16F, CUDA_R_32F, CUDA_R_32F, 1.0f, 0.0f, 1},

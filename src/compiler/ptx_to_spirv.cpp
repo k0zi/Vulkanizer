@@ -1637,6 +1637,14 @@ private:
     // f32 -> f16 bits with round-to-nearest-even. packHalf2x16 would be shorter, but its
     // rounding is implementation-defined (RADV truncates).
     uint32_t floatToHalf(uint32_t f) {
+        if (t_.halfConvertRte) {  // the GPU's conversion, round to nearest even (execution modes at the end)
+            b_.capability(spv::CapabilityFloat16);
+            halfConvert_ = true;
+            const uint32_t f16 = tFloat(16), v2 = b_.typeVector(f16, 2);
+            const uint32_t h = b_.op(spv::OpFConvert, f16, {f});
+            const uint32_t pair = b_.op(spv::OpCompositeConstruct, v2, {h, b_.constFloat(16, 0)});
+            return b_.op(spv::OpBitwiseAnd, tU32(), {b_.op(spv::OpBitcast, tU32(), {pair}), cU32(0xFFFF)});
+        }
         const uint32_t u32 = tU32(), bt = tBool();
         auto op = [&](spv::Op o, uint32_t x, uint32_t y) { return b_.op(o, o >= spv::OpIEqual && o <= spv::OpSLessThanEqual ? bt : u32, {x, y}); };
         auto sel = [&](uint32_t c, uint32_t x, uint32_t y) { return b_.op(spv::OpSelect, u32, {c, x, y}); };
@@ -3166,6 +3174,12 @@ private:
 
         b_.entryPoint(spv::ExecutionModelGLCompute, fn, e_.name, interface_);
         b_.executionMode(fn, spv::ExecutionModeLocalSize, {1, 1, 1});
+        if (halfConvert_) {  // f16 results as CUDA rounds them: to nearest even, subnormals kept
+            b_.capability(spv::CapabilityRoundingModeRTE);
+            b_.capability(spv::CapabilityDenormPreserve);
+            b_.executionMode(fn, spv::ExecutionModeRoundingModeRTE, {16});
+            b_.executionMode(fn, spv::ExecutionModeDenormPreserve, {16});
+        }
     }
 
     const ptx::Module& m_;
@@ -3192,6 +3206,7 @@ private:
     uint32_t localId_ = 0, groupId_ = 0;
     uint32_t exitVar_ = 0, carryVar_ = 0, subgroupId_ = 0;
     bool dotProductDeclared_ = false;
+    bool halfConvert_ = false;  // floatToHalf used the GPU's conversion
     uint32_t warpScratchWord_ = 0;  // first word of the emulated warps' scratch area
     uint32_t barrierWord_ = 0;      // bar.red counter
     std::vector<uint32_t> interface_;

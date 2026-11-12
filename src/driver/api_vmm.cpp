@@ -141,6 +141,26 @@ VkResult createChunks(vk::Device& dev, size_t size, size_t alignment, VmReservat
 
 }  // namespace
 
+namespace vulkanizer::driver {
+
+CUresult freeReservation(DeviceSlot& slot, CUdeviceptr ptr, size_t size) {
+    vk::Device& dev = *slot.vk;
+    auto it = slot.reservations.find(ptr);
+    if (it == slot.reservations.end() || it->second.size != size) return CUDA_ERROR_INVALID_VALUE;
+    // Whatever is still mapped is unmapped first (an application error; a large cuMemAlloc's pieces).
+    for (auto m = slot.mappings.lower_bound(ptr); m != slot.mappings.end() && m->first < ptr + size;) {
+        if (VkResult vr = dev.bindSparse(sparseBinds(it->second, m->first, m->second.size, VK_NULL_HANDLE, 0)))
+            return toCuResult(vr);
+        releaseRef(dev, slot, m->second.allocation);
+        m = slot.mappings.erase(m);
+    }
+    for (vk::Buffer& b : it->second.chunks) dev.freeBuffer(b);
+    slot.reservations.erase(it);
+    return CUDA_SUCCESS;
+}
+
+}  // namespace vulkanizer::driver
+
 extern "C" {
 
 CUresult CUDAAPI cuMemGetAllocationGranularity(size_t* granularityOut, const CUmemAllocationProp* prop,
@@ -187,18 +207,7 @@ CUresult CUDAAPI cuMemAddressFree(CUdeviceptr ptr, size_t size) {
     VULKANIZER_TRACE_API();
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
-    auto it = s.slot->reservations.find(ptr);
-    if (it == s.slot->reservations.end() || it->second.size != size) return CUDA_ERROR_INVALID_VALUE;
-    // Whatever is still mapped (an application error) is unmapped first.
-    for (auto m = s.slot->mappings.lower_bound(ptr); m != s.slot->mappings.end() && m->first < ptr + size;) {
-        if (VkResult vr = s.dev->bindSparse(sparseBinds(it->second, m->first, m->second.size, VK_NULL_HANDLE, 0)))
-            return toCuResult(vr);
-        releaseRef(*s.dev, *s.slot, m->second.allocation);
-        m = s.slot->mappings.erase(m);
-    }
-    for (vk::Buffer& b : it->second.chunks) s.dev->freeBuffer(b);
-    s.slot->reservations.erase(it);
-    return CUDA_SUCCESS;
+    return freeReservation(*s.slot, ptr, size);
 }
 
 CUresult CUDAAPI cuMemCreate(CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop,

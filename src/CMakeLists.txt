@@ -86,6 +86,7 @@ add_library(vulkanizer_cuda SHARED
   driver/api_vmm.cpp
   driver/api_module.cpp
   driver/api_stream.cpp
+  driver/peer.cpp
   driver/printf.cpp
   driver/kernel_cache.cpp
 )
@@ -133,6 +134,7 @@ set(cublas_shaders)
 foreach(entry gemm:gemm gemm_tiled:gemm_tiled trsm:trsm gemv:gemv epilogue:epilogue npu:npu gemm_f16_tn:gemm_f16_tn gemm_f16_tn_h:gemm_f16_tn:C_F16
     gemm_f16_tn_m:gemm_f16_tn:F16_MATH gemm_f16_tn_mh:gemm_f16_tn:F16_MATH,C_F16
     gemm_coopmat16:gemm_coopmat:S=16 gemm_coopmat16_h:gemm_coopmat:S=16,C_F16
+    gemm_coopmat16s:gemm_coopmat:S=16,SMALL_TILE gemm_coopmat16s_h:gemm_coopmat:S=16,SMALL_TILE,C_F16
     gemm_coopmat8:gemm_coopmat:S=8 gemm_coopmat8_h:gemm_coopmat:S=8,C_F16)
   string(REPLACE ":" ";" parts ${entry})
   list(GET parts 0 shader)

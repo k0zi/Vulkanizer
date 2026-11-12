@@ -19,6 +19,9 @@ struct PhysicalDeviceInfo {
     uint32_t maxSubgroupSize = 0;
     VkSubgroupFeatureFlags subgroupOps = 0;  // supported in compute shaders
     bool dot4x8Accelerated = false;          // 4x8-bit packed integer dot products run in hardware
+    // f32 -> f16 conversions can round to nearest even and keep f16 subnormals (float controls:
+    // shaderRoundingModeRTEFloat16 and shaderDenormPreserveFloat16)
+    bool f16RoundRte = false;
     VkDeviceSize maxMemoryAllocationSize = 0;
     VkDeviceSize maxBufferSize = 0;  // maintenance4 (Vulkan 1.3); else maxMemoryAllocationSize
     VkDeviceSize deviceLocalBytes = 0;
@@ -26,6 +29,7 @@ struct PhysicalDeviceInfo {
     uint32_t computeQueueFamily = 0;
     bool computeQueueSparse = false;  // the compute queue family supports sparse binding
     uint32_t computeUnits = 0;        // active compute units (VK_AMD_shader_core_properties2); 0: unknown
+    uint32_t ordinal = 0;             // index in Instance::devices() (the CUDA device ordinal)
     bool hasPciInfo = false;          // VK_EXT_pci_bus_info
     uint32_t pciDomain = 0, pciBus = 0, pciDevice = 0;
 

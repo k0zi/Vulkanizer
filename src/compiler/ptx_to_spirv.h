@@ -27,6 +27,9 @@ struct Target {
     bool fmaInF64 = false;           // in f64 (else with f32 TwoProduct/TwoSum)
     bool exactFtzFma = false;        // .ftz fma is emulated too (else the driver's Fma, see fusedMulAdd)
     bool fusedFma64 = false;         // the same for f64 Fma; otherwise emulated with f64 TwoProduct/TwoSum
+    // f32 -> f16 rounding to nearest even (cvt.rn, f16 arithmetic) by the GPU's conversion: needs float16
+    // and the RoundingModeRTE / DenormPreserve execution modes for 16 bits. Otherwise in integer code.
+    bool halfConvertRte = false;
 };
 
 // Kernel ABI (see plan.md):

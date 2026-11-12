@@ -11,6 +11,7 @@
 #include <map>
 #include <string>
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace vulkanizer::vk {
 
@@ -23,6 +24,9 @@ static constexpr VkMemoryPropertyFlags kAvoidedMemoryFlags =
 static constexpr VkBufferUsageFlags kDeviceBufferUsage =
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+// Staging memory shared between devices (allocateShared / importShared): copies only.
+static constexpr VkBufferUsageFlags kSharedUsage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
 static constexpr VkBufferUsageFlags kStagingUsage =
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -227,6 +231,34 @@ VkResult Device::init() {
         }
         if (externalFd) extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     }
+    // Multi-GPU: staging memory one device exports as a dma-buf and another imports (peer copies,
+    // allocateShared/importShared). VULKANIZER_PEER_DMABUF=0 turns it off.
+    bool dmaBuf = false;
+    if (const char* env = std::getenv("VULKANIZER_PEER_DMABUF"); !env || std::strcmp(env, "0") != 0) {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> props(count);
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, props.data());
+        bool fd = false, dma = false;
+        for (const VkExtensionProperties& p : props) {
+            fd |= !std::strcmp(p.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            dma |= !std::strcmp(p.extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        }
+        if (fd && dma) {
+            VkPhysicalDeviceExternalBufferInfo ebi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO};
+            ebi.usage = kSharedUsage;
+            ebi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            VkExternalBufferProperties ebp{VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+            vkGetPhysicalDeviceExternalBufferProperties(info_.handle, &ebi, &ebp);
+            const VkExternalMemoryFeatureFlags need =
+                VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
+            dmaBuf = (ebp.externalMemoryProperties.externalMemoryFeatures & need) == need;
+        }
+        if (dmaBuf) {
+            if (!externalFd) extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+            extensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        }
+    }
     // Cooperative matrices (tensor cores, WMMA): cuBLAS's f16 GEMM uses square f16 x f16 -> f32 ones
     // of subgroup scope. VULKANIZER_COOPMAT: unset = on GPUs (CPU implementations emulate them, slower
     // than plain code: llvmpipe 22 vs 36 GFLOP/s), 0 = off, 1 = on everywhere.
@@ -284,6 +316,18 @@ VkResult Device::init() {
                 en.pNext = &pipelineStats;
             }
     }
+    // The heaps' real budget and usage (cuMemGetInfo; multi-GPU programs split a model by free memory).
+    {
+        uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> props(count);
+        vkEnumerateDeviceExtensionProperties(info_.handle, nullptr, &count, props.data());
+        for (const VkExtensionProperties& p : props)
+            if (!std::strcmp(p.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+                extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                memoryBudget_ = true;
+            }
+    }
     if (has13) {
         e13.subgroupSizeControl = s13.subgroupSizeControl;
         e13.computeFullSubgroups = s13.computeFullSubgroups;
@@ -328,9 +372,13 @@ VkResult Device::init() {
         return r;
     }
     vkGetDeviceQueue(device_, info_.computeQueueFamily, 0, &queue_);
-    if (externalFd) {  // before the first allocation: every device allocation is exportable
+    if (externalFd || dmaBuf)
         getMemoryFd_ = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR"));
-        features_.memoryExport = getMemoryFd_ != nullptr;
+    if (externalFd) features_.memoryExport = getMemoryFd_ != nullptr;  // before the first allocation
+    if (dmaBuf) {
+        getMemoryFdProperties_ = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
+        features_.sharedMemory = getMemoryFd_ && getMemoryFdProperties_;
     }
 
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -408,6 +456,12 @@ VkResult Device::init() {
         addressHigh_ = uint32_t(vkGetBufferDeviceAddress(device_, &bai) >> 32) & 0xFFFF8000u;
         destroyBuffer(probe);
     }
+    // Multi-GPU: this device's tag in the addresses it hands out (common/device_address.h).
+    // VULKANIZER_ADDRESS_TAG_BASE=n (tests): tags from n, so a single device's addresses carry one too.
+    uint32_t tag = info_.ordinal;
+    if (const char* env = std::getenv("VULKANIZER_ADDRESS_TAG_BASE"); env && *env) tag += uint32_t(std::atoi(env));
+    if ((addressHigh_ >> 16) == 0xFFFFu && tag > 0 && tag <= 0xFF)
+        addressTag_ = uint64_t(tag) << common::kAddressTagShift;
     features_.fusedFma = probeFusedFma();
     features_.fusedFma64 = features_.shaderFloat64 && probeFusedFma64();
     if (features_.sparseBuffers) probeSparse();
@@ -457,6 +511,7 @@ Device::~Device() {
     if (hostSteps_) vkDestroySemaphore(device_, hostSteps_, nullptr);
     for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
     destroyBuffer(readStaging_);
+    destroyBuffer(writeStaging_);
     for (auto& b : blocks_) destroyBuffer(b->buf);
     for (Batch& b : batches_) {
         if (b.fence) vkDestroyFence(device_, b.fence, nullptr);
@@ -564,9 +619,24 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     if (wantAddress) {
         VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         bai.buffer = buffer;
-        out.address = vkGetBufferDeviceAddress(device_, &bai) & kAddressMask;
+        out.address = exposedAddress(vkGetBufferDeviceAddress(device_, &bai));
     }
     return VK_SUCCESS;
+}
+
+void Device::memoryInfo(VkDeviceSize allocated, VkDeviceSize& free, VkDeviceSize& total) const {
+    total = info_.deviceLocalBytes;
+    free = total > allocated ? total - allocated : 0;
+    if (!memoryBudget_) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    mp.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(info_.handle, &mp);
+    VkDeviceSize sum = 0;
+    for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; ++i)
+        if (mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            sum += budget.heapBudget[i] > budget.heapUsage[i] ? budget.heapBudget[i] - budget.heapUsage[i] : 0;
+    free = std::min(sum, total);
 }
 
 VkResult Device::allocateBuffer(VkDeviceSize size, Buffer& out) {
@@ -640,6 +710,108 @@ VkResult Device::exportMemory(uint64_t id, int& fd) {
     return getMemoryFd_(device_, &gi, &fd);
 }
 
+VkResult Device::allocateSystem(VkDeviceSize size, VkBufferUsageFlags usage, bool dmaBuf, Buffer& out) {
+    out = Buffer{};
+    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.pNext = dmaBuf ? &external : nullptr;
+    bci.size = size;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer)) return r;
+    out.size = size;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, out.buffer, &req);
+    // Host-visible, preferably neither device-local (a discrete GPU's VRAM: the host writes it over the
+    // bus, another device cannot reach it) nor cached (write-combined system memory: the GPU reads it
+    // faster over a slow link, 2.5 vs 1.0 GB/s through USB4, plan.md 8.3).
+    constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    int32_t type = -1;
+    const VkMemoryPropertyFlags avoids[] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+    for (VkMemoryPropertyFlags avoid : avoids)
+        for (uint32_t i = 0; i < info_.memProps.memoryTypeCount && type < 0; ++i) {
+            const VkMemoryPropertyFlags f = info_.memProps.memoryTypes[i].propertyFlags;
+            if ((req.memoryTypeBits & (1u << i)) && (f & kHost) == kHost && !(f & avoid)) type = int32_t(i);
+        }
+    VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated.pNext = dmaBuf ? &exportInfo : nullptr;
+    dedicated.buffer = out.buffer;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.pNext = &dedicated;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = uint32_t(type);
+    VkResult r = type < 0 ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkAllocateMemory(device_, &mai, nullptr, &out.memory);
+    if (r == VK_SUCCESS) r = vkBindBufferMemory(device_, out.buffer, out.memory, 0);
+    if (r == VK_SUCCESS) r = vkMapMemory(device_, out.memory, 0, VK_WHOLE_SIZE, 0, &out.mapped);
+    if (r != VK_SUCCESS) {
+        out.mapped = nullptr;
+        destroyBuffer(out);
+        return r;
+    }
+    out.hostCached = info_.memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    return VK_SUCCESS;
+}
+
+VkResult Device::allocateShared(VkDeviceSize size, Buffer& out, int& fd) {
+    fd = -1;
+    if (!features_.sharedMemory) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (VkResult r = allocateSystem(size, kSharedUsage, true, out)) return r;
+    VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+    gi.memory = out.memory;
+    gi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkResult r = getMemoryFd_(device_, &gi, &fd);
+    if (r != VK_SUCCESS) destroyBuffer(out);
+    return r;
+}
+
+VkResult Device::importShared(int fd, VkDeviceSize size, Buffer& out) {
+    out = Buffer{};
+    if (!features_.sharedMemory) {
+        close(fd);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    VkResult r = getMemoryFdProperties_(device_, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp);
+    VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.pNext = &external;
+    bci.size = size;
+    bci.usage = kSharedUsage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (r == VK_SUCCESS) r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer);
+    if (r != VK_SUCCESS) {
+        close(fd);
+        return r;
+    }
+    out.size = size;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device_, out.buffer, &req);
+    const uint32_t bits = req.memoryTypeBits & fp.memoryTypeBits;
+    int32_t type = -1;
+    for (uint32_t i = 0; i < info_.memProps.memoryTypeCount && type < 0; ++i)
+        if (bits & (1u << i)) type = int32_t(i);
+    VkImportMemoryFdInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    import.fd = fd;  // owned by the memory once imported
+    VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    dedicated.pNext = &import;
+    dedicated.buffer = out.buffer;
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.pNext = &dedicated;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = uint32_t(type);
+    r = type < 0 ? VK_ERROR_INVALID_EXTERNAL_HANDLE : vkAllocateMemory(device_, &mai, nullptr, &out.memory);
+    if (r != VK_SUCCESS) close(fd);  // not consumed
+    if (r == VK_SUCCESS) r = vkBindBufferMemory(device_, out.buffer, out.memory, 0);
+    if (r != VK_SUCCESS) destroyBuffer(out);
+    return r;
+}
+
 VkResult Device::importMemory(int fd, VkDeviceSize bufferSize, VkDeviceSize memorySize, uint32_t memoryType,
                               Buffer& out) {
     out = Buffer{};
@@ -695,7 +867,7 @@ VkResult Device::importMemory(int fd, VkDeviceSize bufferSize, VkDeviceSize memo
     }
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = buffer;
-    out.address = vkGetBufferDeviceAddress(device_, &bai) & kAddressMask;
+    out.address = exposedAddress(vkGetBufferDeviceAddress(device_, &bai));
     return VK_SUCCESS;
 }
 
@@ -837,7 +1009,7 @@ VkResult Device::createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, B
     out.size = size;
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = out.buffer;
-    out.address = vkGetBufferDeviceAddress(device_, &bai) & kAddressMask;
+    out.address = exposedAddress(vkGetBufferDeviceAddress(device_, &bai));
     opaqueOut = features_.addressCaptureReplay ? vkGetBufferOpaqueCaptureAddress(device_, &bai) : 0;
     return VK_SUCCESS;
 }
@@ -1296,8 +1468,13 @@ void Device::collectTimings(Batch& b) {
         for (size_t i = 0; i < b.timed.size(); ++i) {
             const Timed& t = b.timed[i];
             const double ns = double(int64_t(ticks[2 * i + 1] - ticks[2 * i])) * timestampPeriodNs_;
-            double& rate = nsPerGroup_[t.pipeline];
-            rate = std::max(rate, ns / double(std::max(t.groups, kRateGroups)));
+            const double measured = ns / double(std::max(t.groups, kRateGroups));
+            Rate& rate = nsPerGroup_[t.pipeline];
+            rate.ns = std::max(rate.ns, measured);
+            if (ns >= kSignificantNs) {
+                rate.sigMin = rate.sigMin == 0 ? measured : std::min(rate.sigMin, measured);
+                rate.sigMax = std::max(rate.sigMax, measured);
+            }
         }
         if (profiling_) {
             std::lock_guard<std::mutex> lock(profileMutex());
@@ -1325,7 +1502,7 @@ VkResult Device::waitBatch(Batch& b) {
         for (const Batch& o : batches_)
             if (o.pending && o.serial < lost->serial && vkGetFenceStatus(device_, o.fence) != VK_SUCCESS) lost = &o;
         std::string names;
-        if (!lost->timed.empty()) {  // every dispatch, with its size
+        if (!lost->timed.empty() && lost->timed.size() == lost->kernels.size()) {  // every dispatch, with its size
             for (const Timed& t : lost->timed) {
                 char size[96];
                 std::snprintf(size, sizeof size, "\n  %8llu groups, estimated %8.3f ms: ", (unsigned long long)t.groups,
@@ -1371,11 +1548,18 @@ VkResult Device::flush() {
 }
 
 VkResult Device::wait(uint64_t serial) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (serial <= completedSerial_) return VK_SUCCESS;
-    if (open_ >= 0 && batches_[open_].serial <= serial) {
-        if (VkResult r = flushLocked()) return r;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (serial <= completedSerial_) return VK_SUCCESS;
+        if (open_ >= 0 && batches_[open_].serial <= serial) {
+            if (VkResult r = flushLocked()) return r;
+        }
+        serial = std::min(serial, nextSerial_ - 1);  // the latest batch: no later serial is ever signalled
     }
+    // The long wait without the lock, so that other threads keep recording (it is still held where
+    // the caller holds it). Any failure (device lost) is reported by the fence waits below.
+    if (progress_) waitSubmitted(serial);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (Batch& b : batches_)
         if (b.pending && b.serial <= serial) {
             if (VkResult r = waitBatch(b)) return r;
@@ -1383,14 +1567,23 @@ VkResult Device::wait(uint64_t serial) {
     return VK_SUCCESS;
 }
 
+VkResult Device::waitSubmitted(uint64_t serial) {
+    if (!progress_) return wait(serial);
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &progress_;
+    wi.pValues = &serial;
+    return vkWaitSemaphores(device_, &wi, UINT64_MAX);
+}
+
 VkResult Device::finish() {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (VkResult r = flushLocked()) return r;
-    for (Batch& b : batches_)
-        if (b.pending) {
-            if (VkResult r = waitBatch(b)) return r;
-        }
-    return VK_SUCCESS;
+    uint64_t last;
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (VkResult r = flushLocked()) return r;
+        last = nextSerial_ - 1;
+    }
+    return wait(last);
 }
 
 bool Device::idleLocked() {
@@ -1522,7 +1715,10 @@ VkResult Device::submit(const std::function<void(VkCommandBuffer)>& record) {
 
 VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, VkDeviceSize size) {
     if (size == 0) return VK_SUCCESS;
-    if (dst.mapped) {
+    // A discrete GPU's mapped memory is VRAM behind the bus: large host writes into it are slow (1.0
+    // GB/s through an eGPU's USB4 link, against 2.5 GB/s for the GPU's own copy from system memory).
+    const bool discrete = info_.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    if (dst.mapped && (!discrete || size <= kAsyncWriteLimit)) {
         // Nothing queued or running: a direct host write keeps the order and costs no
         // GPU round trip (inputs uploaded right before a synchronize, e.g. per LLM token).
         std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -1531,10 +1727,10 @@ VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, 
             return VK_SUCCESS;
         }
     }
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (size <= kAsyncWriteLimit) {
         // Staged in the batch's upload arena (the caller's memory is free again on return) and
         // copied in queue order, without waiting for the GPU.
-        std::lock_guard<std::recursive_mutex> lock(mutex_);
         VkDeviceAddress staged;
         if (VkResult r = upload(src, size, staged)) return r;
         const Batch& b = batches_[open_];
@@ -1544,28 +1740,39 @@ VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, 
             vkCmdCopyBuffer(cb, b.arena.buffer, dst.buffer, 1, &region);
         });
     }
-    if (VkResult r = finish()) return r;  // host access: recorded work comes first
-    if (dst.mapped) {
+    if (dst.mapped && !discrete) {
+        if (VkResult r = finish()) return r;  // host access: recorded work comes first
         std::memcpy(static_cast<char*>(dst.mapped) + offset, src, size);
         return VK_SUCCESS;
     }
-    Buffer staging;
-    VkResult r = createBuffer(size, kStagingUsage,
-                              {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT}, staging);
-    if (r != VK_SUCCESS) return r;
-    std::memcpy(staging.mapped, src, size);
-    r = submit([&](VkCommandBuffer cb) {
-        VkBufferCopy region{0, dst.offset + offset, size};
-        vkCmdCopyBuffer(cb, staging.buffer, dst.buffer, 1, &region);
-    });
-    freeBuffer(staging);
-    return r;
+    // Through writeStaging_, in queue order: the host fills one half while the GPU copies the other
+    // out. Returns once `src` is consumed, without waiting for the last copies.
+    if (!writeStaging_.buffer) {
+        if (VkResult r = allocateSystem(2 * kReadChunk, kStagingUsage, false, writeStaging_)) return r;
+        writeStagingSerial_[0] = writeStagingSerial_[1] = 0;
+    }
+    for (VkDeviceSize at = 0, i = 0; at < size; at += kReadChunk, ++i) {
+        const VkDeviceSize n = std::min(kReadChunk, size - at), half = (i % 2) * kReadChunk;
+        if (VkResult r = wait(writeStagingSerial_[i % 2])) return r;  // its last copy out
+        std::memcpy(static_cast<char*>(writeStaging_.mapped) + half, static_cast<const char*>(src) + at, n);
+        if (VkResult r = record([&](VkCommandBuffer cb) {
+                VkBufferCopy region{half, dst.offset + offset + at, n};
+                vkCmdCopyBuffer(cb, writeStaging_.buffer, dst.buffer, 1, &region);
+            }))
+            return r;
+        if (VkResult r = flushLocked()) return r;
+        writeStagingSerial_[i % 2] = nextSerial_ - 1;
+    }
+    return VK_SUCCESS;
 }
 
 VkResult Device::read(const Buffer& src, VkDeviceSize offset, void* dst, VkDeviceSize size) {
     if (size == 0) return VK_SUCCESS;
+    // Host access: recorded work comes first. Waited for without the lock first (other threads keep
+    // recording meanwhile), then again under it for whatever they recorded.
+    if (VkResult r = finish()) return r;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (VkResult r = finish()) return r;  // host access: recorded work comes first
+    if (VkResult r = finish()) return r;
     if (src.mapped && (src.hostCached || size <= kDirectReadLimit)) {
         std::memcpy(dst, static_cast<const char*>(src.mapped) + offset, size);
         return VK_SUCCESS;
@@ -1712,7 +1919,10 @@ VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t g
         if (params) {
             if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
         }
-        if (VkResult r = recordDispatch(p, std::array<uint32_t, 3>{}.data(), grid, push.data(), pushSize, label, 0))
+        Rate& rate = nsPerGroup_[p.pipeline];
+        const bool timed = timing_ && (profiling_ || !rate.sampled());
+        ++rate.launches;
+        if (VkResult r = recordDispatch(p, std::array<uint32_t, 3>{}.data(), grid, push.data(), pushSize, label, 0, timed))
             return r;
         return launchBlocking_ ? finish() : VK_SUCCESS;
     }
@@ -1723,8 +1933,8 @@ VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t g
     uint64_t chunk = kRateGroups;
     if (probe) {
         if (VkResult r = flushLocked()) return r;
-    } else if (known->second > 0) {
-        chunk = std::max<uint64_t>(1, uint64_t(batchBudgetNs_ / known->second));
+    } else if (known->second.ns > 0) {
+        chunk = std::max<uint64_t>(1, uint64_t(batchBudgetNs_ / known->second.ns));
     } else {
         chunk = UINT64_MAX;
     }
@@ -1748,7 +1958,7 @@ VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t g
                 double estimate = 0;
                 if (!probe || !first) {
                     const uint64_t groups = uint64_t(count[0]) * count[1] * count[2];
-                    estimate = nsPerGroup_[p.pipeline] * double(std::max(groups, kRateGroups));
+                    estimate = nsPerGroup_[p.pipeline].ns * double(std::max(groups, kRateGroups));
                     if (open_ >= 0 && commands_ && batches_[open_].estimateNs + estimate > batchBudgetNs_) {
                         if (VkResult r = flushLocked()) return r;
                     }
@@ -1756,7 +1966,11 @@ VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t g
                 if (params) {  // each batch keeps its own copy (its arena is reused once it has run)
                     if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
                 }
-                if (VkResult r = recordDispatch(p, base, count, push.data(), pushSize, label, estimate)) return r;
+                // A probe, the first launches and every launch of a varying pipeline are timed (Rate).
+                Rate& rate = nsPerGroup_[p.pipeline];
+                const bool timed = profiling_ || probe || !rate.sampled();
+                ++rate.launches;
+                if (VkResult r = recordDispatch(p, base, count, push.data(), pushSize, label, estimate, timed)) return r;
                 if (probe && first) {
                     if (VkResult r = finish()) return r;  // measures it
                 }
@@ -1775,11 +1989,12 @@ VkResult Device::uploadParams(const void* params, size_t size, std::vector<uint8
 }
 
 VkResult Device::recordDispatch(const ComputePipeline& p, const uint32_t base[3], const uint32_t count[3],
-                                const void* pushData, uint32_t pushSize, const char* label, double estimateNs) {
+                                const void* pushData, uint32_t pushSize, const char* label, double estimateNs,
+                                bool timed) {
     return record([&](VkCommandBuffer cb) {
         Batch& b = batches_[open_];
         const uint32_t query = uint32_t(2 * b.timed.size());
-        if (timing_) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.timing, query);
+        if (timed) vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.timing, query);
         b.kernels.push_back(label);
         b.estimateNs += estimateNs;
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
@@ -1789,7 +2004,7 @@ VkResult Device::recordDispatch(const ComputePipeline& p, const uint32_t base[3]
         const uint32_t limit = info_.props.limits.maxComputeWorkGroupCount[0];
         for (uint32_t x = 0; x < count[0]; x += limit)
             vkCmdDispatchBase(cb, base[0] + x, base[1], base[2], std::min(limit, count[0] - x), count[1], count[2]);
-        if (timing_) {
+        if (timed) {
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, b.timing, query + 1);
             b.timed.push_back({label, p.pipeline, uint64_t(count[0]) * count[1] * count[2], estimateNs});
         }

@@ -66,6 +66,7 @@ struct Features {
     bool hostMemoryImport = false;  // host memory at device address h | hostAddressBits() (importHostMemory)
     bool hostMemoryAlloc = false;   // the same for memory of our own (allocateHostMemory)
     bool memoryExport = false;      // device allocations are exportable as opaque fds (CUDA IPC)
+    bool sharedMemory = false;      // allocateShared / importShared (dma-buf): staging between devices
     // S of the S x S x S f16 x f16 -> f32 cooperative matrices of subgroup scope (16 or 8), 0 if none
     uint32_t coopMatrixSize = 0;
 };
@@ -116,6 +117,12 @@ public:
     // (specialization constant 5 of every pipeline, see common/device_address.h): 0xFFFF8000... on
     // RADV, 0 on llvmpipe (CPU pointers). Host memory used in place sits at h | hostAddressBits().
     uint64_t hostAddressBits() const { return uint64_t(addressHigh_) << 32; }
+    // Free and total bytes of the device-local heaps: with VK_EXT_memory_budget the driver's budget
+    // (what this process can still allocate, other processes' use included), otherwise the heap
+    // sizes minus `allocated`.
+    void memoryInfo(VkDeviceSize allocated, VkDeviceSize& free, VkDeviceSize& total) const;
+    // This device's tag in the addresses of its buffers (common/device_address.h), 0 for none.
+    uint64_t addressTag() const { return addressTag_; }
     // Makes [host, host + size) device-accessible at device address host | hostAddressBits() (a
     // sparse buffer placed there, with the host pages imported through VK_EXT_external_memory_host
     // bound to it). `host` and `size` must be multiples of hostImportAlignment(). out.address and
@@ -147,6 +154,14 @@ public:
     VkResult exportId(const Buffer& buf, uint64_t& id);
     VkResult exportMemory(uint64_t id, int& fd);
     VkResult importMemory(int fd, VkDeviceSize bufferSize, VkDeviceSize memorySize, uint32_t memoryType, Buffer& out);
+
+    // Multi-GPU staging (features().sharedMemory): allocateShared makes system memory (host-visible,
+    // not device-local where the device has a choice) of `size` bytes exportable as a dma-buf, and
+    // gives a new fd of it; another device's importShared takes that fd (owned from then on) and
+    // makes the same pages a buffer of its own. Both are for copies only (no device address) and
+    // are freed with freeBuffer.
+    VkResult allocateShared(VkDeviceSize size, Buffer& out, int& fd);
+    VkResult importShared(int fd, VkDeviceSize size, Buffer& out);
 
     // All of these run in queue order with the recorded work. read waits for it and returns the
     // data; write returns once `src` was consumed (small writes are staged and recorded, large
@@ -181,6 +196,9 @@ public:
     uint64_t currentSerial();             // serial of the work recorded so far
     VkResult flush();                     // submits the open batch
     VkResult wait(uint64_t serial);       // flushes if needed and waits for that serial
+    // Waits for that serial without holding up other threads' use of the device (another device's
+    // host step waiting for this one). The work must have been submitted (flush()) already.
+    VkResult waitSubmitted(uint64_t serial);
     VkResult finish();                    // waits for everything recorded
     bool isComplete(uint64_t serial);
     bool idle();                          // nothing recorded or running
@@ -258,7 +276,7 @@ private:
     bool hasRecordedWork() const;
     void collectTimings(Batch& b);
     VkResult recordDispatch(const ComputePipeline& p, const uint32_t base[3], const uint32_t count[3],
-                            const void* pushData, uint32_t pushSize, const char* label, double estimateNs);
+                            const void* pushData, uint32_t pushSize, const char* label, double estimateNs, bool timed);
     // Uploads `params` into the open batch unless already done (uploadedSerial) and patches the
     // address into push[0..8).
     VkResult uploadParams(const void* params, size_t size, std::vector<uint8_t>& push, uint64_t& uploadedSerial);
@@ -301,8 +319,27 @@ private:
     void runHostSteps();
     bool launchBlocking_ = false;  // CUDA_LAUNCH_BLOCKING=1
     double batchBudgetNs_ = 0;  // 0: no limit
-    // GPU time per workgroup of each pipeline: the highest seen, so estimates err on the long side.
-    std::unordered_map<VkPipeline, double> nsPerGroup_;
+    // GPU time per workgroup of each pipeline: the highest measured, so estimates err on the long side
+    // (an underestimate packs more than the batch budget into one submission, and the kernel driver
+    // resets the GPU after 2 s). Two timestamps around a dispatch cost more than a small kernel's run
+    // time, so a pipeline whose measurements agree (sampled(): the dispatches of at least kSignificantNs
+    // within kSteadyRatio of each other, after kTimedLaunches) is timed only every kTimingInterval
+    // launches. One whose cost varies (a GEMM kernel's per-workgroup time follows k, which differs 100x
+    // between calls) is timed on every launch, as is everything under VULKANIZER_PROFILE=1. Shorter
+    // dispatches do not count: their per-workgroup time is mostly fixed overhead, which overestimates.
+    struct Rate {
+        double ns = 0;                       // highest, of all dispatches
+        double sigMin = 0, sigMax = 0;       // lowest and highest of the significant ones
+        uint64_t launches = 0;
+        bool sampled() const {
+            return launches >= kTimedLaunches && sigMax <= kSteadyRatio * sigMin && launches % kTimingInterval != 0;
+        }
+    };
+    static constexpr double kSignificantNs = 50e3;
+    std::unordered_map<VkPipeline, Rate> nsPerGroup_;
+    static constexpr uint64_t kTimedLaunches = 8;
+    static constexpr uint64_t kTimingInterval = 32;
+    static constexpr double kSteadyRatio = 2.0;
     std::vector<std::pair<uint64_t, Buffer>> deferredFrees_;  // (serial, buffer)
     // Sub-allocation (VULKANIZER_NO_SUBALLOC=1 turns it off).
     static constexpr VkDeviceSize kSubAllocLimit = 4 << 20;
@@ -319,12 +356,21 @@ private:
     VkResult subAllocate(VkDeviceSize size, Buffer& out);
     void releaseSubAllocation(Buffer& buf);
     Buffer readStaging_;  // host-cached, two kReadChunk halves (read)
+    Buffer writeStaging_;  // system memory, two kReadChunk halves (write to a discrete GPU)
+    uint64_t writeStagingSerial_[2] = {0, 0};  // the copy out of each half
+    // Mapped system memory (allocateSystem: write-combined where there is a choice), exportable as
+    // a dma-buf with `dmaBuf`.
+    VkResult allocateSystem(VkDeviceSize size, VkBufferUsageFlags usage, bool dmaBuf, Buffer& out);
     VkDeviceSize sparsePageSize_ = 0;
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
     VkDeviceSize hostImportAlignment_ = 0;
     VkDeviceSize placedMapAlignment_ = 4096;
     uint32_t addressHigh_ = 0;  // hostAddressBits() >> 32
+    uint64_t addressTag_ = 0;   // addressTag()
+    bool memoryBudget_ = false;  // VK_EXT_memory_budget enabled
+    // A buffer device address as handed out: without its top bits, with this device's tag.
+    uint64_t exposedAddress(VkDeviceAddress a) const { return (a & kAddressMask) | addressTag_; }
     PFN_vkGetMemoryHostPointerPropertiesEXT getHostPointerProperties_ = nullptr;
     PFN_vkMapMemory2KHR mapMemory2_ = nullptr;
     // VULKANIZER_PIPELINE_STATS=1: the driver's statistics of every pipeline (registers, spills...)
@@ -332,6 +378,7 @@ private:
     void printPipelineStats(VkPipeline pipeline, const char* entryPoint, const uint32_t spec[5]);
     PFN_vkUnmapMemory2KHR unmapMemory2_ = nullptr;
     PFN_vkGetMemoryFdKHR getMemoryFd_ = nullptr;
+    PFN_vkGetMemoryFdPropertiesKHR getMemoryFdProperties_ = nullptr;
     std::unordered_map<VkDeviceMemory, uint64_t> exportIds_;  // exported memory -> id (exportId)
     std::unordered_map<uint64_t, VkDeviceMemory> exported_;
     uint64_t nextExportId_ = 1;

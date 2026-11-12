@@ -155,7 +155,7 @@ std::string kernelCacheKey(const std::string& moduleHash, const std::string& ent
                                    uint32_t(t.float16) << 2 | uint32_t(t.float64) << 3 | uint32_t(t.int8) << 4 |
                                    uint32_t(t.int16) << 5 | uint32_t(t.storage8) << 6 | uint32_t(t.storage16) << 7 |
                                    uint32_t(t.int64Atomics) << 8 | uint32_t(t.integerDotProduct) << 9 | uint32_t(t.fusedFma) << 10 | uint32_t(t.fmaInF64) << 11 | uint32_t(t.exactFtzFma) << 13 |
-                                   uint32_t(t.fusedFma64) << 12};
+                                   uint32_t(t.fusedFma64) << 12 | uint32_t(t.halfConvertRte) << 14};
     h.update(fields, sizeof fields);
     return h.hexDigest();
 }

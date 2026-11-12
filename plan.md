@@ -61,6 +61,8 @@ Hátra, javasolt sorrendben:
 4. **6. fázis**: a korlátok feloldása (PyTorch/ComfyUI → bináris kompatibilitás → teljesítmény → teljesség); a nem
    clean-room feladatok külön, eltéve: [plan_non_clean.md](plan_non_clean.md).
 5. **7. fázis**: NPU offload (2026-11-10: váz, XDNA bring-up, mérés, zero-copy, aszinkron végrehajtás és GPU + NPU megosztás kész; a megosztás ezen az APU-n nem gyorsít, a 7.6 igény szerint).
+6. **8. fázis**: több GPU (tensor-split): egyedi címek eszközönként, aszinkron dma-buf peer-másolás, `CUDA_VISIBLE_DEVICES`,
+   valós szabad memória; eGPU-feltöltés 2,5×.
 
 ### Fázis 0 – Váz ✅
 - [x] CMake projekt, build/test/run/clean scriptek
@@ -354,8 +356,8 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
   - GPU-n kész (2026-10-21): a sablon 1024×1024-en, seed 42-vel végigfut a Renoiron, 117,8 s/lépés (8 lépés, összesen ~21 perc).
     Közben előjött hibák:
     - A 64 parancsos batchek 1024×1024-en 2 s-nál tovább futottak, és az amdgpu reseteli a GPU-t (`lockup_timeout`,
-      alapból 2000 ms a compute ringen is). Megoldás: minden dispatch timestampet kap, és pipeline-onként a mért legnagyobb
-      ns/workgroup alapján egy submit legfeljebb `VULKANIZER_BATCH_MS` (alap: 50 ms) becsült munkát kap. A nagyobb gridek
+      alapból 2000 ms a compute ringen is). Megoldás: a dispatchek timestampet kapnak (2026-11-11 óta mintavételesen), és
+      pipeline-onként a mért ns/workgroup alapján egy submit legfeljebb `VULKANIZER_BATCH_MS` (alap: 50 ms) becsült munkát kap. A nagyobb gridek
       darabokra bomlanak (`vkCmdDispatchBase`, a `%nctaid` push constantból jön). Egy új pipeline első indítása egy 256
       workgroupos, külön mért próbadarab.
     - A pufferben átadott kernelparaméterek (`paramsInBuffer`, >256 bájt, pl. a TensorIterator offset calculatorai)
@@ -851,7 +853,7 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
 - [ ] **6.11** cuSOLVER komplex, `geev`, `sytrf`, `gesvda`; cuFFT callbackek (elő/utó-kernel); cuSPARSE BSR és komplex;
   cuRAND MT19937/MTGP32 a nyilvános algoritmus, paramétertáblák és dokumentált elrendezés szerint (a hivatalos
   kimenettel csak ellenőrizve), `curand_discrete`. (Az NVIDIA-azonos scrambled Sobol és Poisson: plan_non_clean.md.)
-- [ ] **6.12** Több GPU: peer access dma-buf importtal azonos címen; IPC event exportált timeline semaphore-ral;
+- [ ] **6.12** Több GPU (a peer access és az eszközközi másolás: 8. fázis); IPC event exportált timeline semaphore-ral;
   managed memória migráció (csak dGPU-n, mérés után).
 
 ### Fázis 7 – NPU offload
@@ -1119,6 +1121,169 @@ rögzíteni; a kernelek építéséhez nehéz toolchain kell (mlir-aie, Peano/ll
 vannak (licenc: a mlir-aie Apache-2.0 with LLVM exception – a THIRD_PARTY_NOTICES-ba, ha csomagoljuk); egy NPU-hívás
 fix költsége (~100 µs nagyságrend, mérendő) miatt a kis GEMM-ek sosem érik meg.
 
+### Fázis 8 – Több GPU: tensor-split
+Cél: ha a gépben több GPU van (pl. egy nagy memóriájú iGPU és diszkrét/eGPU-k), a programok az összes memóriát
+használhassák. Egyetlen „összevont” virtuális GPU nem reális: egy Vulkan-kernel csak a saját eszköze memóriáját éri el,
+és egy eGPU-ról a másik eszköz memóriájához nyúlni a linken át (USB4: ~2,5 GB/s) két nagyságrenddel lassabb a VRAM-nál.
+Ezért **alkalmazásszintű tensor-split**: minden GPU külön CUDA-eszköz marad, a modellt az alkalmazás osztja szét
+(llama.cpp `-sm layer -ts`, PyTorch/accelerate `device_map`, ComfyUI több-GPU-s node-ok); a Vulkanizer feladata, hogy a
+több eszközös CUDA helyesen és gyorsan működjön. A peer access marad 0 (`cuDeviceCanAccessPeer`), helyette gyors,
+aszinkron eszközközi másolás (a 6.12 peer access tétele ezzel kiváltva).
+
+Gép (2026-11-11): Ryzen AI 9 HX 370, Radeon 890M iGPU (67 GiB device-local, RADV STRIX1) + 2× Radeon RX 9060 XT 16 GiB
+(RADV GFX1200) USB4-es eGPU-házban (ASMedia ASM246x, 2 × 20 Gb/s; a GPU-k saját linkje PCIe 5.0 x16, a szűk keresztmetszet
+az alagút).
+
+- [x] **8.0** Felmérés: a 3 eszköz **ugyanazokat a címeket** adta (`0x800100200000`-tól mindhármon): a `cudaMemcpy(Default)`
+  és a `cudaPointerGetAttributes` több GPU-n rossz eszközt találhatott. A peer-másolás a hoston át 0,6 GB/s, a
+  `cuMemcpyPeerAsync` szinkron, a másik eszköz eventjére váró stream a hívó szálon blokkolt; a `cudaMemcpy3DPeer(Async)`
+  hiányzott (llama.cpp `-sm row`); `cuMemGetInfo` a heap méretét adta, nem a szabadot.
+- [x] **8.1** Eszközkiválasztás és memória: `CUDA_VISIBLE_DEVICES` (sorszámok vagy `GPU-<uuid-előtag>`, sorrendet is ad,
+  az első érvénytelen elemnél vége, ahogy a CUDA-ban), `CUDA_DEVICE_ORDER=PCI_BUS_ID` (alap: diszkrét > integrált),
+  `VULKANIZER_DEVICE` vesszős listával; `cuMemGetInfo` a `VK_EXT_memory_budget` szerint (budget − usage a device-local
+  heapeken; a 890M-en pl. 40 GiB szabad a 67-ből). Teszthez: `VULKANIZER_DUPLICATE_DEVICES=n` (minden eszköz n-szer,
+  külön logikai eszközként – egy GPU-n is fut a több eszközös teszt).
+- [x] **8.2** Egyedi címek: az n-edik eszköz címeiben a 48–55. bit n (`common/device_address.h`, `Device::addressTag()`).
+  Ott a RADV-cím minden bitje 1, a kernelek OR-ja (5-ös specializációs konstans) visszaállítja, így a jelölő a GPU-ig
+  sem jut el; a 0. eszköz címei változatlanok, a host-memória mindenhol a saját host-címén marad, a generikus
+  shared/local jelölők (56–63. bit) szabadok. Ahol a felső bitek 0-k (llvmpipe: CPU-pointerek, eleve egyediek), nincs
+  jelölő. Teszthez: `VULKANIZER_ADDRESS_TAG_BASE=n` (a 0. eszköz is jelölt) – a teljes készlet így is zöld.
+- [x] **8.3** Aszinkron peer-másolás (`src/driver/peer.cpp`): eszközpáronként (irányonként) egy staging: a forráseszköz
+  rendszermemóriát foglal dma-buf exporttal (`Device::allocateShared`, write-combined GTT), a céleszköz importálja
+  (`importShared`). Darabonként (4 × 16 MiB, `VULKANIZER_PEER_STAGING_MB`): forrás sora: (vár a slot felszabadulására)
+  buffer → slot; cél sora: host-lépés vár a forrás timeline-értékére (`enqueueHost`, a munkaszál `waitSubmitted`-del, zár
+  nélkül), majd slot → buffer. A hívás nem vár (a szinkron változatok a végén), a host nem nyúl az adathoz. Ide fut a
+  `cuMemcpyPeer(Async)`, a `cuMemcpy*`/`cudaMemcpyAsync` két eszköz pointerével, a 2D/3D másolás eszközök között (a sorok
+  egy staged másolásban) és az új `cuMemcpy3DPeer(Async)` / `cudaMemcpy3DPeer(Async)`. dma-buf nélkül (vagy
+  `VULKANIZER_PEER_DMABUF=0`) a régi host-út.
+  - Mérés (`cuMemcpyPeer`, Release): 9060 XT → 9060 XT 2,0–2,3 GB/s (régi host-út: 0,6), 890M → 9060 XT 2,4 GB/s – a
+    USB4-link plafonja (DtoH 2,44 GB/s). 16 KiB: 0,10–0,16 ms.
+  - Közben (eGPU-feltöltés): diszkrét GPU-n a nagy (> 256 KiB) `write` nem CPU-memcpy a ReBAR-on át (USB4-en 1,0 GB/s),
+    hanem kétpufferes GPU-másolás write-combined rendszermemóriából (`writeStaging_`): HtoD 1,0 → 2,5–2,6 GB/s (a modell
+    betöltése az eGPU-kra ennyivel gyorsabb). Cache-elt rendszermemóriából a GPU ugyanígy csak ~1 GB/s-mal olvas.
+- [x] **8.3b** Nagy foglalás és eszközközi felszabadítás (a llama.cpp-n jött elő): a RADV `maxMemoryAllocationSize`-a 4 GiB,
+  a ggml viszont eszközönként egyetlen modellméretű buffert foglal (12,6 GiB) – eddig `cuMemAlloc` → OUT_OF_MEMORY minden
+  eszközön (egy GPU-n is: nagy modell sosem fért el egyben). Most a korlát fölötti `cuMemAlloc` virtuális memória
+  (`allocateLarge`: `cuMemAddressReserve` + ≤ 4 GiB-os `cuMemCreate`-darabok egymás után leképezve, `largeAllocations`;
+  a `cuMemFree`, a `cuMemGetAddressRange` és a pointer-attribútumok az egészet látják). A `cuMemFree` egy másik
+  eszköz memóriáját is felszabadítja (UVA, mint a CUDA-ban: a ggml minden eszköz cuBLAS-munkaterületét egy eszközről
+  szabadítja fel). Teszt: `memory` (5 GiB-os foglalás, memset és másolás a 4 GiB-os határon át, ha van 7 GiB szabad),
+  `multigpu` (felszabadítás a másik kontextusból).
+- [x] **8.4** Eszközök közötti eventre várás (`cuStreamWaitEvent`): a váró eszköz sorában host-lépés (`waitForOtherDevice`),
+  a hívó nem blokkol.
+- [ ] **8.5** NCCL rangok különböző eszközökön a 8.3 stagingjén (ma host-memórián át) – csak ha mérés szerint számít.
+- [ ] **8.6** Alkalmazások: llama.cpp kész (lent); PyTorch `device_map="auto"` és ComfyUI több GPU-n még nincs kipróbálva.
+  - llama.cpp (`tools/build_llama.sh`; a friss llama.cpp a `CUDA::cublasLt`-hez is linkel, és az nvcc 12.9 g++ ≤ 14-et
+    kér – a script mindkettőt kezeli), Qwen3.6-35B-A3B UD-Q5_K_XL (25,3 GiB, egyik eGPU-ra sem fér), `llama-bench -p 512
+    -n 128 -sm layer`, Release:
+    | Eszközök | `-ts` | pp512 t/s | tg128 t/s |
+    |---|---|---|---|
+    | 890M egyedül | – | 23,2 | 5,9 |
+    | 2× 9060 XT (eGPU) | auto | 437 | 39,7 |
+    | 2× 9060 XT + 890M (`-dev CUDA0/CUDA1/CUDA2`) | 16/16/6 | 191 | 19,1 |
+    | 2× 9060 XT + 890M | 16/16/40 | 45,7 | 8,4 |
+    | 9060 XT + 890M | 16/40 | 34,2 | 7,4 |
+    A kimenet helyes (llama-simple: „Paris…”, a két eGPU-n 38,7 t/s). Tanulságok: (1) a réteges felosztásnál a rétegek
+    egymás után futnak, a sebességet a leglassabb eszköz része szabja meg: az iGPU itt ~7×-esen lassabb, ezért csak
+    akkor érdemes bevonni, ha a modell nélküle nem fér el. (2) A llama.cpp az integrált GPU-t magától kihagyja, ha van
+    diszkrét (`src/llama.cpp`: „add integrated GPUs only if no discrete GPUs were found”) – `-dev CUDA0/CUDA1/CUDA2`
+    veszi be. (3) Rossz `-ts` (pl. minden egy eGPU-ra) túlfoglalja a VRAM-ot: a RADV rendszermemóriába tolja a többit,
+    a USB4-en át 3,1 t/s. (4) Az eszközök közti forgalom (tokenenként egy aktiváció) nem számít: a két eGPU tg-je az
+    egy GPU-s nagyságrendben van.
+- Tesztek: `multigpu` (`VULKANIZER_DUPLICATE_DEVICES=2`) és `multigpu_devices` (a gép eszközein, 2-nél kevesebbel kihagyva):
+  egyedi címek és `CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL` bármelyik kontextusból, eventre várás + `cuMemcpyPeerAsync` +
+  kernel a céleszközön, unified másolás belső/igazítatlan címekkel, pitched sorok `cuMemcpy3DPeerAsync`-kal és
+  vissza `cuMemcpy2DAsync`-kal, a stagingnél nagyobb (320 MiB) másolás mindkét irányban. A teljes készlet (42, az nvcc-s
+  tesztekkel) zöld a 9060 XT-n és a 890M-en, `rt_kernels multigpu` a 3 valódi GPU-n.
+
+### Teljesítmény-javítások (2026-11-11)
+
+Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + szinkron, két szál; cuBLAS GEMM 1024³/4096³; llama.cpp):
+- [x] **Mintavételes dispatch-időzítés** (`vk::Device::dispatch`, `Rate`): eddig minden dispatch két timestampet kapott
+  (a batch-becslés és a profil miatt), ez többe került, mint egy kis kernel futása. Most az a pipeline, amelynek
+  jelentős (≥ 50 µs-os) dispatchei 2×-en belül egyeznek, az első 8 indítás után csak minden 32.-en mérődik; a változó
+  költségű (pl. a cuBLAS GEMM: a workgroupra jutó idő k-val nő, k 128 és 10 240 között) minden indításon, ahogy
+  `VULKANIZER_PROFILE=1` alatt minden. A becslés a valaha mért legnagyobb ns/workgroup marad. Kis kernel: 3,3 → 1,2
+  µs/indítás (9060 XT).
+  - Tanulság (2026-11-11): az első változat minden pipeline-t mintavételezett, és a becslést a kisebb mérések felé is
+    visszahúzta. A ComfyUI Z-Image-futásán a GEMM-pipeline becslése a sok kis k-jú szorzás után lecsökkent, a nagy k-júakat
+    alig mérte, egy submit 2 s fölé nőtt: `ring comp_1.1.0 timeout`, a queue-reset nem sikerült, MODE1 GPU-reset a
+    9060 XT-n, közben megállt a desktop. A batch-budget biztonsága a pontos (túl-) becslésen múlik; ezen csak
+    egyenletes költségű kernelekre szabad spórolni.
+- [x] **Várakozás lock nélkül**: a `cuStreamSynchronize`, a `cuCtxSynchronize` és a DtoH másolás eddig a globális
+  driver-lockot és a `Device` mutexét is fogta a fence-várás alatt, így más szálak (más GPU-ra sem) indíthattak semmit.
+  Most a `Device::wait`/`finish` a timeline semaphore-ra lock nélkül vár, a driver a várás idejére elengedi a lockot
+  (`finishUnlocked`). Indítás egy másik, folyamatosan szinkronizáló szál mellett: 8,4 → 1,2 µs (9060 XT), 38,7 → 8,7 µs (890M).
+- [x] **cuBLAS: coopmat csak ahol gyorsabb**: a 890M-en (RDNA3.5) a cooperative matrix f16 TN GEMM 3× lassabb a tiled
+  kernelnél (4096³: 1,14 vs 3,48 TFLOPS; wave32-vel sem jobb), a 9060 XT-n (RDNA4) 2× gyorsabb (15,6 vs 7,2). Eszközönként
+  egyszer mérve dől el (1024³, saját streamen, eventekkel; `coopFaster`), `VULKANIZER_GEMM_COOP=0/1` felülbírálja.
+- llama.cpp, Release, `llama-bench`:
+  | Modell, eszköz | pp512 előtte → utána | tg előtte → utána |
+  |---|---|---|
+  | Qwen3.6-35B-A3B Q5_K_P (26 GiB), 2× 9060 XT | 449 → 474 | 41,7 → 48,4 (tg128) |
+  | Qwen3-VL 8B Q4_K_M, 9060 XT | 773 → 768 | 46,3 → 48,6 (tg128) |
+  | Qwen3-VL 8B Q4_K_M, 890M | – | 6,2–7,4 → 7,9 (tg64, zajos) |
+  Összevetés a natív Vulkan backenddel, ugyanabból a llama.cpp-ből (03d6c82, `.work/llama-vulkan`), `-fa 0`, r=3:
+  | Modell, eszköz | pp512 Vulkan / Vulkanizer | tg128 Vulkan / Vulkanizer |
+  |---|---|---|
+  | Qwen3-VL 8B Q4_K_M, 9060 XT | 1981 / 770 (39%) | 53,5 / 50,5 (94%) |
+  | Qwen3-VL 8B Q4_K_M, 890M | 93 / 114 (122%) | 7,6 / 7,6 (100%) |
+  | Qwen3.6-35B-A3B Q5_K_P, 2× 9060 XT | 1597 / 485 (30%) | 59,6 / 48,3 (81%) |
+  A `-fa auto` a Vulkanizeren kikapcsol (az alap build FA-kernel nélküli, `build_llama.sh --fa` kell hozzá); `-fa 1`-gyel
+  az attention a CPU-ra kerül (tg 22). (Az első mérésben a 890M lassú állapotban volt; a felhasználó gépén mérve:
+  Vulkan 477 / 15,8, Vulkanizer 192 / 15,5.)
+- [x] **Gyorsabb coopmat GEMM** (`gemm_coopmat.comp`): a dense modellek pp-jének ~78%-a a cuBLAS f16 TN GEMM (a ggml a
+  K-kvantált súlyokat f16-ra bontja ki, n = 512). A kernel eddig 64×64-es csempékkel, 16 bites shared-írásokkal és
+  átfedés nélkül dolgozott. Most: 128×128-as csempe (subgroupként 4×4 mátrix), uvec4-es shared-írások, a következő
+  k-lépés regiszterekbe töltve a szorzás alatt, kiírás subgroupnként egy mátrixnyi shared-pufferen át. Kis kimenetre
+  (kevesebb 128-as csempe, mint compute unit) a 64×64-es változat fut (`SMALL_TILE`). llama-méretű GEMM-ek (m = 1024–
+  12288, n = 512, k = 4096–12288): 9060 XT 12,6 → 18,3 TFLOPS; 890M 3,3 (tiled) → 6,8 TFLOPS, így ott is a coopmat
+  nyeri a `coopFaster` mérést. Kipróbálva, nem nyert: BK = 64 (168 VGPR, ~5 TFLOPS), wave32 (`RADV_PERFTEST=cswave32`),
+  sorköz-kitöltés nélkül (15,4). Teszt: két nagy f16 TN eset a `cublas`-ban (1030×777, 1100×520, szélekkel, beta ≠ 0).
+  | Modell, eszköz | pp512 előtte → utána | natív Vulkan |
+  |---|---|---|
+  | Qwen3-VL 8B Q4_K_M, 9060 XT | 770 → 987 | 1758–1981 |
+  | Qwen3-VL 8B Q4_K_M, 890M | 192 → 306 | 477 |
+  | Qwen3.6-35B-A3B Q5_K_P, 2× 9060 XT | 478 → 492 | 1719 |
+- [x] **NPU-mérés** (a 890M + XDNA2 gépen, 2026-11-11): az NPU-ra csak bf16 kernelek vannak, így a llama.cpp f16 GEMM-jei
+  `VULKANIZER_NPU=force`-szal sem mennek oda. bf16 TN 4096×512×4096: GPU (tiled bf16) 4,8–5,4 ms, NPU zero-copy 10,9 ms
+  (ebből az NPU-futás 6,8 ms ≈ 2,5 TFLOPS), felosztás 0,98–1,11×; ugyanez f16-ban a coopmat kernellel 2,8 ms
+  (6,2 TFLOPS). A 12288-as és a k = 12288-as alakra nincs NPU-kernel. Az NPU tehát itt nem segít.
+- [x] **Hardveres f32 → f16 konverzió** (`Target::halfConvertRte`): a `cvt.rn.f16.f32` és az f16 aritmetika eredménye
+  eddig ~40 egész-utasításos szoftveres RNE-kerekítés volt (a `packHalf2x16` a RADV-n csonkít). Ahol az eszköz
+  `shaderRoundingModeRTEFloat16` + `shaderDenormPreserveFloat16`, ott `OpFConvert` a `RoundingModeRTE 16` és
+  `DenormPreserve 16` execution mode-dal. `VULKANIZER_SOFT_F16_CVT=1` a régi út. A ggml `dequantize_block_q4_K`
+  kódja 3120 → 1300 bájt, ideje 341 → 194 µs (pp512 alatt átlag), a Q6_K-é 343 → 193 µs; becslés szerint így a
+  9060 XT sávszélesség-plafonján (~300 GB/s) fut. A pp512-ben ez zajon belüli (+1–2%; a GEMM ideje futásonként
+  ±5%-ot szór), a 890M-en 273 → 292. Teszt: `half_convert` (+ `half_convert_soft`): minden f16 érték, minden két
+  szomszédos f16 közti döntetlen és ±1 ulp, 2^22 szétszórt f32 bitminta; mindkét úton 0 eltérés minden eszközön.
+- [x] **ComfyUI mérés** (Z-Image Turbo, 1024×1024, 8 lépés euler, cfg 1, a ComfyUI API-ján át, 9060 XT, egy hideg és
+  három meleg futás; a natív ROCm a ComfyUI `.venv`-je, PyTorch 2.13 ROCm 7):
+  | | Vulkanizer | natív ROCm |
+  |---|---|---|
+  | egy kép (meleg) | 75–81 s | 14,1–14,8 s |
+  | 8 lépés | 31 s (3,9 s/lépés) | ~8,5 s (1,0–1,25 s/lépés) |
+  | VAE-dekódolás | ~41 s (fp32) | ~3 s (bf16) |
+  A Vulkanizer GPU-ideje (`VULKANIZER_PROFILE`): diffúzió + szövegkódoló 27,6 s, ebből GEMM 19,3 s, softmax 1,9 s (a math
+  attention: nincs fused SDPA), `isneginf`/`nan_to_num`/elemenkénti ~3,5 s. VAE 38,8 s: im2col 14,9 s (39 ms/indítás)
+  + f32 GEMM 23,7 s – a konvolúció cuDNN nélkül im2col + sgemm, és a ComfyUI a VAE-t fp32-ben futtatja (a jelentett
+  compute capability-n nem választ bf16-ot). Teendők: cuDNN-shim vagy natív konvolúció (6.4), bf16 VAE, fused attention.
+  - `--bf16-vae` (ComfyUI-kapcsoló): 80 → 47 s/kép, a VAE ~41 → ~9,5 s; a kép a ROCm-osével egyezik (átlagos eltérés
+    6/255, a fp16/bf16 különbség). A ROCm-futás 4. képe egyébként fekete lett (a natív stack hibája).
+  - `VULKANIZER_TORCH_SDPA=mem_efficient,flash`: „cutlassF: no kernel found to launch” – a fused attention nem fut.
+  - A diffúziós modell GEMM-jei (VULKANIZER_LOG=debug): a lineáris rétegek (m = 3840–11520, n = 4128, k = 3840–10240)
+    és a QKᵀ (k = 128) f16 TN-ként a coopmat kernelen mennek; az attn·V (NN, m = 128, n = k = 4128) a tiled kernelen; a
+    szövegkódoló f32-ben, n = 31-gyel a generic kernelen (kicsi). Lépésenként ~52 TFLOP: 3,9 s/lépés ≈ 13 TFLOPS
+    effektív, a ROCm 1,1 s/lépése ≈ 47 TFLOPS. A fő szűk keresztmetszet a GEMM-kernel hatékonysága (~19 TFLOPS).
+  - A „Model Initializing” (a súlyok VRAM-ba töltése, minden futásnál, mert a szövegkódoló és a modell együtt nem fér
+    el): 9 s a ROCm 2,5 s-ával szemben.
+- [ ] Nyitva (pp): a MoE-modellnél a GEMM csak 27%: 44 ezer kernelindítás promptonként (sok kis `quantize_q8_1`,
+  `mul_mat_q` darab), a lefordított int8 MMQ-kernelek lassúak – ez a PTX-fordítón múlik. A dense modelleknél a
+  `dequantize_block_q4_K` (11%) a sávszélesség felén fut. A profil „GPU idle” sora több eszköznél hibás (az eszközök
+  timestampjei egy listába kerülnek).
+- [ ] Nyitva: a parancsok közti teljes memóriabarrier (9060 XT-n kísérletben 1,1 → 0,5 µs/indítás nélküle, a 890M-en
+  ~7 → ~1–2 µs) csak függőség-követéssel lazítható; NN/NT f16 GEMM-hez nincs coopmat kernel (9060 XT: 8 vs 15,6 TFLOPS).
+
 ## 3. Ismert korlátok / kockázatok
 
 - **Statikusan linkelt libcudart** (az nvcc alapértelmezése) nem fut: az NVIDIA runtime a driver nem dokumentált belső tábláit igényli. Megoldás: `-cudart shared` újrafordítás (a táblák pótlása nem clean-room: plan_non_clean.md).
@@ -1135,8 +1300,8 @@ fix költsége (~100 µs nagyságrend, mérendő) miatt a kis GEMM-ek sosem éri
   biteket (a PTX-fordító a báziscímen, egyetlen 32 bites OR-ral a device felső bitjeivel – RADV-n 0xFFFF8000,
   llvmpipe-on 0, az 5-ös specializációs konstans; a GLSL shaderek `canon()`-nal), így a
   host-memória h címe is érvényes device-cím (lásd 5.2). Mérhető ára nincs.
-- **UVA**: több Vulkan device címtere ütközhet; a pointer-keresés a current context device-án belül történik
-  (eszközök között `cudaMemcpyPeer` működik, a `cudaMemcpyDefault` két eszköz pointerével nem).
+- **UVA**: a Vulkan device-ok címterei ütköznének; az n-edik eszköz címei ezért a 48–55. biten n-et hordoznak (8.2).
+  Peer access nincs (egy kernel csak a saját eszköze memóriáját éri el); eszközök között a másolás staged (8.3).
 - **Regisztrált host-memória** (`cuMemHostRegister`): ha nem adoptálható (6.7), importálva, és amíg él, minden GPU-submit
   lassabb (a kernel minden submitnál újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát
   ez nem érinti.
@@ -1147,7 +1312,13 @@ fix költsége (~100 µs nagyságrend, mérendő) miatt a kis GEMM-ek sosem éri
 | Változó | Jelentés |
 |---|---|
 | `VULKANIZER_LOG` | `off`/`error`/`warn` (default)/`info`/`debug`/`trace` – `trace` minden API hívást logol |
-| `VULKANIZER_DEVICE` | Device név részlet (case-insensitive), pl. `radv`, `llvmpipe` |
+| `VULKANIZER_DEVICE` | Device név részlet (case-insensitive), pl. `radv`, `llvmpipe`; vesszővel több is (bármelyik illik) |
+| `CUDA_VISIBLE_DEVICES` | A látható eszközök és sorrendjük: sorszámok vagy `GPU-<uuid-előtag>`, vesszővel (8.1) |
+| `CUDA_DEVICE_ORDER` | `PCI_BUS_ID`: PCI-cím szerinti sorrend (alap: diszkrét > integrált > … > CPU) |
+| `VULKANIZER_PEER_STAGING_MB` | Eszközközi másolás stagingje eszközpáronként és irányonként (alap 64 MiB, 4 darabban; 8.3) |
+| `VULKANIZER_PEER_DMABUF` | `0` = eszközök között a régi, hoston átmenő másolás (dma-buf staging nélkül) |
+| `VULKANIZER_DUPLICATE_DEVICES` | Teszthez: minden eszköz n-szer, külön logikai eszközként (8.1) |
+| `VULKANIZER_ADDRESS_TAG_BASE` | Teszthez: az eszközjelölők n-től indulnak, így egy eszköz címei is jelöltek (8.2) |
 | `VULKANIZER_ALLOW_CPU` | `1` = CPU Vulkan device-ok (llvmpipe) is látszanak (több GPU kipróbálásához is) |
 | `VULKANIZER_SM_COUNT` | Jelentett multiprocessor-szám (alap: AMD-n a valós CU-szám, máshol 8; CPU-n a szálak száma) |
 | `VULKANIZER_VALIDATION` | `1` = Vulkan validation layer bekapcsolása |
@@ -1170,6 +1341,8 @@ fix költsége (~100 µs nagyságrend, mérendő) miatt a kis GEMM-ek sosem éri
 | `VULKANIZER_EIG_JACOBI` | `1` = az `eigh` egy mátrixra is Jacobi-iterációval (nem tridiagonalizálással, 6.8) |
 | `VULKANIZER_HOST_ADOPT` | `0` = a regisztrált host-memória mindig importálva (nem adoptálva, 6.7) |
 | `VULKANIZER_COOPMAT` | Cooperative matrix a cuBLAS f16 GEMM-hez: alapból csak GPU-n, `0` = ki, `1` = CPU-s eszközön is (6.6) |
+| `VULKANIZER_SOFT_F16_CVT` | `1` = az f32 → f16 kerekítés egész-kóddal (nem a GPU konverziójával, RTE float controls nélküli eszközök útja) |
+| `VULKANIZER_GEMM_COOP` | `0`/`1`: a cuBLAS f16 TN GEMM coopmat vagy tiled kernelen fut; alapból eszközönként egyszer mérve dől el |
 | `VULKANIZER_TORCH_SDPA` | `mem_efficient,flash`: a `run_torch.sh` ezeket a fused attention backendeket nem tiltja, és `VULKANIZER_CC=80`-at állít (6.3) |
 | `VULKANIZER_NPU` | NPU offload (7.): `off` (alap; 7.2: a másolós út nem nyer), `auto` (a policy dönt), `force` (minden, amit a backend tud) |
 | `VULKANIZER_NPU_BACKEND` | `auto` (alap: a felderített NPU szerint), `xdna` (AMD, XRT), `cpu` (host referencia, teszthez; NPU nem kell) |

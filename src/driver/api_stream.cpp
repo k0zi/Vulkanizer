@@ -39,7 +39,7 @@ CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
     if (CUresult r = enterContext(s)) return r;
     if (!validStream(hStream)) return CUDA_ERROR_INVALID_HANDLE;
     if (CUresult r = refuseIfCapturing(hStream)) return r;
-    if (VkResult vr = s.dev->finish()) return toCuResult(vr);
+    if (VkResult vr = finishUnlocked(s, *s.dev)) return toCuResult(vr);
     return checkDeviceAssert(*s.slot, true);
 }
 
@@ -61,13 +61,17 @@ CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent, unsigned in
     // An event recorded during a capture forks or joins it: the waiting stream captures too.
     if (hEvent->captureGraph) return joinCapture(hStream, hEvent);
     // One queue per device: on the event's own device everything recorded later already runs after
-    // it. Another device's event (multi-GPU) is waited for on the host.
+    // it. Another device's event (multi-GPU): the waiting device's later work waits for it (a host
+    // step on that device, peer.cpp), the caller does not.
     ApiScope s;
     if (CUresult r = enterContext(s)) return r;
     const bool realStream = hStream && hStream != CU_STREAM_LEGACY && hStream != CU_STREAM_PER_THREAD;
     const CUdevice waiting = realStream ? hStream->ctx->device : s.ctx->device;
-    if (hEvent->recorded && hEvent->ctx->device != waiting)
-        return toCuResult(Driver::get().slot(hEvent->ctx->device)->vk->wait(hEvent->serial));
+    if (hEvent->recorded && hEvent->ctx->device != waiting) {
+        DeviceSlot* w = Driver::get().slot(waiting);
+        if (CUresult r = Driver::get().ensureDevice(*w)) return r;
+        return waitForOtherDevice(*w->vk, *Driver::get().slot(hEvent->ctx->device)->vk, hEvent->serial);
+    }
     return CUDA_SUCCESS;
 }
 
