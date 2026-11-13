@@ -263,7 +263,9 @@ VkResult Device::init() {
     // of subgroup scope. VULKANIZER_COOPMAT: unset = on GPUs (CPU implementations emulate them, slower
     // than plain code: llvmpipe 22 vs 36 GFLOP/s), 0 = off, 1 = on everywhere.
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopMatrix{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16Enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
     uint32_t coopMatrixSize = 0;
+    bool coopMatrixBf16 = false;
     const char* coopEnv = std::getenv("VULKANIZER_COOPMAT");
     const bool coopWanted = coopEnv && *coopEnv ? std::strcmp(coopEnv, "0") != 0
                                                 : info_.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU;
@@ -293,6 +295,36 @@ VkResult Device::init() {
                     m.BType == VK_COMPONENT_TYPE_FLOAT16_KHR && m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
                     m.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && !m.saturatingAccumulation)
                     coopMatrixSize = std::max(coopMatrixSize, m.MSize);
+        }
+        // bf16 x bf16 -> f32 ones of the same size (VK_KHR_shader_bfloat16): cuBLAS's bf16 GEMM
+        if (coopMatrixSize == 16) {
+            bool hasBf16 = false;
+            for (const VkExtensionProperties& p : props) hasBf16 |= !std::strcmp(p.extensionName, VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+            VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
+            if (hasBf16) {
+                VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                f2.pNext = &bf16;
+                vkGetPhysicalDeviceFeatures2(info_.handle, &f2);
+            }
+            bool shape = false;
+            uint32_t n = 0;
+            getProps(info_.handle, &n, nullptr);
+            std::vector<VkCooperativeMatrixPropertiesKHR> shapes(n, {VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR});
+            getProps(info_.handle, &n, shapes.data());
+            for (const VkCooperativeMatrixPropertiesKHR& m : shapes)
+                shape |= m.scope == VK_SCOPE_SUBGROUP_KHR && m.MSize == 16 && m.NSize == 16 && m.KSize == 16 &&
+                         m.AType == VK_COMPONENT_TYPE_BFLOAT16_KHR && m.BType == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+                         m.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && m.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                         !m.saturatingAccumulation;
+            if (hasBf16 && shape && bf16.shaderBFloat16Type && bf16.shaderBFloat16CooperativeMatrix &&
+                !std::getenv("VULKANIZER_NO_BF16_COOPMAT")) {
+                extensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+                bf16Enable.shaderBFloat16Type = VK_TRUE;
+                bf16Enable.shaderBFloat16CooperativeMatrix = VK_TRUE;
+                bf16Enable.pNext = en.pNext;
+                en.pNext = &bf16Enable;
+                coopMatrixBf16 = true;
+            }
         }
         if (coopMatrixSize) {
             extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
@@ -345,6 +377,7 @@ VkResult Device::init() {
     features_.sharedInt64Atomics = e12.shaderSharedInt64Atomics;
     features_.vulkanMemoryModel = e12.vulkanMemoryModel;
     features_.coopMatrixSize = coopMatrixSize;
+    features_.coopMatrixBf16 = coopMatrixBf16;
     features_.subgroupSizeControl = e13.subgroupSizeControl;
     features_.computeFullSubgroups = e13.computeFullSubgroups;
     features_.timelineSemaphore = e12.timelineSemaphore;
@@ -355,15 +388,19 @@ VkResult Device::init() {
     features_.integerDotProduct = e13.shaderIntegerDotProduct && info_.dot4x8Accelerated;
 
     float priority = 1.0f;
-    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    qci.queueFamilyIndex = info_.computeQueueFamily;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &priority;
+    // A queue of the copy family too, where it differs (and timeline semaphores order the two).
+    const bool copyQueue = info_.copyQueueFamily != info_.computeQueueFamily && e12.timelineSemaphore;
+    VkDeviceQueueCreateInfo qci[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    qci[0].queueFamilyIndex = info_.computeQueueFamily;
+    qci[0].queueCount = 1;
+    qci[0].pQueuePriorities = &priority;
+    qci[1] = qci[0];
+    qci[1].queueFamilyIndex = info_.copyQueueFamily;
 
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &en;
-    dci.queueCreateInfoCount = 1;
-    dci.pQueueCreateInfos = &qci;
+    dci.queueCreateInfoCount = copyQueue ? 2 : 1;
+    dci.pQueueCreateInfos = qci;
     dci.enabledExtensionCount = uint32_t(extensions.size());
     dci.ppEnabledExtensionNames = extensions.data();
     VkResult r = vkCreateDevice(info_.handle, &dci, nullptr, &device_);
@@ -372,6 +409,11 @@ VkResult Device::init() {
         return r;
     }
     vkGetDeviceQueue(device_, info_.computeQueueFamily, 0, &queue_);
+    if (copyQueue) {
+        vkGetDeviceQueue(device_, info_.copyQueueFamily, 0, &copyQueue_);
+        sharingFamilies_[0] = info_.computeQueueFamily;
+        sharingFamilies_[1] = info_.copyQueueFamily;
+    }
     if (externalFd || dmaBuf)
         getMemoryFd_ = reinterpret_cast<PFN_vkGetMemoryFdKHR>(vkGetDeviceProcAddr(device_, "vkGetMemoryFdKHR"));
     if (externalFd) features_.memoryExport = getMemoryFd_ != nullptr;  // before the first allocation
@@ -405,6 +447,22 @@ VkResult Device::init() {
         sci.pNext = &ti;
         if ((r = vkCreateSemaphore(device_, &sci, nullptr, &progress_)) != VK_SUCCESS) return r;
         if ((r = vkCreateSemaphore(device_, &sci, nullptr, &hostSteps_)) != VK_SUCCESS) return r;
+    }
+    if (copyQueue_) {
+        VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+        sci.pNext = &ti;
+        if ((r = vkCreateSemaphore(device_, &sci, nullptr, &copyDone_)) != VK_SUCCESS) return r;
+        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpi.queueFamilyIndex = info_.copyQueueFamily;
+        if ((r = vkCreateCommandPool(device_, &cpi, nullptr, &copyPool_)) != VK_SUCCESS) return r;
+        VkCommandBufferAllocateInfo ccai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ccai.commandPool = copyPool_;
+        ccai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ccai.commandBufferCount = kCopySlots;
+        if ((r = vkAllocateCommandBuffers(device_, &ccai, copyCmd_)) != VK_SUCCESS) return r;
     }
 
     // GPU timestamps for CUDA events, if the queue supports them.
@@ -456,6 +514,9 @@ VkResult Device::init() {
         addressHigh_ = uint32_t(vkGetBufferDeviceAddress(device_, &bai) >> 32) & 0xFFFF8000u;
         destroyBuffer(probe);
     }
+    // Where kernels read instead of an address their guard rules out (loads the compiler executes
+    // unconditionally to keep them in straight-line code): specialization constants 6 and 7.
+    if (VkResult r = createBuffer(kSpeculationBytes, kDeviceBufferUsage, {0}, speculation_)) return r;
     // Multi-GPU: this device's tag in the addresses it hands out (common/device_address.h).
     // VULKANIZER_ADDRESS_TAG_BASE=n (tests): tags from n, so a single device's addresses carry one too.
     uint32_t tag = info_.ordinal;
@@ -509,9 +570,12 @@ Device::~Device() {
     vkDeviceWaitIdle(device_);
     if (progress_) vkDestroySemaphore(device_, progress_, nullptr);
     if (hostSteps_) vkDestroySemaphore(device_, hostSteps_, nullptr);
+    if (copyDone_) vkDestroySemaphore(device_, copyDone_, nullptr);
+    if (copyPool_) vkDestroyCommandPool(device_, copyPool_, nullptr);
     for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
     destroyBuffer(readStaging_);
     destroyBuffer(writeStaging_);
+    destroyBuffer(speculation_);
     for (auto& b : blocks_) destroyBuffer(b->buf);
     for (Batch& b : batches_) {
         if (b.fence) vkDestroyFence(device_, b.fence, nullptr);
@@ -552,7 +616,7 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
     bci.usage = usage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
     external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     if (exportable) bci.pNext = &external;
@@ -718,7 +782,7 @@ VkResult Device::allocateSystem(VkDeviceSize size, VkBufferUsageFlags usage, boo
     bci.pNext = dmaBuf ? &external : nullptr;
     bci.size = size;
     bci.usage = usage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer)) return r;
     out.size = size;
     VkMemoryRequirements req;
@@ -782,7 +846,7 @@ VkResult Device::importShared(int fd, VkDeviceSize size, Buffer& out) {
     bci.pNext = &external;
     bci.size = size;
     bci.usage = kSharedUsage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     if (r == VK_SUCCESS) r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer);
     if (r != VK_SUCCESS) {
         close(fd);
@@ -824,7 +888,7 @@ VkResult Device::importMemory(int fd, VkDeviceSize bufferSize, VkDeviceSize memo
     bci.pNext = &external;
     bci.size = bufferSize;
     bci.usage = kDeviceBufferUsage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     VkBuffer buffer = VK_NULL_HANDLE;
     if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &buffer)) return r;
     VkMemoryRequirements req;
@@ -977,7 +1041,7 @@ void Device::probeSparse() {
     bci.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT;
     bci.size = 1 << 20;
     bci.usage = kDeviceBufferUsage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     VkBuffer buffer = VK_NULL_HANDLE;
     if (vkCreateBuffer(device_, &bci, nullptr, &buffer) != VK_SUCCESS) {
         features_.sparseBuffers = false;
@@ -1003,7 +1067,7 @@ VkResult Device::createSparseBuffer(VkDeviceSize size, uint64_t opaqueAddress, B
     if (features_.addressCaptureReplay) bci.flags |= VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
     bci.size = size;
     bci.usage = kDeviceBufferUsage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     out = Buffer{};
     if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer)) return r;
     out.size = size;
@@ -1028,7 +1092,7 @@ VkResult Device::createAtHostAddress(uint64_t h, VkDeviceSize size, bool importe
                 VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
     bci.size = size;
     bci.usage = kDeviceBufferUsage;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    setSharing(bci);
     if (VkResult r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer)) return r;
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     bai.buffer = out.buffer;
@@ -1197,7 +1261,7 @@ VkResult Device::placeHostMemory(uint64_t h, VkDeviceSize size, bool sparse, Buf
         bci.flags = VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
         bci.size = size;
         bci.usage = kDeviceBufferUsage;
-        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        setSharing(bci);
         r = vkCreateBuffer(device_, &bci, nullptr, &out.buffer);
         out.size = size;
     }
@@ -1377,8 +1441,12 @@ VkResult Device::flushLocked() {
     si.pCommandBuffers = &b.cmd;
     // With timeline semaphores every batch signals its serial (host steps wait for it), and a host
     // step's batch waits for the step.
+    // A batch after copy queue work waits for that too.
     VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkPipelineStageFlags waitStages[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    VkSemaphore waitSemaphores[2];
+    uint64_t waitValues[2];
+    uint32_t waits = 0;
     if (progress_) {
         si.pNext = &ts;
         ts.signalSemaphoreValueCount = 1;
@@ -1386,15 +1454,22 @@ VkResult Device::flushLocked() {
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &progress_;
         if (hostWait_) {
-            ts.waitSemaphoreValueCount = 1;
-            ts.pWaitSemaphoreValues = &hostWait_;
-            si.waitSemaphoreCount = 1;
-            si.pWaitSemaphores = &hostSteps_;
-            si.pWaitDstStageMask = &waitStage;
+            waitSemaphores[waits] = hostSteps_;
+            waitValues[waits++] = hostWait_;
         }
+        if (copyWait_) {
+            waitSemaphores[waits] = copyDone_;
+            waitValues[waits++] = copyWait_;
+        }
+        ts.waitSemaphoreValueCount = waits;
+        ts.pWaitSemaphoreValues = waitValues;
+        si.waitSemaphoreCount = waits;
+        si.pWaitSemaphores = waitSemaphores;
+        si.pWaitDstStageMask = waitStages;
     }
     const VkResult r = vkQueueSubmit(queue_, 1, &si, b.fence);
     hostWait_ = 0;
+    copyWait_ = 0;
     if (r != VK_SUCCESS) return r;
     b.pending = true;
     return VK_SUCCESS;
@@ -1713,6 +1788,67 @@ VkResult Device::submit(const std::function<void(VkCommandBuffer)>& record) {
     return vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
 }
 
+void Device::setSharing(VkBufferCreateInfo& bci) const {
+    if (copyQueue_) {
+        bci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+        bci.queueFamilyIndexCount = 2;
+        bci.pQueueFamilyIndices = sharingFamilies_;
+    } else {
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    }
+}
+
+VkResult Device::waitCopy(uint64_t value) {
+    if (!value) return VK_SUCCESS;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &copyDone_;
+    wi.pValues = &value;
+    return vkWaitSemaphores(device_, &wi, UINT64_MAX);
+}
+
+VkResult Device::joinCopies() {
+    copyWait_ = copyValue_;
+    if (VkResult r = beginBatch()) return r;
+    return flushLocked();
+}
+
+VkResult Device::submitCopy(uint64_t after, const std::function<void(VkCommandBuffer)>& commands, uint64_t& value) {
+    const uint32_t slot = nextCopySlot_;
+    nextCopySlot_ = (nextCopySlot_ + 1) % kCopySlots;
+    if (VkResult r = waitCopy(copyCmdValue_[slot])) return r;
+    VkCommandBuffer cb = copyCmd_[slot];
+    if (VkResult r = vkResetCommandBuffer(cb, 0)) return r;
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (VkResult r = vkBeginCommandBuffer(cb, &bi)) return r;
+    commands(cb);
+    hostBarrier(cb);
+    if (VkResult r = vkEndCommandBuffer(cb)) return r;
+    value = copyValue_ + 1;
+    VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    ts.signalSemaphoreValueCount = 1;
+    ts.pSignalSemaphoreValues = &value;
+    const VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &ts;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &copyDone_;
+    if (after) {
+        ts.waitSemaphoreValueCount = 1;
+        ts.pWaitSemaphoreValues = &after;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &progress_;
+        si.pWaitDstStageMask = &waitStage;
+    }
+    if (VkResult r = vkQueueSubmit(copyQueue_, 1, &si, VK_NULL_HANDLE)) return r;
+    copyValue_ = value;
+    copyCmdValue_[slot] = value;
+    return VK_SUCCESS;
+}
+
 VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, VkDeviceSize size) {
     if (size == 0) return VK_SUCCESS;
     // A discrete GPU's mapped memory is VRAM behind the bus: large host writes into it are slow (1.0
@@ -1750,6 +1886,23 @@ VkResult Device::write(const Buffer& dst, VkDeviceSize offset, const void* src, 
     if (!writeStaging_.buffer) {
         if (VkResult r = allocateSystem(2 * kReadChunk, kStagingUsage, false, writeStaging_)) return r;
         writeStagingSerial_[0] = writeStagingSerial_[1] = 0;
+    }
+    if (copyQueue_) {
+        // On the copy queue, after the compute work recorded so far; the compute work recorded
+        // next waits for the copies (an empty batch here, so that finish() covers them).
+        if (VkResult r = flushLocked()) return r;
+        const uint64_t after = nextSerial_ - 1;
+        for (VkDeviceSize at = 0, i = 0; at < size; at += kReadChunk, ++i) {
+            const VkDeviceSize n = std::min(kReadChunk, size - at), half = (i % 2) * kReadChunk;
+            if (VkResult r = waitCopy(writeStagingSerial_[i % 2])) return r;  // its last copy out
+            std::memcpy(static_cast<char*>(writeStaging_.mapped) + half, static_cast<const char*>(src) + at, n);
+            if (VkResult r = submitCopy(after, [&](VkCommandBuffer cb) {
+                    VkBufferCopy region{half, dst.offset + offset + at, n};
+                    vkCmdCopyBuffer(cb, writeStaging_.buffer, dst.buffer, 1, &region);
+                }, writeStagingSerial_[i % 2]))
+                return r;
+        }
+        return joinCopies();
     }
     for (VkDeviceSize at = 0, i = 0; at < size; at += kReadChunk, ++i) {
         const VkDeviceSize n = std::min(kReadChunk, size - at), half = (i % 2) * kReadChunk;
@@ -1789,6 +1942,31 @@ VkResult Device::read(const Buffer& src, VkDeviceSize offset, void* dst, VkDevic
     }
     // The GPU copies chunk i into one half of the staging buffer while the host copies chunk i - 1
     // out of the other.
+    if (copyQueue_) {  // everything recorded has executed: nothing to wait for on the copy queue
+        uint64_t prev = 0;
+        VkDeviceSize prevAt = 0, prevSize = 0;
+        for (VkDeviceSize at = 0, i = 0;; at += prevSize, ++i) {
+            const VkDeviceSize n = std::min(kReadChunk, size - at);
+            uint64_t value = 0;
+            if (n) {
+                const VkDeviceSize half = (i % 2) * kReadChunk;
+                if (VkResult r = submitCopy(0, [&](VkCommandBuffer cb) {
+                        VkBufferCopy region{src.offset + offset + at, half, n};
+                        vkCmdCopyBuffer(cb, src.buffer, readStaging_.buffer, 1, &region);
+                    }, value))
+                    return r;
+            }
+            if (prevSize) {
+                if (VkResult r = waitCopy(prev)) return r;
+                std::memcpy(static_cast<char*>(dst) + prevAt,
+                            static_cast<const char*>(readStaging_.mapped) + ((i - 1) % 2) * kReadChunk, prevSize);
+            }
+            if (!n) return VK_SUCCESS;
+            prev = value;
+            prevAt = at;
+            prevSize = n;
+        }
+    }
     uint64_t prevSerial = 0;
     VkDeviceSize prevAt = 0, prevSize = 0;
     for (VkDeviceSize at = 0, i = 0;; at += prevSize, ++i) {
@@ -1817,6 +1995,18 @@ VkResult Device::read(const Buffer& src, VkDeviceSize offset, void* dst, VkDevic
 VkResult Device::copy(const Buffer& src, VkDeviceSize srcOffset, const Buffer& dst, VkDeviceSize dstOffset,
                       VkDeviceSize size) {
     if (size == 0) return VK_SUCCESS;
+    if (copyQueue_ && size >= kCopyQueueMin && src.hostAddressed != dst.hostAddressed) {
+        // Between host and device memory: on the copy queue, in order with the compute work
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        if (VkResult r = flushLocked()) return r;
+        uint64_t value;
+        if (VkResult r = submitCopy(nextSerial_ - 1, [&](VkCommandBuffer cb) {
+                VkBufferCopy region{src.offset + srcOffset, dst.offset + dstOffset, size};
+                vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
+            }, value))
+            return r;
+        return joinCopies();
+    }
     return record([&](VkCommandBuffer cb) {  // device to device: no host synchronization
         VkBufferCopy region{src.offset + srcOffset, dst.offset + dstOffset, size};
         vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
@@ -1850,10 +2040,13 @@ VkResult Device::createComputePipeline(const uint32_t* code, size_t wordCount, c
         return r;
     }
 
-    // 0..4 from the caller, 5: the address bits kernels set (hostAddressBits())
-    const VkSpecializationMapEntry entries[6] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}};
-    const uint32_t values[6] = {spec[0], spec[1], spec[2], spec[3], spec[4], addressHigh_};
-    VkSpecializationInfo specInfo{6, entries, sizeof values, values};
+    // 0..4 from the caller, 5: the address bits kernels set (hostAddressBits()), 6 / 7: the address
+    // of speculation_ (low / high word)
+    const VkSpecializationMapEntry entries[8] = {{0, 0, 4},  {1, 4, 4},  {2, 8, 4},  {3, 12, 4},
+                                                 {4, 16, 4}, {5, 20, 4}, {6, 24, 4}, {7, 28, 4}};
+    const uint32_t values[8] = {spec[0], spec[1], spec[2], spec[3], spec[4], addressHigh_,
+                                uint32_t(speculation_.address), uint32_t(speculation_.address >> 32)};
+    VkSpecializationInfo specInfo{8, entries, sizeof values, values};
 
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -1927,56 +2120,75 @@ VkResult Device::dispatch(const ComputePipeline& p, uint32_t groupsX, uint32_t g
         return launchBlocking_ ? finish() : VK_SUCCESS;
     }
 
-    // Workgroups per chunk: as many as fit in the budget, or a probe on its own for a new pipeline.
-    auto known = nsPerGroup_.find(p.pipeline);
-    const bool probe = known == nsPerGroup_.end();
-    uint64_t chunk = kRateGroups;
-    if (probe) {
+    // A new pipeline: its first kRateGroups workgroups (part of the first row, whole rows or whole
+    // planes) run on their own and are measured; the rest of the grid, as three boxes (the rest of the
+    // probe's rows, of its planes, the other planes), goes in chunks sized by that measurement.
+    if (nsPerGroup_.find(p.pipeline) == nsPerGroup_.end()) {
         if (VkResult r = flushLocked()) return r;
-    } else if (known->second.ns > 0) {
-        chunk = std::max<uint64_t>(1, uint64_t(batchBudgetNs_ / known->second.ns));
-    } else {
-        chunk = UINT64_MAX;
+        uint32_t pc[3] = {groupsX, 1, 1};  // the probe's extent
+        if (groupsX >= kRateGroups) pc[0] = uint32_t(kRateGroups);
+        else if (uint64_t(groupsX) * groupsY >= kRateGroups) pc[1] = uint32_t(kRateGroups / groupsX);
+        else pc[1] = groupsY, pc[2] = std::min(groupsZ, uint32_t(kRateGroups / (uint64_t(groupsX) * groupsY)));
+        if (params) {
+            if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
+        }
+        ++nsPerGroup_[p.pipeline].launches;
+        const uint32_t zero[3] = {0, 0, 0};
+        if (VkResult r = recordDispatch(p, zero, pc, push.data(), pushSize, label, 0, true)) return r;
+        if (VkResult r = finish()) return r;  // measures it
+        const uint32_t rowsBase[3] = {pc[0], 0, 0}, rowsCount[3] = {groupsX - pc[0], pc[1], pc[2]};
+        const uint32_t planesBase[3] = {0, pc[1], 0}, planesCount[3] = {groupsX, groupsY - pc[1], pc[2]};
+        const uint32_t restBase[3] = {0, 0, pc[2]}, restCount[3] = {groupsX, groupsY, groupsZ - pc[2]};
+        for (const auto& [b, c] : {std::pair{rowsBase, rowsCount}, std::pair{planesBase, planesCount},
+                                   std::pair{restBase, restCount}})
+            if (c[0] && c[1] && c[2]) {
+                if (VkResult r = dispatchChunks(p, b, c, push, pushSize, label, params, paramsSize, uploaded)) return r;
+            }
+        return launchBlocking_ ? finish() : VK_SUCCESS;
     }
-    // Chunks are boxes of whole planes, whole rows or part of a row, in blockIdx order.
-    const uint64_t row = groupsX, plane = row * groupsY;
-    uint32_t step[3] = {groupsX, groupsY, groupsZ};
+    const uint32_t origin[3] = {0, 0, 0};
+    if (VkResult r = dispatchChunks(p, origin, grid, push, pushSize, label, params, paramsSize, uploaded)) return r;
+    return launchBlocking_ ? finish() : VK_SUCCESS;
+}
+
+// The box [origin, origin + extent) of the grid in chunks of as many workgroups as fit in the batch
+// budget (by the pipeline's measured time per workgroup): boxes of whole planes, whole rows or part
+// of a row, in blockIdx order.
+VkResult Device::dispatchChunks(const ComputePipeline& p, const uint32_t origin[3], const uint32_t extent[3],
+                                std::vector<uint8_t>& push, uint32_t pushSize, const char* label, const void* params,
+                                size_t paramsSize, uint64_t& uploaded) {
+    const double rateNs = nsPerGroup_[p.pipeline].ns;
+    const uint64_t chunk = rateNs > 0 ? std::max<uint64_t>(1, uint64_t(batchBudgetNs_ / rateNs)) : UINT64_MAX;
+    const uint64_t row = extent[0], plane = row * extent[1];
+    uint32_t step[3] = {extent[0], extent[1], extent[2]};
     if (chunk < plane) {
         step[2] = 1;
         if (chunk < row) step[1] = 1, step[0] = uint32_t(chunk);
         else step[1] = uint32_t(chunk / row);
     } else {
-        step[2] = uint32_t(std::min<uint64_t>(groupsZ, chunk / plane));
+        step[2] = uint32_t(std::min<uint64_t>(extent[2], chunk / plane));
     }
-    bool first = true;
-    for (uint32_t z = 0; z < groupsZ; z += step[2])
-        for (uint32_t y = 0; y < groupsY; y += step[1])
-            for (uint32_t x = 0; x < groupsX; x += step[0]) {
-                const uint32_t base[3] = {x, y, z};
-                const uint32_t count[3] = {std::min(step[0], groupsX - x), std::min(step[1], groupsY - y),
-                                           std::min(step[2], groupsZ - z)};
-                double estimate = 0;
-                if (!probe || !first) {
-                    const uint64_t groups = uint64_t(count[0]) * count[1] * count[2];
-                    estimate = nsPerGroup_[p.pipeline].ns * double(std::max(groups, kRateGroups));
-                    if (open_ >= 0 && commands_ && batches_[open_].estimateNs + estimate > batchBudgetNs_) {
-                        if (VkResult r = flushLocked()) return r;
-                    }
+    for (uint32_t z = 0; z < extent[2]; z += step[2])
+        for (uint32_t y = 0; y < extent[1]; y += step[1])
+            for (uint32_t x = 0; x < extent[0]; x += step[0]) {
+                const uint32_t base[3] = {origin[0] + x, origin[1] + y, origin[2] + z};
+                const uint32_t count[3] = {std::min(step[0], extent[0] - x), std::min(step[1], extent[1] - y),
+                                           std::min(step[2], extent[2] - z)};
+                const uint64_t groups = uint64_t(count[0]) * count[1] * count[2];
+                const double estimate = nsPerGroup_[p.pipeline].ns * double(std::max(groups, kRateGroups));
+                if (open_ >= 0 && commands_ && batches_[open_].estimateNs + estimate > batchBudgetNs_) {
+                    if (VkResult r = flushLocked()) return r;
                 }
                 if (params) {  // each batch keeps its own copy (its arena is reused once it has run)
                     if (VkResult r = uploadParams(params, paramsSize, push, uploaded)) return r;
                 }
-                // A probe, the first launches and every launch of a varying pipeline are timed (Rate).
+                // The first launches and every launch of a varying pipeline are timed (Rate).
                 Rate& rate = nsPerGroup_[p.pipeline];
-                const bool timed = profiling_ || probe || !rate.sampled();
+                const bool timed = profiling_ || !rate.sampled();
                 ++rate.launches;
                 if (VkResult r = recordDispatch(p, base, count, push.data(), pushSize, label, estimate, timed)) return r;
-                if (probe && first) {
-                    if (VkResult r = finish()) return r;  // measures it
-                }
-                first = false;
             }
-    return launchBlocking_ ? finish() : VK_SUCCESS;
+    return VK_SUCCESS;
 }
 
 VkResult Device::uploadParams(const void* params, size_t size, std::vector<uint8_t>& push, uint64_t& uploadedSerial) {

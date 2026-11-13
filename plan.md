@@ -743,23 +743,61 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
     Kernel cache formátum: VKZ3 (+`assertOffset`).
   - Tesztek: `tests/device_assert.cpp` (`data/assert.ptx`, két kör a reset előtt/után), `tests/cuda/rt_assert.cu`
     (CUDA 12 és 13); RADV és llvmpipe.
-- [ ] **6.3** Fused attention: a mem-efficient (majd a flash) SDPA backend a hiányzó PTX-ek (`cp.async`, további
-  `mma`/`ldmatrix` változatok) pótlásával; kapcsoló: `VULKANIZER_TORCH_SDPA`.
-  Kész, ha: `zimage_forward.py` a fused backenddel is tűrésen belül, és a ComfyUI csúcsmemóriája kisebb.
-  - Felderítés (2026-10-23): a conda-forge build fatbinjeiben (`vulkanizer-check --dump-ptx`) a mem-efficient
-    (`fmha_cutlassF/B_*`) és a flash (`pytorch_flash::flash_fwd_*`) kernelek PTX-e megvan (`compute_120`), de az
-    `_sm50/_sm70/_sm75` változatok csak egy „FATAL: kernel is for sm80+” printf; tartalma csak az `_sm80`-asnak van.
-    A PyTorch a jelentett CC szerint választ, ezért kell a CC ≥ 8.0.
-  - Fordító: `cp.async` (ca/cg, 4/8/16 bájt, src-size zero-fill, ignore-src predikátum; szinkron ld + st.shared,
-    a `commit_group`/`wait_group`/`wait_all` no-op), a `.L2::128B` alakú modifier (számmal kezdődő `::` rész),
-    `cvt.rn{.relu}.{f16x2,bf16x2}.f32`, `mma.m16n8k8.row.col.f32.tf32.tf32.f32` (a tf32 alsó 13 bitje eldobva,
-    mint a tensor core-on). Teszt: `tests/warp_matrix.cpp` (RADV, llvmpipe). Az összes (125) attention-modul
-    első sm80/flash entryje lefordul (`vulkanizer-ptxc`).
-  - Kapcsoló: `VULKANIZER_TORCH_SDPA=mem_efficient,flash` (`tools/torch/sitecustomize.py` ezeket nem tiltja;
-    `run_torch.sh` és `vulkanizer-run --torch` ilyenkor `VULKANIZER_CC=80`-at állít, ha nincs megadva).
-  - Hátra (a végső torch-körben): helyesség (`zimage_forward.py`), sebesség és csúcsmemória a math úthoz képest,
-    ez alapján az alapértelmezés. Kockázat: a flash kernelek SPIR-V-je óriási (2,2 M szó: az emulált `mma` miatt),
-    a pipeline-fordítás ideje a driverben ismeretlen.
+- [x] **6.3** Fused attention (2026-11-12): a PyTorch mem-efficient attention forward kernelei (`fmha_cutlassF_*`)
+  Vulkanizer saját shadereiként futnak (`src/driver/attention.{h,cpp}`, `src/driver/shaders/attention_*.comp`).
+  - Miért nem a PTX-ük: a conda-forge build fatbinjében az `_sm50/_sm70/_sm75` változatok PTX-e csak egy „kernel
+    is for sm80+” printf, az `_sm80`-asok tensor core-utasításai pedig emulálva lassúak (a SPIR-V óriási). A
+    flash-kernelek ugyanígy.
+  - Felismerés név alapján (`PyTorchMemEffAttention15AttentionKernel`, `fmha_cutlassF_{f16,bf16,f32}_..._<Q>x<K>_`):
+    a függvény nem fordul le, az indítás az `AttentionKernel::Params`-ból (272 bájt, PyTorch 2.9–2.14; a 2.14 a
+    200-as offseten `q_heads_per_kv`-t hozott a 2.13 `use_dropout`-ja helyére, a dropout nélküli 0/≥1 bájt
+    különbözteti meg őket) saját argumentum-struktúrát tölt, és a saját shadert indítja (CC-től függetlenül).
+    Dropouttal `CUDA_ERROR_NOT_SUPPORTED`.
+  - `attention_coopmat.comp` (f16, bf16 ahol van bf16 coopmat; head_dim ≤ 128): flash attention 16×16×16
+    coopmatokon, 256 szálas workgroup, subgroupanként 16 lekérdezés, 32-es kulcsblokkok, a következő K/V-blokk
+    regiszterekbe előtöltve. A pontszámok (K Qᵀ, a K sor-folytonos A-mátrix: 64 bites LDS-olvasás) a subgroup
+    saját shared soraiba kerülnek; ott a lane-ek (soronként 4 / 2) alkalmazzák a skálát, a biast és a maszkokat,
+    online softmax, a valószínűségek f16/bf16-ként vissza a P·V-hez. Az O akkumulátorok regiszterben maradnak, a
+    sorok átskálázása elemenként: az elemek sorát egy sorszám-mátrix betöltése adja meg (a layout az implementációé).
+  - `attention_scalar.comp` (f32, f16, bf16; bármely fejméret; coopmat nélküli eszközök): f32 skalár flash, a
+    value-oszlopok 64-es szeletekben (y = fej × szelet).
+  - Teljes szemantika: bias (+ skála előtte), causal maszk (bal felső / jobb alsó), csúszóablak, GQA,
+    változó szekvenciahossz (`seqstart_q/k`, `seqlen_k`), logsumexp (32-re kerekítve +inf-fel, mint a kernel), a
+    teljesen maszkolt sor kimenete 0.
+  - Spekulatív betöltések: a feltétel mögötti betöltéseket a shaderfordítók (llvmpipe LLVM, RADV) feltétel nélkülivé
+    teszik; minden betöltés érvényes címről olvas (az utolsó érvényes sor/oszlop), csak az érték választódik.
+  - A 890M-en (RADV, wave64) az 512 szálas workgroup hibás eredményt ad: a workgroup mindig 256 szál.
+  - PyTorch-oldal (`tools/torch/sitecustomize.py`): a mem-efficient backend alapból bekapcsolva; egy
+    `scaled_dot_product_attention`-wrapper a math útra küldi, ami a fused útnak nem való (gradiens: a backward
+    kernelek stubok; fejméret > 128; f32; coopmat nélküli eszköz – ott a GEMM-es math út gyorsabb, mint a skalár
+    kernel). A bf16-ot 7.5-ös CC-n a PyTorch maga sem küldi ide. `VULKANIZER_FUSED_ATTENTION=0`: nincs csere (és a
+    mem-efficient backend ki); `=scalar`: mindig a skalár kernel. `VULKANIZER_TORCH_SDPA` felülírja a backendeket
+    (`math`, vagy `mem_efficient,flash` – flash-sel a `run_torch.sh` CC 8.0-t jelent).
+  - Mérés (9060 XT, 1 × 30 fej × 4128 × 4128, d = 128, f16): math út 95,7 ms, fused 17,8–19,5 ms (~13,5 TFLOPS);
+    a ROCm-os PyTorch ebben a buildben a gfx1200-ra nem ad fused kernelt (math: 85 ms). 890M: 70 ms.
+  - Kipróbálva, nem nyert (a mérések szerint a számítási rész nem fedi át a betöltést): BN = 64 (az LDS miatt fele
+    annyi workgroup: 8,7 TFLOPS), regiszteres softmax a sor-hozzárendelés felderítésével (192 VGPR, ugyanannyi),
+    BM = 128 (a K/V-forgalom 9,5 → 6,2 ms, a kernel nem gyorsult).
+  - Eredmény: ComfyUI Z-Image 1024², 8 lépés, `--bf16-vae`, meleg futás 34,8 → 26,2–26,7 s/kép (hideg 44 → 33 s); a
+    kép az előzőtől átlagosan 0,3–0,8/255-re, a ROCm-tól változatlanul ~5/255-re. `zimage_forward.py`: GPU fp16 vs
+    CPU fp16 rel. L2 2,9e-3, a GPU az fp32-től annyira tér el, mint az fp16 maga (OK; új kapcsoló:
+    `--extra-model-paths`, a ComfyUI `extra_model_paths.yaml`-ja).
+  - Teszt: `tests/attention.cpp` (PyTorch-nevű csonk kernel, 2.14-es `Params`, CPU-referencia: f16 d64/d128/d80
+    páratlan stride-okkal, causal + LSE, változó hossz, bf16 bias + GQA, f32 ablak, f32 d200 bias; RADV és
+    llvmpipe).
+- [x] **6.3b** PyTorch `im2col_kernel` saját shaderként (2026-11-12, `src/driver/im2col.{h,cpp}`,
+  `shaders/im2col.comp`): a cuDNN nélküli konvolúció (a ComfyUI VAE-je) oszlopai. A lefordított kernel elemenként tölt
+  és tárol (2 bájtos tárolások; a következő betöltés nem kerülhet az előző tárolás elé, mert a fordító nem tudja, hogy
+  a pufferek nem fedik egymást). A saját shaderben egy szál 16 bájtnyi egymás melletti kimeneti elemet készít: (i, j)
+  kernelpozíciónként a betöltései együtt mennek ki, egy 16 bájtos tárolással (ha a sor hossza ennek többszöröse és a
+  cél igazított, különben elemenként). Név alapján (2, 4, 8 bájtos elemek: Half/BFloat16, float, double/complex<float>),
+  a paraméterek egyszerű skalárok. A beépített kernelek közös belépője `src/driver/builtin_kernels.h`;
+  `VULKANIZER_BUILTIN_KERNELS=0` mindet kikapcsolja. Conv 128 csatorna, 1024², bf16: 40,1 → 31,1 ms. Teszt:
+  `tests/im2col.cpp` (csonk kernelek, CPU-referencia, stride/padding/dilation, igazított és nem igazított sorok).
+  - ComfyUI (meleg, `--bf16-vae`): 27,9 s/kép a compute queue-n futó másolásokkal (alapértelmezés a fenti visszavonás
+    óta), 26,0–26,3 s `RADV_PERFTEST=transfer_queue`-val (SDMA másolási queue). A kernel minden ringre jelez
+    queue-resetet (`sdma_reset_mask: queue full`), de a graphics ringé a gyakorlatban nem sikerült; az SDMA-é
+    kipróbálatlan. A felhasználó döntése: az SDMA alapból be van kapcsolva (26,0–26,3 s/kép).
 - [ ] **6.4** cuDNN shim (`libcudnn.so.9`) – csak ha a mérés szerint a konvolúció a ComfyUI idejének jelentős része és
   egy implicit-GEMM shader ≥ 1,5×-et hoz. A PyTorch által cuDNN-re küldött minden op kell (conv, batchnorm, RNN, CTC).
 
@@ -1270,19 +1308,147 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
   compute capability-n nem választ bf16-ot). Teendők: cuDNN-shim vagy natív konvolúció (6.4), bf16 VAE, fused attention.
   - `--bf16-vae` (ComfyUI-kapcsoló): 80 → 47 s/kép, a VAE ~41 → ~9,5 s; a kép a ROCm-osével egyezik (átlagos eltérés
     6/255, a fp16/bf16 különbség). A ROCm-futás 4. képe egyébként fekete lett (a natív stack hibája).
-  - `VULKANIZER_TORCH_SDPA=mem_efficient,flash`: „cutlassF: no kernel found to launch” – a fused attention nem fut.
+  - `VULKANIZER_TORCH_SDPA=mem_efficient,flash`: „cutlassF: no kernel found to launch” – a fused attention nem fut
+    (megoldva: 6.3, a kernelek saját shaderként futnak).
   - A diffúziós modell GEMM-jei (VULKANIZER_LOG=debug): a lineáris rétegek (m = 3840–11520, n = 4128, k = 3840–10240)
     és a QKᵀ (k = 128) f16 TN-ként a coopmat kernelen mennek; az attn·V (NN, m = 128, n = k = 4128) a tiled kernelen; a
     szövegkódoló f32-ben, n = 31-gyel a generic kernelen (kicsi). Lépésenként ~52 TFLOP: 3,9 s/lépés ≈ 13 TFLOPS
     effektív, a ROCm 1,1 s/lépése ≈ 47 TFLOPS. A fő szűk keresztmetszet a GEMM-kernel hatékonysága (~19 TFLOPS).
   - A „Model Initializing” (a súlyok VRAM-ba töltése, minden futásnál, mert a szövegkódoló és a modell együtt nem fér
     el): 9 s a ROCm 2,5 s-ával szemben.
+- [x] **GEMM: ROCm-összevetés és a coopmat kernel második köre** (2026-11-12). Alakonkénti mérés (a ComfyUI
+  Z-Image és a llama GEMM-jei, `VULKANIZER_LOG=debug`-ból) a ROCm-os PyTorch `matmul`-jával szemben (9060 XT):
+  | Alak (m × n × k) | előtte | utána | ROCm |
+  |---|---|---|---|
+  | ffn1/3 TN 10240 × 4128 × 3840 | 27,9 | 34,3 | 51,9 |
+  | ffn2 TN 3840 × 4128 × 10240 | 19,7 | 28,0 | 52,2 |
+  | qkv TN 11520 × 4128 × 3840 | 25,8 | 34,0 | 59,2 |
+  | QKᵀ TN 4128 × 4128 × 128, batch 30 | 8,5 | 19,9 | 26,3 |
+  | attn·V NN 128 × 4128 × 4128, batch 30 | 8,4 (tiled) | 25,9 | 31,0 |
+  | llama TN 4096 × 512 × 4096 | 16,6 | 24,4 | 51,1 |
+  | NT 4096² × 1024 / bf16 TN, f32 C | 6,7 / 6,2 (tiled) | 26,2 / 30,7 | – |
+  Okok és javítások (`gemm_coopmat.comp`):
+  - A szélek nullával töltő betöltési ága miatt az ACO minden k-lépésben `s_wait_loadcnt 0`-t tett a prefetch-betöltések
+    után: a következő lépés betöltése nem fedte át a szorzást. Most a matrixon belüli csempék (egységes ág)
+    előre kiszámolt címekről, feltétel nélkül töltenek.
+  - Csoportos csempesorrend (8 csempesor, oszloponként): az egyszerre futó workgroupok A-sorai és B-oszlopai a
+    cache-ben maradnak (ffn2 20 → 26). A csempeszám m-ből és n-ből jön, mert a Vulkanizer a nagy rácsot
+    darabokban, dispatch base-szel indítja (a `gl_NumWorkGroups` ott a darab mérete: GPU-hiba lett belőle).
+  - Belső csempén a kimenet közvetlenül `coopMatStore`-ral megy C-be (alpha, beta coopmat-műveletként; f16 C a
+    hardveres RTE konverzióval: `RoundingModeRTE 16` execution mode, `VULKANIZER_FEATURE_F16_ROUND_RTE` nélkül az
+    S = 16-os f16 C-s út nem fut). Eddig elemenként, 2 bájtos írásokkal, szoftveres kerekítéssel: a QKᵀ (k = 128)
+    idejét ez vitte.
+  - Minden elrendezés (specialization constant 10: operandusonként k vagy m/n mentén folytonos; a shared tár az
+    operandus saját elrendezésében), és bf16 bemenet (`VK_KHR_shader_bfloat16`, f32 vagy bf16 C; a 890M-en nincs).
+  - Kevés csempénél (≤ 16 / CU, `VULKANIZER_GEMM_DBUF_TILES`) két shared puffer, k-lépésenként egy barrierrel:
+    llama 4096 × 512: 18 → 24,4. Sok csempénél rosszabb (34 → 25: a 44 KB LDS kevesebb workgroupot enged).
+  - Kipróbálva, nem nyert: BK = 64 (204 VGPR, 4 wave/SIMD, 34 → 23), kisebb LDS (a `Cs` nélkül: nem változott, az
+    occupancy nem korlát).
+  - llvmpipe-en az S = 8-as coopmat út (`VULKANIZER_COOPMAT=1` + `VULKANIZER_GEMM_COOP=1`) rossz eredményt ad, a
+    commitolt kernellel is – a coopFaster ott a tiled kernelt választja, így alapból nem fut. Nyitva.
+  Eredmény: llama.cpp pp512 a 9060 XT-n 987 → 1370–1430 (zajos), 890M 306 → 312, MoE 2× 9060 492 → 530.
+  Teszt: `cublas` 7 új coop eset (NN, NT, TT, k % 8, strided, bf16 → f32/bf16, szélekkel, beta ≠ 0).
+- [x] **Graphics queue a másolásokhoz** (kísérlet, opt-in): host → VRAM a 9060 XT-n (USB4) a compute-only queue-n
+  2,6 GB/s, a graphics + compute családon 3,8 GB/s, az SDMA queue-n (`RADV_PERFTEST=transfer_queue`) szintén 3,8
+  (ROCm: 3,87). `VULKANIZER_QUEUE=graphics` a graphics családot választja: HtoD 2,6 → 3,8 GB/s, a GEMM változatlan,
+  llama tg 47,6 → 49,4. Alapértelmezés még nem: egy kijelzőt is hajtó GPU-n a graphics queue-n futó munka a desktopot
+  is akaszthatja. Alternatíva: csak a nagy feltöltések az SDMA-n, timeline-szemaforral (lásd a copy queue-t lent).
+- [x] **ComfyUI mérés újra** (`--bf16-vae`, meleg futás): 47 s → 40,0 s (8 lépés 3,9 → 3,55 s/it); graphics queue-val
+  35,6 s (3,2 s/it, a „Model Initializing” 5,4 → 4,7 s). ROCm: 14,5 s. Profil (futásonként): GPU-idő ~25,6 s, ebből
+  cuBLAS ~14,6 s, im2col 2,5 s (VAE), softmax 1,9 s, elemenkénti kernelek ~3 s (`isneginf` 1,3 s), parancsok közti
+  idő (zömében a súlyfeltöltés másolásai) ~4,1 s. A lépésenkénti GEMM-idő a mérés szerint ~1,7 s; a többit a
+  nem-GEMM kernelek és a súlyok mozgatása viszi.
+- [x] **Copy queue a host ↔ device másolásokhoz** (2026-11-12, alapértelmezés diszkrét GPU-n). A nagy, staged
+  `write`/`read` (> 256 KB) és a host- és device-memória közti `copy` (≥ 1 MB, pl. pinned `cudaMemcpyAsync`) egy
+  külön queue-n megy: transfer-only családon (SDMA), ha a driver ad ilyet, különben a graphics családon. A kernelek a
+  compute queue-n maradnak. Sorrend: a másolás timeline-szemaforral megvárja a compute queue addig rögzített munkáját
+  (`progress_`), és jelzi a sajátját (`copyDone_`). Utána egy üres compute batch erre vár, így a soron következő munka,
+  a `finish()` és a serialok is lefedik. A bufferek `VK_SHARING_MODE_CONCURRENT`-ek a két családdal; a copy queue-nak
+  8 parancspuffere van körben. 9060 XT (USB4): HtoD pageable 2,6 → 3,8, pinned 2,6 → 3,8, DtoH 2,4 → 3,0 GB/s (ROCm:
+  3,87). Kikapcsolás: `VULKANIZER_COPY_QUEUE=0`. Teszt: `memory` (kernelek/memsetek és nagy, staged és pinned másolások
+  sorrendje egy streamen, három körben). Ellenőrizve: a két queue közti várakozás nélkül a teszt elbukik.
+  - Visszavonva a graphics család alapértelmezése (2026-11-12, este): kétszer (19:46, 20:59) egy kernel lapfaultja után
+    a graphics ring is elakadt, a ring resetje nem sikerült, MODE1 reset jött VRAM-vesztéssel, és a gnome-shell is
+    meghalt („context is lost … innocent”). A csak compute-ringet érintő hibáknál (09:40, 19:14) a queue reset sikerült.
+    Most: SDMA (RADV-n a Vulkanizer a példány létrehozása előtt `RADV_PERFTEST`-hez fűzi a `transfer_queue`-t:
+    HtoD 3,8, DtoH 3,3 GB/s), ahol nincs, a compute queue (2,6 GB/s); a graphics család csak
+    `VULKANIZER_COPY_QUEUE=graphics`-ra. Az SDMA-ring resetje kipróbálatlan (a kernel jelzi: `sdma_reset_mask: queue
+    full`).
+- [x] **GEMM: harmadik kör** (2026-11-12, 9060 XT, TFLOPS, előtte → utána):
+  | Alak | előtte | utána | ROCm |
+  |---|---|---|---|
+  | ffn1/3 TN 10240 × 4128 × 3840 | 34,2 | 39,6 | 51,9 |
+  | ffn2 TN 3840 × 4128 × 10240 | 27,1 | 29,4 | 52,2 |
+  | qkv TN 11520 × 4128 × 3840 | 33,8 | 39,0 | 59,2 |
+  | out TN 3840 × 4128 × 3840 | 33,2 | 38,2 | 49,4 |
+  | QKᵀ / attn·V | 19,1 / 27,1 | 22,2 / 27,9 | 26,3 / 31,0 |
+  | bf16 TN, f32 C 4096² × 1024 | 30,3 | 34,7 | – |
+  Összesítve a Z-Image alakokon 29,4 → 33,0.
+  - A `Cs` (a szélek kiírásának shared puffere) az `As` elejére került: 24 → 20 KB LDS, 2 helyett ~3 workgroup/CU.
+  - Szélső csempék, ha a teljes k-lépés belül van: vektoros, feltétel nélküli betöltés egy létező sorról, és a mátrixon
+    kívüli rész nullázása a shared memóriába íráskor. Feltétel: k mentén mindig, m/n mentén ha a kiterjedés 8-cal osztható.
+  - Hosszú k (≥ 4096) vagy integrált GPU: +4 KB LDS (specialization constant 11), így kevesebb workgroup fut egyszerre.
+    Ok: aliasoló sortávolságnál (k · 2 bájt a 4 KB többszöröse közelében) egy sor 128 bájtos cache-sorának két
+    felét két k-lépés olvassa, és a második előtt kiszorul. ffn2 20 → 29, 4096³ 22 → 28; ROCm is esik ezeken
+    (k = 8192: 40, 4096³: 36).
+  - Akkumulátorok oszloponként külön tömbben (a RADV a > 256 bájtos, ciklusban indexelt tömböket a kibontás előtt
+    scratch-be teszi; wave32-ben ez 512 bájt volt), betöltési címek egy bázisból és egységes lépésközből (VGPR 144 → 132).
+  - Kipróbálva, nem nyert (a mérések alapján elvetve):
+    - wave32 (`VK_EXT_subgroup_size_control`), mint a hipBLASLt: 23,7 vs 28,7;
+    - B közvetlenül VGPR-be (DTVB): a RADV a globális coopmat-betöltést 16 bites elemenkéntire fordítja;
+    - k-forgatás workgroupenként: megszünteti a cache-megosztást, 37 → 20;
+    - két lépéssel előre töltés (PGR2): 217 VGPR ütemezés előtt;
+    - BK = 64: k = 8192-n 15 → 20, máshol 37 → 22;
+    - padding nélküli LDS: bank-konfliktusok, 37 → 25.
+  - Méréssel: globális betöltés nélkül 39, csak LDS + WMMA-val 52 TFLOPS. A barrier + shared tárolás szerkezete tehát
+    52 → 39-et visz; a ROCm a második szinten van.
+  Teszt: `cublas` 2 új eset (hosszú k, részleges utolsó k-lépés).
+- [x] **PTX-fordító: nem-GEMM kernelek** (2026-11-12). Mikrobenchmark Z-Image alakokon, Vulkanizer vs ROCm (ms):
+  | Op | előtte | utána | ROCm |
+  |---|---|---|---|
+  | softmax f16 [30, 4128, 4128] | 10,1 | 9,3 | 6,7 |
+  | softmax f16, 8256 hosszú sorok | 11,7 | 8,3 | 6,7 |
+  | `where(mask, 0, x)` (sugárzott maszk) | 11,4 | 10,5 | 6,7 |
+  | `isneginf`, `nan_to_num`, add, copy, layer_norm | sávszélesség-közeli | ugyanaz | ugyanaz |
+  | im2col bf16 | ~105 GB/s | ugyanaz | ~200 GB/s |
+  - Paraméterbuffer (a push constantokba nem férő paraméterek): csak olvasható (`NonWritable`) blokkon át olvasva, így
+    a RADV skalár `s_load`-dal, konstans-cache-ből olvas. Eddig szálanként vektoros betöltés + `v_readfirstlane` volt
+    (a TensorIterator kernelei elemenként több száz paraméterszót olvasnak).
+  - If-konverzió: `@p bra L; <≤ 24 mellékhatás nélküli utasítás>; L:` → predikált utasítások. A predikált,
+    mellékhatás nélküli utasítás feltétel nélkül fut, az eredményt `select` választja ki. A betöltés hamis feltételnél
+    az eszköz kis spekulációs bufferéből olvas (specialization constant 6/7). Így a softmax 5 betöltése egyszerre
+    megy ki (eddig egyenként, mindegyik után `s_wait_loadcnt 0`).
+    - Hiba (javítva, 2026-11-12 este): a spekulációs cím SSA-értéke abban a blokkban jött létre, ahol először
+      kellett, és onnan használták a többi ág is, amelyet az a blokk nem dominál: érvénytelen SPIR-V. A RADV-n ebből
+      lapfault lett (a PyTorch f32 `im2col_kernel`-je, a cím `0x800000800000`), egyszer teljes GPU-resettel (lásd
+      Copy queue), llvmpipe-on segfault. Most minden használatnál újra képződik. Teszt: `ptx_module` („guarded”, két
+      egymást nem domináló ág), `VULKANIZER_SPIRV_VAL=1`-gyel a régi kód elbukik rajta.
+    - Nyitva: a teljes tesztsor `VULKANIZER_SPIRV_VAL=1`-gyel (llvmpipe) még négy kernelnél jelez: a lokális
+      (Function) tömbök típusán `ArrayStride` dekoráció van (VUID-StandaloneSpirv-None-10684, az új spirv-val
+      szabálya; a driverek nem bánják). Külön, dekoráció nélküli tömbtípus kell a Function változóknak.
+  - `shfl.bfly` konstans maszkkal → `OpGroupNonUniformShuffleXor`, `shfl.down/up` konstans eltolással →
+    relatív shuffle. Eddig számított indexű shuffle (`ds_bpermute`) volt, most `v_permlanex16` / `ds_swizzle`.
+  - `ld/st.global.v8` (PTX 8.8, a PyTorch compute_120 PTX-ében): két 16 bájtos részre bontva (a f32 kimenetű
+    softmax eddig el sem indult). Teszt: `ptx_module`.
+  - Az új pipeline első indítása (rátamérés) csak az első ≤ 256 csoportot futtatja külön; a rácsot eddig végig
+    256-os darabokban, közöttük barrierrel küldte (softmax: 484 dispatch egy indításra).
+  - Nyitva:
+    - A softmax a 1024 szálas blokk redukcióinak barrier-késleltetését viszi.
+    - A `where` az indexszámítás 32 bites szorzásait.
+    - Az im2col betöltés → tárolás sorrendjét: a fordító nem tudja, hogy a bemenet és a kimenet nem fedik egymást,
+      így a következő betöltés nem kerülhet a tárolás elé.
+    - A legnagyobb tétel a fused attention (6.3) volt: futásonként ~6 s (softmax, `isneginf`, `where`, a két
+      attention-GEMM) – kész, lásd 6.3.
+- [x] **Eredmény ebben a körben** (9060 XT):
+  - ComfyUI Z-Image 1024², 8 lépés, `--bf16-vae`, meleg futás: 40,0 → 34,8 s (3,55 → 3,13 s/lépés). A kép bitre
+    azonos az előzővel; a ROCm-tól átlagosan ~5/255.
+  - llama.cpp pp512: 9060 ~1360 (zajos), 890M 312 → 338, MoE 2× 9060 530 → 578; tg változatlan (47,7).
 - [ ] Nyitva (pp): a MoE-modellnél a GEMM csak 27%: 44 ezer kernelindítás promptonként (sok kis `quantize_q8_1`,
   `mul_mat_q` darab), a lefordított int8 MMQ-kernelek lassúak – ez a PTX-fordítón múlik. A dense modelleknél a
   `dequantize_block_q4_K` (11%) a sávszélesség felén fut. A profil „GPU idle” sora több eszköznél hibás (az eszközök
   timestampjei egy listába kerülnek).
 - [ ] Nyitva: a parancsok közti teljes memóriabarrier (9060 XT-n kísérletben 1,1 → 0,5 µs/indítás nélküle, a 890M-en
-  ~7 → ~1–2 µs) csak függőség-követéssel lazítható; NN/NT f16 GEMM-hez nincs coopmat kernel (9060 XT: 8 vs 15,6 TFLOPS).
+  ~7 → ~1–2 µs) csak függőség-követéssel lazítható.
 
 ## 3. Ismert korlátok / kockázatok
 
@@ -1342,8 +1508,14 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
 | `VULKANIZER_HOST_ADOPT` | `0` = a regisztrált host-memória mindig importálva (nem adoptálva, 6.7) |
 | `VULKANIZER_COOPMAT` | Cooperative matrix a cuBLAS f16 GEMM-hez: alapból csak GPU-n, `0` = ki, `1` = CPU-s eszközön is (6.6) |
 | `VULKANIZER_SOFT_F16_CVT` | `1` = az f32 → f16 kerekítés egész-kóddal (nem a GPU konverziójával, RTE float controls nélküli eszközök útja) |
-| `VULKANIZER_GEMM_COOP` | `0`/`1`: a cuBLAS f16 TN GEMM coopmat vagy tiled kernelen fut; alapból eszközönként egyszer mérve dől el |
-| `VULKANIZER_TORCH_SDPA` | `mem_efficient,flash`: a `run_torch.sh` ezeket a fused attention backendeket nem tiltja, és `VULKANIZER_CC=80`-at állít (6.3) |
+| `VULKANIZER_GEMM_DBUF_TILES` | a coopmat GEMM két shared pufferes változata legfeljebb ennyi 128 × 128-as csempénél / compute unit (alap: 16; `0` = soha) |
+| `VULKANIZER_NO_BF16_COOPMAT` | nem kapcsolja be a bf16 cooperative matrixokat (`VK_KHR_shader_bfloat16`); a bf16 GEMM a tiled kernelen fut |
+| `VULKANIZER_QUEUE` | `graphics` = a kernelek is a graphics + compute queue-családon futnak a compute-only helyett (kísérlet; a gyors host ↔ VRAM másolást már a copy queue adja, lásd `VULKANIZER_COPY_QUEUE`) |
+| `VULKANIZER_COPY_QUEUE` | a host ↔ device másolások queue-ja diszkrét GPU-n: alapból SDMA (RADV-n a Vulkanizer `RADV_PERFTEST=transfer_queue`-t állít), ahol nincs, a compute queue; `graphics`: a graphics család (egy kernelhiba ilyenkor teljes GPU-resetet okoz, a desktoppal együtt); `0`: mindig a compute queue |
+| `VULKANIZER_GEMM_COOP` | `0`/`1`: a cuBLAS f16/bf16 GEMM coopmat vagy tiled kernelen fut; alapból eszközönként egyszer mérve dől el |
+| `VULKANIZER_TORCH_SDPA` | a megtartott SDPA-backendek (alapból `mem_efficient`, a fused attentionnel); `math`: egyik sem; `mem_efficient,flash`: a flash is, és a `run_torch.sh` `VULKANIZER_CC=80`-at állít (6.3) |
+| `VULKANIZER_FUSED_ATTENTION` | `0` = a PyTorch mem-efficient kernelei nem cserélődnek a saját fused attentionre (6.3); `scalar` = mindig a skalár kernel |
+| `VULKANIZER_BUILTIN_KERNELS` | `0` = a könyvtárkernelek (PyTorch mem-efficient attention, `im2col_kernel`) nem cserélődnek Vulkanizer saját shadereire, a PTX-ük fordul le (6.3, 6.3b) |
 | `VULKANIZER_NPU` | NPU offload (7.): `off` (alap; 7.2: a másolós út nem nyer), `auto` (a policy dönt), `force` (minden, amit a backend tud) |
 | `VULKANIZER_NPU_BACKEND` | `auto` (alap: a felderített NPU szerint), `xdna` (AMD, XRT), `cpu` (host referencia, teszthez; NPU nem kell) |
 | `VULKANIZER_NPU_MIN_MNK` | `auto` módban az NPU-hoz legalább ennyi m·n·k·batch kell (alap: 2^24, egy 256³ GEMM) |

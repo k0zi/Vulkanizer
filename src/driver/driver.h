@@ -29,6 +29,11 @@ struct CUctx_st {
     bool primary = false;
 };
 
+namespace vulkanizer::driver {
+// Kernels of libraries that run as Vulkanizer's own shaders instead of their translated PTX (builtin_kernels.h)
+enum class BuiltinKernel : uint8_t { None, AttentionF16, AttentionBF16, AttentionF32, Im2col };
+}
+
 struct CUfunc_st {
     static constexpr uint32_t kMagic = 0x434e5553;  // 'SUNC'
     uint32_t magic = kMagic;
@@ -38,6 +43,9 @@ struct CUfunc_st {
     bool compiled = false;
     std::string compileError;
     vulkanizer::compiler::KernelBinary binary;
+    // A library kernel that runs as Vulkanizer's own shader (builtin_kernels.h)
+    vulkanizer::driver::BuiltinKernel builtin = vulkanizer::driver::BuiltinKernel::None;
+    uint32_t builtinParam = 0;  // attention: queries per CUDA block; im2col: element bytes
     // keyed by the specialization: blockDim.x/y/z, dynamic shared memory words
     std::map<std::array<uint32_t, 5>, vulkanizer::vk::ComputePipeline> pipelines;  // by spec constants
 };

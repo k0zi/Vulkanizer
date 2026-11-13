@@ -13,6 +13,7 @@ struct Target {
     uint32_t subgroupSize = 32;
     bool subgroupBallot = true;   // subgroup ballot and shuffle operations in compute shaders
     bool subgroupShuffle = true;
+    bool subgroupShuffleRelative = false;  // shuffle up / down by a lane delta
     uint32_t maxPushConstantsSize = 128;
     uint32_t maxSharedMemorySize = 48 * 1024;
     bool float16 = false;

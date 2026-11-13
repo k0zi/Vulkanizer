@@ -27,6 +27,11 @@ typedef enum VulkanizerFeature {
     // VK_KHR_cooperative_matrix: S of the S x S x S f16 x f16 -> f32 matrices of subgroup scope (16 or 8)
     VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16 = 3,
     VULKANIZER_FEATURE_SUBGROUP_SIZE = 4,       // the subgroup size of compute shaders
+    // VK_KHR_shader_bfloat16: 16 x 16 x 16 bf16 x bf16 -> f32 cooperative matrices of subgroup scope
+    VULKANIZER_FEATURE_COOPERATIVE_MATRIX_BF16 = 5,
+    // f32 -> f16 conversions can be made to round to nearest even (shaderRoundingModeRTEFloat16 and
+    // shaderDenormPreserveFloat16)
+    VULKANIZER_FEATURE_F16_ROUND_RTE = 6,
 } VulkanizerFeature;
 
 // *value = 1 if the current context's device has the feature, else 0 (sizes: the size, 0 if none).

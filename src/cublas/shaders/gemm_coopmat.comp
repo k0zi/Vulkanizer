@@ -7,16 +7,24 @@
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+#ifdef BF16
+#extension GL_EXT_bfloat16 : require
+#endif
 
-// gemm_f16_tn.comp on cooperative matrices (VK_KHR_cooperative_matrix: the GPU's matrix units where
-// it has them): C = alpha * A^T * B + beta * C with f16 A and B, both contiguous along k (lda, ldb
-// multiples of 8, 16-byte aligned), f32 accumulation, C in f16 (C_F16 defined) or f32.
+// C = alpha * op(A) * op(B) + beta * C on cooperative matrices (VK_KHR_cooperative_matrix: the GPU's
+// matrix units where it has them). A and B are f16 (bf16 with BF16 defined), each contiguous along k
+// or along m / n (specialization constant 10, kConfig), with leading dimensions and batch strides
+// multiples of 8 and 16-byte aligned starts; f32 accumulation; C in f32, f16 (C_F16) or bf16 (C_BF16).
 // S x S x S matrices (S = 16, or 8 on llvmpipe). A workgroup is 4 subgroups side by side in 2 x 2,
-// each computing 4 x 4 output matrices: tiles of 8S x 8S (128 x 128; SMALL_TILE: 2 x 2 matrices, 64 x 64,
-// for products with fewer tiles than the GPU has compute units), k in steps of 2S through shared
-// memory. The next step's operands are loaded into registers while the current one is multiplied.
-// The results leave one matrix at a time through a small shared buffer per subgroup (edges, alpha,
-// beta, exact f16 rounding).
+// each computing 4 x 4 output matrices: tiles of 8S x 8S (128 x 128; SMALL_TILE: 2 x 2 matrices,
+// 64 x 64, for products with fewer tiles than the GPU has compute units), k in steps of 2S through
+// shared memory (DOUBLE_BUFFER: two buffers, for products of few tiles), kept in the operand's own
+// layout. The next step's operands are loaded into registers
+// while the current one is multiplied: for tiles inside the matrices with plain 16-byte loads from
+// precomputed addresses, at the edges element by element with zero fill.
+// The results of tiles inside C go straight from the accumulators to memory (DIRECT_STORE); the
+// others, one matrix at a time through a small shared buffer per subgroup (edges, exact rounding).
 // Compiled for Vulkan 1.2 (SPIR-V 1.5), so the subgroup size is the device's: the launch's
 // 4 * subgroup size threads are exactly 4 subgroups.
 
@@ -34,6 +42,13 @@ uint64_t canon(uint64_t a) {  // on the high word alone
     return packUint2x32(w);
 }
 
+// Bit 0: A contiguous along k (op(A) = A^T), bit 1: B contiguous along k (op(B) = B).
+layout(constant_id = 10) const uint kConfig = 3u;
+// Extra shared memory (uvec4 units, S = 16) that holds fewer workgroups on a compute unit at a time:
+// for long k, where more workgroups at once share less of their operands in the caches (see cublas.cpp).
+layout(constant_id = 11) const int kExtraVecs = 0;
+const bool kAlongKA = (kConfig & 1u) != 0u, kAlongKB = (kConfig & 2u) != 0u;
+
 layout(push_constant, std430) uniform Params {
     uint64_t a, b, c;
     int64_t strideA, strideB, strideC;  // elements between batch entries
@@ -44,25 +59,95 @@ layout(push_constant, std430) uniform Params {
     int batchOffset;
 } p;
 
+#ifdef BF16
+#define InType bfloat16_t
+#else
+#define InType float16_t
+#endif
+
 #ifdef SMALL_TILE
 const int TM = 2, TN = 2;                // output matrices per subgroup: tiles of 4S x 4S, for small products
 #else
 const int TM = 4, TN = 4;                // output matrices per subgroup
 #endif
 const int BM = 2 * TM * S, BN = 2 * TN * S, BK = 2 * S;
-const int LDV = BK / 8 + 1;              // row pitch in uvec4 (8 halves): rows on different banks
-shared uvec4 As[BM * LDV];               // row i of A^T, along k
-shared uvec4 Bs[BN * LDV];               // column j of B, along k
+// Shared tiles in uvec4 (8 values) with a padded row pitch (rows on different banks): contiguous
+// along k, BM rows of BK; contiguous along m (n), BK rows of BM (BN).
+const int LDV = BK / 8 + 1, LDVM = BM / 8 + 1;
+const int kTileVecs = BM * LDV > BK * LDVM ? BM * LDV : BK * LDVM;  // BM == BN
+#ifdef DOUBLE_BUFFER
+const int kBuffers = 2;  // one multiplied while the other is filled
+#else
+const int kBuffers = 1;
+#endif
+#if S == 8
+// llvmpipe (the only S = 8 device) reads cooperative matrices from a uvec4 array in the wrong units:
+// there the tiles are arrays of 16-bit values, offsets and strides in values (kUnit = 8 per uvec4).
+shared InType As[kBuffers * kTileVecs * 8];
+shared InType Bs[kBuffers * kTileVecs * 8];
+const int kUnit = 8;
+void putTile(bool a, int slot, uvec4 v) {  // slot: in uvec4 units, buffer included
+    [[unroll]] for (int q = 0; q < 8; ++q) {
+        const uint16_t bits = uint16_t(v[q / 2] >> (16 * (q % 2)));
+#ifdef BF16
+        const InType x = uintBitsToBFloat16EXT(bits);
+#else
+        const InType x = uint16BitsToHalf(bits);
+#endif
+        if (a) As[slot * 8 + q] = x;
+        else Bs[slot * 8 + q] = x;
+    }
+}
+#else
+shared uvec4 As[kBuffers * kTileVecs + kExtraVecs];
+shared uvec4 Bs[kBuffers * kTileVecs];
+const int kUnit = 1;
+void putTile(bool a, int slot, uvec4 v) {
+    if (a) As[slot] = v;
+    else Bs[slot] = v;
+}
+#endif
+#if S == 8
 shared float Cs[4][S * S];               // per subgroup: one result matrix on its way out
+#endif
 
-float loadHalf(uint64_t base, int64_t index) { return unpackHalf2x16(uint(U16(canon(base + uint64_t(index) * 2ul)).v)).x; }
+#if defined(C_F16)
+#define CType float16_t
+const uint64_t kCSize = 2ul;
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer CMat { float16_t v[]; };
+#elif defined(C_BF16)
+const uint64_t kCSize = 2ul;
+#else
+#define CType float
+const uint64_t kCSize = 4ul;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer CMat { float v[]; };
+#endif
+#if defined(DIRECT_STORE) && defined(C_F16)
+// f32 -> f16 conversions round to nearest even (RoundingModeRTE for 16-bit floats; the device must
+// have shaderRoundingModeRTEFloat16, which the launch checks).
+#extension GL_EXT_spirv_intrinsics : require
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4467], 4462, 16);
+#endif
 
-// 8 raw halves along k (2 per uint) of row `row` (of A^T or B^T), zero outside the matrix.
-uvec4 loadRaw8(uint64_t base, int ld, int row, int rows, int k) {
-    if (row < rows && k + 8 <= p.k) return U16x8(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k)) * 2ul)).v;
+float loadC16(uint64_t base, int64_t index) {
+    const uint bits = uint(U16(canon(base + uint64_t(index) * 2ul)).v);
+#ifdef C_BF16
+    return uintBitsToFloat(bits << 16);
+#else
+    return unpackHalf2x16(bits).x;
+#endif
+}
+
+// 8 raw 16-bit values along the contiguous dimension (`inner`, of `inners`) of line `outer` (of
+// `outers`), zero outside the matrix.
+uvec4 loadRaw8(uint64_t base, int ld, int outer, int outers, int inner, int inners) {
+    if (outer < outers && inner + 8 <= inners)
+        return U16x8(canon(base + (uint64_t(outer) * uint64_t(ld) + uint64_t(inner)) * 2ul)).v;
     uint h[8];
-    for (int q = 0; q < 8; ++q)
-        h[q] = row < rows && k + q < p.k ? uint(U16(canon(base + (uint64_t(row) * uint64_t(ld) + uint64_t(k + q)) * 2ul)).v) : 0u;
+    [[unroll]] for (int q = 0; q < 8; ++q)
+        h[q] = outer < outers && inner + q < inners
+                   ? uint(U16(canon(base + (uint64_t(outer) * uint64_t(ld) + uint64_t(inner + q)) * 2ul)).v)
+                   : 0u;
     return uvec4(h[0] | h[1] << 16, h[2] | h[3] << 16, h[4] | h[5] << 16, h[6] | h[7] << 16);
 }
 
@@ -87,6 +172,12 @@ uint toHalfBits(float f) {  // round to nearest even (packHalf2x16 rounding is i
     return sign | h;
 }
 
+uint toBf16Bits(float f) {  // round to nearest even; NaN stays NaN
+    const uint u = floatBitsToUint(f);
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) return (u >> 16) | 0x40u;
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
+
 uint64_t batchBase(uint64_t base, int64_t stride, int batch, uint64_t size) {
     return base + uint64_t(stride * batch) * size;
 }
@@ -95,26 +186,178 @@ void store(uint64_t C, int gm, int gn, float acc) {
     if (gm >= p.m || gn >= p.n) return;
     const int64_t idx = int64_t(gm) + int64_t(gn) * p.ldc;
     float v = p.alpha * acc;
+#if defined(C_F16) || defined(C_BF16)
+    if (p.beta != 0.0) v += p.beta * loadC16(C, idx);
 #ifdef C_F16
-    if (p.beta != 0.0) v += p.beta * loadHalf(C, idx);
     U16(canon(C + uint64_t(idx) * 2ul)).v = uint16_t(toHalfBits(v));
+#else
+    U16(canon(C + uint64_t(idx) * 2ul)).v = uint16_t(toBf16Bits(v));
+#endif
 #else
     if (p.beta != 0.0) v += p.beta * F32(canon(C + uint64_t(idx) * 4ul)).v;
     F32(canon(C + uint64_t(idx) * 4ul)).v = v;
 #endif
 }
 
-const int kLoads = BM * BK / 8;  // uvec4 loads of one operand per k step (BM == BN)
+const int kGroup = 8;              // tile rows per group (see main)
+const int kLoads = BM * BK / 8;    // uvec4 loads of one operand per k step (BM == BN)
+
+uvec4 ra[4], rb[4];      // the next k step, per thread
+// Where this thread's first part of it starts (k = 0), canonical; part r is r * stepRows* lines
+// further (the loads of one round cover whole lines).
+uint64_t pa, pb;
+uint64_t rowStepA, rowStepB;  // bytes between a thread's parts: uniform
+// Tiles at the edges of the matrices, in k steps inside them: parts that lie wholly outside the
+// matrix load from a line of the tile that exists instead (fa / fb, fStepA / fStepB apart) and are
+// zeroed on their way to shared memory (maskA / maskB: bit r = part r inside, or no zeroing needed).
+// Possible where every part is wholly inside or wholly outside (edgeFast): always along k (the
+// parts are pieces of rows), along m / n when the extent is a multiple of 8.
+uint64_t fa, fb, fStepA, fStepB;
+uint validA, validB, maskA, maskB;
+bool edgeFast;
+
+// Load idx of a k step of an operand contiguous along k (`alongK`) or along m / n: the line it
+// is on and the position along it, within the tile; and its place in the shared tile.
+void part(bool alongK, int idx, out int line, out int pos, out int slot) {
+    if (alongK) {  // line = row of the tile (m / n), pos = k
+        line = idx / (BK / 8), pos = idx % (BK / 8) * 8;
+        slot = line * LDV + pos / 8;
+    } else {       // line = k, pos = m / n
+        line = idx / (BM / 8), pos = idx % (BM / 8) * 8;
+        slot = line * LDVM + pos / 8;
+    }
+}
+
+// One operand's 8 values for load idx of the k step at k0, at the edges of the matrices.
+uvec4 edgeLoad(bool alongK, uint64_t base, int ld, int tile0, int extent, int idx, int k0) {
+    int line, pos, slot;
+    part(alongK, idx, line, pos, slot);
+    return alongK ? loadRaw8(base, ld, tile0 + line, extent, k0 + pos, p.k)
+                  : loadRaw8(base, ld, k0 + line, p.k, tile0 + pos, extent);
+}
+
+// One k step (k0 .. k0 + BK) of both operands into ra / rb.
+void loadStep(uint64_t A, uint64_t B, int tileM, int tileN, int tid, int threads, int perThread, bool inside, int k0) {
+    const uint64_t stepA = uint64_t(k0) * (kAlongKA ? 2ul : uint64_t(p.lda) * 2ul);
+    const uint64_t stepB = uint64_t(k0) * (kAlongKB ? 2ul : uint64_t(p.ldb) * 2ul);
+    if (inside && k0 + BK <= p.k) {  // uniform: the whole step inside the matrices
+        [[unroll]] for (int r = 0; r < perThread; ++r)
+            if (tid + r * threads < kLoads) {
+                ra[r] = U16x8(pa + stepA + uint64_t(r) * rowStepA).v;
+                rb[r] = U16x8(pb + stepB + uint64_t(r) * rowStepB).v;
+            }
+        return;
+    }
+    if (edgeFast && k0 + BK <= p.k) {  // uniform: an edge tile, the step inside along k
+        [[unroll]] for (int r = 0; r < perThread; ++r)
+            if (tid + r * threads < kLoads) {
+                const uint64_t a = ((validA >> r) & 1u) != 0u ? pa + uint64_t(r) * rowStepA : fa + uint64_t(r) * fStepA;
+                const uint64_t b = ((validB >> r) & 1u) != 0u ? pb + uint64_t(r) * rowStepB : fb + uint64_t(r) * fStepB;
+                ra[r] = U16x8(a + stepA).v;
+                rb[r] = U16x8(b + stepB).v;
+            }
+        return;
+    }
+    [[unroll]] for (int r = 0; r < perThread; ++r) {
+        const int idx = tid + r * threads;
+        if (idx < kLoads) {
+            ra[r] = edgeLoad(kAlongKA, A, p.lda, tileM, p.m, idx, k0);
+            rb[r] = edgeLoad(kAlongKB, B, p.ldb, tileN, p.n, idx, k0);
+        }
+    }
+}
+
+// ra / rb into the shared tiles at `base` (uvec4 units).
+void storeStep(int tid, int threads, int perThread, int base) {
+    [[unroll]] for (int r = 0; r < perThread; ++r) {
+        const int idx = tid + r * threads;
+        if (idx < kLoads) {
+            int line, pos, slot;
+            part(kAlongKA, idx, line, pos, slot);
+            putTile(true, base + slot, ((maskA >> r) & 1u) != 0u ? ra[r] : uvec4(0u));
+            part(kAlongKB, idx, line, pos, slot);
+            putTile(false, base + slot, ((maskB >> r) & 1u) != 0u ? rb[r] : uvec4(0u));
+        }
+    }
+}
+
+#define AccMat coopmat<float, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator>
+#define AMat coopmat<InType, gl_ScopeSubgroup, S, S, gl_MatrixUseA>
+#define BMat coopmat<InType, gl_ScopeSubgroup, S, S, gl_MatrixUseB>
+// The accumulators are one array per output column j (accJ[i] = output matrix (i, j)): RADV puts
+// function-local arrays over 256 bytes that the shader indexes in loops into scratch memory before
+// it unrolls the loops, and with 32-lane subgroups TM x TN accumulators are 512.
+#define FOR_EACH_COLUMN(X) X(0, acc0) X(1, acc1) if (TN > 2) { X(2, acc2) X(3, acc3) }
+
+// acc(i, j) += A(i) B(j) for k step kk of the shared tiles at `base`, column j.
+void mulColumn(inout AccMat acc[TM], AMat a[TM], int j, int sn, int base, int kk) {
+    BMat b;
+    if (kAlongKB)  // B (k x n) column j: a row of Bs
+        coopMatLoad(b, Bs, (base + (sn + j * S) * LDV + kk / 8) * kUnit, LDV * kUnit, gl_CooperativeMatrixLayoutColumnMajor);
+    else           // row k of B: a row of Bs
+        coopMatLoad(b, Bs, (base + kk * LDVM + (sn + j * S) / 8) * kUnit, LDVM * kUnit, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (int i = 0; i < TM; ++i) acc[i] = coopMatMulAdd(a[i], b, acc[i]);
+}
+
+#if defined(DIRECT_STORE) && !defined(C_BF16)
+// Output column j of a tile inside C, straight from the accumulators (f16: converted with round to
+// nearest even).
+void storeColumnDirect(AccMat acc[TM], uint64_t C, int gm0, int gn) {
+    [[unroll]] for (int i = 0; i < TM; ++i) {
+        const int gm = gm0 + i * S;
+        CMat c = CMat(canon(C + (uint64_t(gm) + uint64_t(gn) * uint64_t(p.ldc)) * kCSize));
+        AccMat v = acc[i] * p.alpha;
+        if (p.beta != 0.0) {
+            coopmat<CType, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator> old;
+            coopMatLoad(old, c.v, 0, uint(p.ldc), gl_CooperativeMatrixLayoutColumnMajor);
+            v += AccMat(old) * p.beta;
+        }
+        coopMatStore(coopmat<CType, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator>(v), c.v, 0, uint(p.ldc),
+                     gl_CooperativeMatrixLayoutColumnMajor);
+    }
+}
+#endif
+
+// Output column j one matrix at a time through this subgroup's part of Cs, column major (edges).
+// For S = 16 Cs is the start of As (the workgroup is done with the tiles): S * S floats per subgroup.
+void storeColumnShared(AccMat acc[TM], uint64_t C, int gm0, int gn, int sg) {
+    const int lane = int(gl_SubgroupInvocationID), lanes = int(gl_SubgroupSize);
+    [[unroll]] for (int i = 0; i < TM; ++i) {
+        const int gm = gm0 + i * S;
+        if (gm < p.m && gn < p.n) {  // uniform in the subgroup
+#if S == 8
+            coopMatStore(acc[i], Cs[sg], 0, S, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+            coopMatStore(acc[i], As, sg * (S * S / 4), S / 4, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (int e = lane; e < S * S; e += lanes) {
+#if S == 8
+                const float v = Cs[sg][e];
+#else
+                const float v = uintBitsToFloat(As[sg * (S * S / 4) + e / 4][e % 4]);
+#endif
+                store(C, gm + e % S, gn + e / S, v);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+}
 
 void main() {
     const int batch = int(gl_WorkGroupID.z) + p.batchOffset;
     const uint64_t A = batchBase(p.a, p.strideA, batch, 2ul), B = batchBase(p.b, p.strideB, batch, 2ul);
-#ifdef C_F16
-    const uint64_t C = batchBase(p.c, p.strideC, batch, 2ul);
-#else
-    const uint64_t C = batchBase(p.c, p.strideC, batch, 4ul);
-#endif
-    const int tileM = int(gl_WorkGroupID.x) * BM, tileN = int(gl_WorkGroupID.y) * BN;
+    const uint64_t C = batchBase(p.c, p.strideC, batch, kCSize);
+    // Tiles in groups of kGroup rows of tiles (along m), column by column within a group: the
+    // workgroups that run at the same time share their rows of A and columns of B in the caches.
+    // (Tile counts from m and n: a launch may run in parts, each with its own gl_NumWorkGroups.)
+    const int tilesM = (p.m + BM - 1) / BM, tilesN = (p.n + BN - 1) / BN;
+    const int lin = int(gl_WorkGroupID.x) + int(gl_WorkGroupID.y) * tilesM;
+    const int group = lin / (kGroup * tilesN), firstM = group * kGroup, groupM = min(tilesM - firstM, kGroup);
+    const int inGroup = lin - group * kGroup * tilesN;
+    const int tileM = (firstM + inGroup % groupM) * BM, tileN = (inGroup / groupM) * BN;
     const int tid = int(gl_LocalInvocationIndex);
     const int threads = int(gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z);
     const int perThread = (kLoads + threads - 1) / threads;  // 2 with 256 threads
@@ -122,64 +365,100 @@ void main() {
     const int sg = int(gl_SubgroupID);
     const int sm = (sg & 1) * TM * S, sn = (sg >> 1) * TN * S;
 
-    coopmat<float, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator> acc[TM][TN];
-    for (int i = 0; i < TM; ++i)
-        for (int j = 0; j < TN; ++j) acc[i][j] = coopmat<float, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator>(0.0);
+    AccMat acc0[TM], acc1[TM], acc2[TM], acc3[TM];  // acc2 / acc3: TN = 4 only
+    [[unroll]] for (int i = 0; i < TM; ++i) acc0[i] = acc1[i] = acc2[i] = acc3[i] = AccMat(0.0);
 
-    uvec4 ra[4], rb[4];  // the next k step (perThread <= 4: at least kLoads / 4 threads)
-    for (int r = 0; r < perThread; ++r) {
-        const int idx = tid + r * threads;
-        if (idx < kLoads) {
-            const int row = idx / (BK / 8), k = idx % (BK / 8) * 8;
-            ra[r] = loadRaw8(A, p.lda, tileM + row, p.m, k);
-            rb[r] = loadRaw8(B, p.ldb, tileN + row, p.n, k);
-        }
+    // For tiles inside the matrix, the addresses of this thread's parts of a k step: its loads are
+    // then plain and unconditional, with nothing that waits on them before they are stored to
+    // shared memory (the zero fills of the edge path would make the compiler wait for every load
+    // in flight).
+    const bool inside = tileM + BM <= p.m && tileN + BN <= p.n;  // uniform in the workgroup
+    {
+        int line, pos, slot;
+        part(kAlongKA, tid, line, pos, slot);
+        pa = canon(A + (kAlongKA ? uint64_t(tileM + line) * uint64_t(p.lda) + uint64_t(pos)
+                                 : uint64_t(line) * uint64_t(p.lda) + uint64_t(tileM + pos)) * 2ul);
+        part(kAlongKB, tid, line, pos, slot);
+        pb = canon(B + (kAlongKB ? uint64_t(tileN + line) * uint64_t(p.ldb) + uint64_t(pos)
+                                 : uint64_t(line) * uint64_t(p.ldb) + uint64_t(tileN + pos)) * 2ul);
+        // threads is a multiple of the loads per line (BK / 8 along k, BM / 8 along m / n)
+        rowStepA = uint64_t(threads / (kAlongKA ? BK / 8 : BM / 8)) * uint64_t(p.lda) * 2ul;
+        rowStepB = uint64_t(threads / (kAlongKB ? BK / 8 : BM / 8)) * uint64_t(p.ldb) * 2ul;
     }
+    validA = validB = maskA = maskB = ~0u;
+    edgeFast = false;
+    if (!inside) {
+        int line, pos, slot;
+        part(kAlongKA, tid, line, pos, slot);
+        const int linesA = threads / (kAlongKA ? BK / 8 : BM / 8);  // lines between parts
+        const bool fastA = kAlongKA || p.m % 8 == 0;
+        [[unroll]] for (int r = 0; r < 4; ++r)
+            if (kAlongKA ? tileM + line + r * linesA >= p.m : tileM + pos + 8 > p.m) validA &= ~(1u << r);
+        fa = canon(A + (kAlongKA ? uint64_t(tileM) * uint64_t(p.lda) + uint64_t(pos)
+                                 : uint64_t(line) * uint64_t(p.lda) + uint64_t(tileM)) * 2ul);
+        fStepA = kAlongKA ? 0ul : rowStepA;
+        part(kAlongKB, tid, line, pos, slot);
+        const int linesB = threads / (kAlongKB ? BK / 8 : BM / 8);
+        const bool fastB = kAlongKB || p.n % 8 == 0;
+        [[unroll]] for (int r = 0; r < 4; ++r)
+            if (kAlongKB ? tileN + line + r * linesB >= p.n : tileN + pos + 8 > p.n) validB &= ~(1u << r);
+        fb = canon(B + (kAlongKB ? uint64_t(tileN) * uint64_t(p.ldb) + uint64_t(pos)
+                                 : uint64_t(line) * uint64_t(p.ldb) + uint64_t(tileN)) * 2ul);
+        fStepB = kAlongKB ? 0ul : rowStepB;
+        edgeFast = fastA && fastB;
+        if (edgeFast) maskA = validA, maskB = validB;
+    }
+    // One shared buffer: per k step, store it, barrier, send out the next step's loads, multiply,
+    // barrier. DOUBLE_BUFFER (for products of few tiles, where the barriers' latency shows): step s
+    // is multiplied from buffer s % 2 while step s + 1, loaded into registers during step s - 1, is
+    // stored to the other one; then one barrier, and the loads of step s + 2 go out.
+    loadStep(A, B, tileM, tileN, tid, threads, perThread, inside, 0);
+    int buf = 0;
+#ifdef DOUBLE_BUFFER
+    storeStep(tid, threads, perThread, 0);
+    barrier();
+    if (BK < p.k) loadStep(A, B, tileM, tileN, tid, threads, perThread, inside, BK);
+#endif
     for (int k0 = 0; k0 < p.k; k0 += BK) {
+#ifndef DOUBLE_BUFFER
         barrier();  // the previous step's multiplications are done with the shared tiles
-        for (int r = 0; r < perThread; ++r) {
-            const int idx = tid + r * threads;
-            if (idx < kLoads) {
-                const int row = idx / (BK / 8), kv = idx % (BK / 8);
-                As[row * LDV + kv] = ra[r];
-                Bs[row * LDV + kv] = rb[r];
-            }
-        }
+        storeStep(tid, threads, perThread, 0);
         barrier();
-        if (k0 + BK < p.k) {  // the next step, in flight during the multiplications
-            for (int r = 0; r < perThread; ++r) {
-                const int idx = tid + r * threads;
-                if (idx < kLoads) {
-                    const int row = idx / (BK / 8), k = k0 + BK + idx % (BK / 8) * 8;
-                    ra[r] = loadRaw8(A, p.lda, tileM + row, p.m, k);
-                    rb[r] = loadRaw8(B, p.ldb, tileN + row, p.n, k);
-                }
-            }
+        if (k0 + BK < p.k)  // the next step, in flight during the multiplications
+            loadStep(A, B, tileM, tileN, tid, threads, perThread, inside, k0 + BK);
+#endif
+        const int base = buf * kTileVecs;
+        [[unroll]] for (int kk = 0; kk < BK; kk += S) {
+            AMat a[TM];
+            // offsets and strides in uvec4 units (8 values; kUnit: in values); kk, sm and sn are multiples of 8
+            [[unroll]] for (int i = 0; i < TM; ++i)
+                if (kAlongKA)  // A (m x k) row i: a row of As
+                    coopMatLoad(a[i], As, (base + (sm + i * S) * LDV + kk / 8) * kUnit, LDV * kUnit, gl_CooperativeMatrixLayoutRowMajor);
+                else           // column k of A: a row of As
+                    coopMatLoad(a[i], As, (base + kk * LDVM + (sm + i * S) / 8) * kUnit, LDVM * kUnit, gl_CooperativeMatrixLayoutColumnMajor);
+#define MUL_COLUMN(j, accJ) mulColumn(accJ, a, j, sn, base, kk);
+            FOR_EACH_COLUMN(MUL_COLUMN)
         }
-        for (int kk = 0; kk < BK; kk += S) {
-            coopmat<float16_t, gl_ScopeSubgroup, S, S, gl_MatrixUseA> a[TM];
-            coopmat<float16_t, gl_ScopeSubgroup, S, S, gl_MatrixUseB> b[TN];
-            // offsets and strides in uvec4 units (8 halves); kk is a multiple of 8
-            for (int i = 0; i < TM; ++i)
-                coopMatLoad(a[i], As, (sm + i * S) * LDV + kk / 8, LDV, gl_CooperativeMatrixLayoutRowMajor);
-            for (int j = 0; j < TN; ++j)  // B (k x n) column j is a row of Bs
-                coopMatLoad(b[j], Bs, (sn + j * S) * LDV + kk / 8, LDV, gl_CooperativeMatrixLayoutColumnMajor);
-            for (int i = 0; i < TM; ++i)
-                for (int j = 0; j < TN; ++j) acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+#ifdef DOUBLE_BUFFER
+        if (k0 + BK < p.k) {
+            buf ^= 1;
+            storeStep(tid, threads, perThread, buf * kTileVecs);
+            barrier();  // the step is in the other buffer, and everyone is done with this one
+            if (k0 + 2 * BK < p.k) loadStep(A, B, tileM, tileN, tid, threads, perThread, inside, k0 + 2 * BK);
         }
+#endif
     }
 
-    // Out one matrix at a time through this subgroup's part of Cs, column major.
-    const int lane = int(gl_SubgroupInvocationID), lanes = int(gl_SubgroupSize);
-    for (int i = 0; i < TM; ++i)
-        for (int j = 0; j < TN; ++j) {
-            const int gm = tileM + sm + i * S, gn = tileN + sn + j * S;
-            if (gm >= p.m || gn >= p.n) continue;  // uniform in the subgroup
-            coopMatStore(acc[i][j], Cs[sg], 0, S, gl_CooperativeMatrixLayoutColumnMajor);
-            subgroupMemoryBarrierShared();
-            subgroupBarrier();
-            for (int e = lane; e < S * S; e += lanes) store(C, gm + e % S, gn + e / S, Cs[sg][e]);
-            subgroupMemoryBarrierShared();
-            subgroupBarrier();
-        }
+#if defined(DIRECT_STORE) && !defined(C_BF16)
+    if (inside) {
+#define STORE_DIRECT(j, accJ) storeColumnDirect(accJ, C, tileM + sm, tileN + sn + j * S);
+        FOR_EACH_COLUMN(STORE_DIRECT)
+        return;
+    }
+#endif
+#if S != 8
+    barrier();  // every subgroup is done with As, which holds Cs now
+#endif
+#define STORE_SHARED(j, accJ) storeColumnShared(accJ, C, tileM + sm, tileN + sn + j * S, sg);
+    FOR_EACH_COLUMN(STORE_SHARED)
 }

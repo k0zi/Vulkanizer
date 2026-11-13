@@ -2,6 +2,8 @@
 
 #include "driver/driver.h"
 
+#include "driver/builtin_kernels.h"
+
 #include "common/log.h"
 #include "compiler/spirv_tools.h"
 #include "common/sha256.h"
@@ -119,6 +121,12 @@ bool envFlag(const char* name) {
 // VULKANIZER_SPIRV_VAL=1 runs spirv-val on it and rejects invalid modules.
 void compileFunction(CUfunc_st& f, const DeviceSlot& slot) {
     f.compileAttempted = true;
+    f.builtin = matchBuiltinKernel(f.entry->name, f.builtinParam);
+    if (f.builtin != BuiltinKernel::None) {  // runs as Vulkanizer's own shader (builtin_kernels.h)
+        f.compiled = true;
+        VULKANIZER_DEBUG("kernel '%s': Vulkanizer's own shader", f.entry->name.c_str());
+        return;
+    }
     const compiler::Target target = targetFor(slot);
     CUmod_st& mod = *f.module;
     if (mod.sourceHash.empty()) {
@@ -267,6 +275,7 @@ compiler::Target targetFor(const DeviceSlot& slot) {
     t.subgroupSize = slot.info->subgroupSize;
     t.subgroupBallot = slot.info->subgroupOps & VK_SUBGROUP_FEATURE_BALLOT_BIT;
     t.subgroupShuffle = slot.info->subgroupOps & VK_SUBGROUP_FEATURE_SHUFFLE_BIT;
+    t.subgroupShuffleRelative = slot.info->subgroupOps & VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT;
     if (envFlag("VULKANIZER_EMULATE_WARPS")) t.subgroupShuffle = false;  // debugging: shared-memory warps
     t.maxPushConstantsSize = slot.info->props.limits.maxPushConstantsSize;
     t.maxSharedMemorySize = slot.info->props.limits.maxComputeSharedMemorySize;
@@ -333,6 +342,8 @@ CUresult launchKernel(ApiScope& s, CUfunction f, const unsigned grid[3], const u
         VULKANIZER_ERROR("cannot launch '%s': %s", e.name.c_str(), f->compileError.c_str());
         return CUDA_ERROR_NOT_SUPPORTED;
     }
+    // its own shared memory, whatever the CUDA kernel would have asked for
+    if (f->builtin != BuiltinKernel::None) return launchBuiltinKernel(s, f, grid, params);
     if (uint64_t(f->binary.staticSharedBytes) + sharedMemBytes > lim.maxComputeSharedMemorySize) {
         VULKANIZER_ERROR("'%s': %u static + %u dynamic bytes of shared memory exceed the device limit (%u)", e.name.c_str(),
                     f->binary.staticSharedBytes, sharedMemBytes, lim.maxComputeSharedMemorySize);
@@ -592,6 +603,8 @@ CUresult CUDAAPI vulkanizerGetFeature(VulkanizerFeature feature, int* value) {
     case VULKANIZER_FEATURE_FLOAT64: *value = s.slot->vk->features().shaderFloat64; return CUDA_SUCCESS;
     case VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16: *value = int(s.slot->vk->features().coopMatrixSize); return CUDA_SUCCESS;
     case VULKANIZER_FEATURE_SUBGROUP_SIZE: *value = int(s.slot->info->subgroupSize); return CUDA_SUCCESS;
+    case VULKANIZER_FEATURE_COOPERATIVE_MATRIX_BF16: *value = s.slot->vk->features().coopMatrixBf16; return CUDA_SUCCESS;
+    case VULKANIZER_FEATURE_F16_ROUND_RTE: *value = s.slot->info->f16RoundRte; return CUDA_SUCCESS;
     }
     return CUDA_ERROR_INVALID_VALUE;
 }
@@ -767,6 +780,8 @@ CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attri
     VULKANIZER_TRACE_API();
     if (!validHandle(hfunc)) return CUDA_ERROR_INVALID_HANDLE;
     if (attrib == CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES) {
+        uint32_t param;  // Vulkanizer's own shaders have shared memory of their own (builtin_kernels.h)
+        if (matchBuiltinKernel(hfunc->entry->name, param) != BuiltinKernel::None) return CUDA_SUCCESS;
         int limit = 0;
         if (CUresult r = cuFuncGetAttribute(&limit, attrib, hfunc)) return r;
         if (value < 0 || value > limit) return CUDA_ERROR_INVALID_VALUE;

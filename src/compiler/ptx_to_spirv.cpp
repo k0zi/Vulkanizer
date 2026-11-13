@@ -73,6 +73,7 @@ public:
             error = "line " + std::to_string(perr.line) + ": " + perr.message;
             return false;
         }
+        ifConvert();
         if (!buildCfg(fn_, cfg_, error)) return false;
         if (!structurize(cfg_, st_, error)) return false;
         try {
@@ -542,30 +543,38 @@ private:
         return b_.op(spv::OpLoad, tU32(), {ptr});
     }
 
-    // Reads a scalar of type t at byte offset `off` (a u32 value, possibly dynamic) of the
-    // parameter buffer.
-    uint32_t paramAt(const ptx::Instruction& ins, uint32_t off, const PtxType& t) {
-        const uint32_t width = t.base == Base::Pred ? 8 : t.width;
-        if (paramsInBuffer_) {
-            const uint32_t base = canonical(pushU64(0));
-            Access a;
-            a.type = t;
-            if (width < 32 && !(width == 8 ? t_.storage8 : t_.storage16)) {
-                // read the containing word instead of a sub-word load
-                const uint32_t wordOff = b_.op(spv::OpBitwiseAnd, tU32(), {off, cU32(~3u)});
-                a.type = {Base::Bit, 32};
-                const uint32_t word = loadAt(ins, Space::Global, b_.op(spv::OpIAdd, tU64(), {base, extendTo64(wordOff, false)}), a)[0];
-                return narrow(b_.op(spv::OpShiftRightLogical, tU32(), {word, byteShift(off)}), width, t.isSigned());
-            }
-            return loadAt(ins, Space::Global, b_.op(spv::OpIAdd, tU64(), {base, extendTo64(off, false)}), a)[0];
+    // Word `index` (a u32 value) of the parameter buffer (paramsInBuffer_). Read through a block
+    // declared NonWritable: the driver can then use scalar loads through the constant cache for
+    // uniform offsets (RADV: s_load instead of a vector load per thread, then v_readfirstlane;
+    // PyTorch's TensorIterator kernels read hundreds of parameter words per element).
+    uint32_t paramBufferWord(uint32_t index) {
+        if (!paramBlockPointer_) {
+            const uint32_t arr = b_.typeArray(tU32(), std::max<uint32_t>(1, (e_.paramBytes + 3) / 4));
+            b_.decorate(arr, spv::DecorationArrayStride, {4});
+            const uint32_t st = b_.typeStruct({arr});
+            b_.decorate(st, spv::DecorationBlock);
+            b_.memberDecorate(st, 0, spv::DecorationOffset, {0});
+            b_.memberDecorate(st, 0, spv::DecorationNonWritable);
+            paramBlockPointer_ = b_.typePointer(spv::StorageClassPhysicalStorageBuffer, st);
         }
+        const uint32_t block = b_.op(spv::OpConvertUToPtr, paramBlockPointer_, {canonical(pushU64(0))});
+        const uint32_t ptr = b_.op(spv::OpAccessChain, b_.typePointer(spv::StorageClassPhysicalStorageBuffer, tU32()),
+                                   {block, cU32(0), index});
+        return b_.op(spv::OpLoad, tU32(), {ptr, uint32_t(spv::MemoryAccessAlignedMask), 4});
+    }
+
+    // Reads a scalar of type t at byte offset `off` (a u32 value, possibly dynamic) of the
+    // parameters (push constants, or the parameter buffer).
+    uint32_t paramAt(const ptx::Instruction&, uint32_t off, const PtxType& t) {
+        const uint32_t width = t.base == Base::Pred ? 8 : t.width;
+        auto word = [&](uint32_t index) { return paramsInBuffer_ ? paramBufferWord(index) : pushWordAt(index); };
         const uint32_t index = b_.op(spv::OpShiftRightLogical, tU32(), {off, cU32(2)});
         uint32_t bits;
         if (width == 64) {
-            const uint32_t lo = pushWordAt(index), hi = pushWordAt(b_.op(spv::OpIAdd, tU32(), {index, cU32(1)}));
+            const uint32_t lo = word(index), hi = word(b_.op(spv::OpIAdd, tU32(), {index, cU32(1)}));
             bits = b_.op(spv::OpBitcast, tU64(), {b_.op(spv::OpCompositeConstruct, b_.typeVector(tU32(), 2), {lo, hi})});
         } else {
-            bits = pushWordAt(index);
+            bits = word(index);
             if (width < 32)
                 bits = narrow(b_.op(spv::OpShiftRightLogical, tU32(), {bits, byteShift(off)}), width, t.isSigned());
         }
@@ -764,7 +773,7 @@ private:
 
     struct Access {
         PtxType type;
-        uint32_t count = 1;  // .v2 / .v4
+        uint32_t count = 1;  // .v2 / .v4 / .v8 (PTX 8.8: 32 bytes, .b32/.f32)
         Space space = Space::Generic;
         bool isVolatile = false;
     };
@@ -775,6 +784,7 @@ private:
         for (std::string_view m : ins.mods) {
             if (m == ".v2") a.count = 2;
             else if (m == ".v4") a.count = 4;
+            else if (m == ".v8") a.count = 8;
             else if (m == ".global" || m == ".const") a.space = Space::Global;
             else if (m == ".shared") a.space = Space::Shared;
             else if (m == ".local") a.space = Space::Local;
@@ -804,9 +814,20 @@ private:
         return out;
     }
 
+    // Global accesses of more than 4 elements (.v8) go as several of 4: SPIR-V vectors of 8 need the
+    // Vector16 capability, which Vulkan does not have.
     std::vector<uint32_t> loadAt(const ptx::Instruction& ins, Space sp, uint32_t addr, const Access& a) {
         std::vector<uint32_t> values;
         const uint32_t elemBytes = a.type.width / 8;
+        if (sp == Space::Global && a.count > 4) {
+            Access part = a;
+            part.count = 4;
+            for (uint32_t i = 0; i < a.count; i += 4) {
+                const uint32_t at = i ? b_.op(spv::OpIAdd, tU64(), {addr, cU64(i * elemBytes)}) : addr;
+                for (uint32_t v : loadAt(ins, sp, at, part)) values.push_back(v);
+            }
+            return values;
+        }
         if (sp == Space::Global) {
             const uint32_t type = memType(ins, a.type, a.count);
             std::vector<uint32_t> ops{globalPointer(addr, type), uint32_t(spv::MemoryAccessAlignedMask),
@@ -832,6 +853,15 @@ private:
     void storeAt(const ptx::Instruction& ins, Space sp, uint32_t addr, const Access& a,
                  const std::vector<uint32_t>& values) {
         const uint32_t elemBytes = a.type.width / 8;
+        if (sp == Space::Global && a.count > 4) {
+            Access part = a;
+            part.count = 4;
+            for (uint32_t i = 0; i < a.count; i += 4) {
+                const uint32_t at = i ? b_.op(spv::OpIAdd, tU64(), {addr, cU64(i * elemBytes)}) : addr;
+                storeAt(ins, sp, at, part, std::vector<uint32_t>(values.begin() + i, values.begin() + i + 4));
+            }
+            return;
+        }
         if (sp == Space::Global) {
             const uint32_t type = memType(ins, a.type, a.count);
             std::vector<uint32_t> parts;
@@ -882,8 +912,12 @@ private:
             writeBack(values);
             return;
         }
-        withSpace(acc.space, address(ins, addr, acc.space),
-                  [&](Space sp, uint32_t at) { writeBack(loadAt(ins, sp, at, a)); });
+        uint32_t at = address(ins, addr, acc.space);
+        // Run whatever the guard says (speculatively, see emitGuarded): where it is false, from memory
+        // that is always there.
+        if (speculate_ && (acc.space == Space::Global || acc.space == Space::Generic))
+            at = b_.op(spv::OpSelect, tU64(), {speculate_, at, speculationAddress()});
+        withSpace(acc.space, at, [&](Space sp, uint32_t at) { writeBack(loadAt(ins, sp, at, a)); });
     }
 
     // ld/st.param on a variable declared in the body: an inlined call's argument or result.
@@ -2570,6 +2604,43 @@ private:
         if (ins.operands.size() != (sync ? 5u : 4u)) fail(ins, "wrong number of shfl operands");
         const PtxType bt{Base::Bit, 32};
         const uint32_t a = value(ins, ins.operands[1], bt);
+        // Butterfly with a constant lane mask inside whole segments (warp reductions: c = 0x1f): an
+        // xor shuffle, which drivers do with cross-lane ALU operations (RADV: DPP / ds_swizzle) instead
+        // of a shuffle by computed lane (ds_bpermute, through the LDS). Masks under 32 stay within the
+        // warp's half of a 64-wide subgroup.
+        if (ins.has(".bfly") && nativeWarps() && ins.operands[2].kind == ptx::OperandKind::Immediate &&
+            ins.operands[3].kind == ptx::OperandKind::Immediate) {
+            const uint32_t mask = uint32_t(ins.operands[2].imm) & 31, cImm = uint32_t(ins.operands[3].imm);
+            const uint32_t seg = (cImm >> 8) & 31;
+            if ((cImm & 31) == 31 && (mask & seg) == 0) {
+                b_.capability(spv::CapabilityGroupNonUniformShuffle);
+                const ptx::Operand& d = ins.operands[0];
+                storeReg(ins, dstReg(ins).name, bt,
+                         b_.op(spv::OpGroupNonUniformShuffleXor, tU32(), {cU32(spv::ScopeSubgroup), a, cU32(mask)}));
+                if (!d.pairName.empty()) storeReg(ins, d.pairName, {Base::Pred, 1}, b_.constBool(true));
+                return;
+            }
+        }
+        // Up / down by a constant delta over the whole warp (c = 0x1f / 0): a relative shuffle, the
+        // lanes whose source lies outside the warp keep their own value. In a 64-wide subgroup the
+        // other half's lanes are such sources, so the subgroup's own edge needs no care.
+        if ((ins.has(".down") || ins.has(".up")) && nativeWarps() && t_.subgroupShuffleRelative &&
+            ins.operands[2].kind == ptx::OperandKind::Immediate && ins.operands[3].kind == ptx::OperandKind::Immediate) {
+            const uint32_t delta = uint32_t(ins.operands[2].imm) & 31, cImm = uint32_t(ins.operands[3].imm);
+            const bool down = ins.has(".down");
+            if (delta && (down ? cImm == 0x1f : cImm == 0)) {
+                b_.capability(spv::CapabilityGroupNonUniformShuffleRelative);
+                const uint32_t lane = laneId();
+                const uint32_t valid = down ? b_.op(spv::OpULessThanEqual, tBool(), {lane, cU32(31 - delta)})
+                                            : b_.op(spv::OpUGreaterThanEqual, tBool(), {lane, cU32(delta)});
+                const uint32_t moved = b_.op(down ? spv::OpGroupNonUniformShuffleDown : spv::OpGroupNonUniformShuffleUp,
+                                             tU32(), {cU32(spv::ScopeSubgroup), a, cU32(delta)});
+                const ptx::Operand& d = ins.operands[0];
+                storeReg(ins, dstReg(ins).name, bt, b_.op(spv::OpSelect, tU32(), {valid, moved, a}));
+                if (!d.pairName.empty()) storeReg(ins, d.pairName, {Base::Pred, 1}, valid);
+                return;
+            }
+        }
         const uint32_t bval = b_.op(spv::OpBitwiseAnd, tU32(), {value(ins, ins.operands[2], bt), cU32(31)});
         const uint32_t c = value(ins, ins.operands[3], bt);
         const uint32_t cval = b_.op(spv::OpBitwiseAnd, tU32(), {c, cU32(31)});
@@ -2900,7 +2971,105 @@ private:
         else fail(ins, "unsupported instruction '" + std::string(op) + "'");
     }
 
-    // Predicated instructions become a small selection construct.
+    // Instructions that can run whatever their guard says: no side effects, no traps, no waiting on
+    // other threads; loads only from global memory (with the address replaced where the guard is
+    // false, see emitLd) or kernel parameters at fixed offsets.
+    static bool speculatable(const ptx::Instruction& ins) {
+        static const std::unordered_set<std::string_view> kPure = {
+            "mov",  "add",  "sub",  "mul",   "mad",  "mul24", "mad24", "fma",  "div",  "rem",   "abs",
+            "neg",  "min",  "max",  "and",   "or",   "xor",   "not",   "cnot", "shl",  "shr",   "cvt",
+            "cvta", "setp", "selp", "set",   "slct", "rcp",   "sqrt",  "rsqrt", "ex2", "lg2",   "sin",
+            "cos",  "tanh", "bfe",  "bfi",   "prmt", "popc",  "clz",   "brev", "bfind", "copysign", "testp",
+            "sad",  "lop3", "shf",  "dp4a",  "dp2a"};
+        if (kPure.count(ins.opcode)) return true;
+        if (ins.opcode != "ld" && ins.opcode != "ldu") return false;
+        for (std::string_view m : ins.mods)
+            if (m == ".shared" || m == ".local" || m == ".volatile" || m == ".relaxed" || m == ".acquire" ||
+                m == ".cv" || m == ".mmio" || m.substr(0, 7) == ".shared")
+                return false;
+        if (ins.operands.size() != 2 || ins.operands[1].kind != ptx::OperandKind::Address) return false;
+        if (ins.has(".param")) return !ins.operands[1].baseIsRegister;
+        return true;
+    }
+
+    // Registers an instruction writes (operand 0: a register, a pair "%p|%q" or a vector).
+    static std::vector<std::string_view> destinations(const ptx::Instruction& ins) {
+        std::vector<std::string_view> out;
+        if (ins.operands.empty()) return out;
+        const ptx::Operand& d = ins.operands[0];
+        if (d.kind == ptx::OperandKind::Register) {
+            out.push_back(d.name);
+            if (!d.pairName.empty()) out.push_back(d.pairName);
+        } else if (d.kind == ptx::OperandKind::Vector) {
+            for (const ptx::Operand& e : d.elems)
+                if (e.kind == ptx::OperandKind::Register) out.push_back(e.name);
+        }
+        return out;
+    }
+
+    // The address of the device's speculation buffer (specialization constants 6 and 7). Built where it
+    // is used: an instruction result kept from another block may not dominate this use.
+    uint32_t speculationAddress() {
+        if (!speculationLo_) {
+            speculationLo_ = b_.specConstInt(32, 0, 6);
+            speculationHi_ = b_.specConstInt(32, 0, 7);
+        }
+        const uint32_t v2 = b_.typeVector(tU32(), 2);
+        return canonical(b_.op(spv::OpBitcast, tU64(), {b_.op(spv::OpCompositeConstruct, v2, {speculationLo_, speculationHi_})}));
+    }
+
+    // If-conversion: "@p bra L; <a few speculatable instructions>; L:" (bounds checks around a load
+    // and its use, e.g. PyTorch's softmax) becomes the instructions guarded by !p, without the branch.
+    // NVIDIA's assembler does the same; for the Vulkan driver the code stays in one basic block, where
+    // it can send the loads of several such pieces out before waiting for the first.
+    void ifConvert() {
+        constexpr size_t kMaxInstructions = 24;
+        auto& code = fn_.instructions;
+        std::unordered_map<std::string_view, size_t> labelAt;
+        std::vector<bool> labelled(code.size() + 1, false);
+        for (const ptx::Label& l : fn_.labels) {
+            labelAt[l.name] = l.index;
+            if (l.index <= code.size()) labelled[l.index] = true;
+        }
+        std::vector<bool> removed(code.size(), false);
+        bool any = false;
+        for (size_t i = 0; i < code.size(); ++i) {
+            const ptx::Instruction& br = code[i];
+            if (br.opcode != "bra" || br.guard.empty() || br.operands.size() != 1 ||
+                br.operands[0].kind != ptx::OperandKind::Symbol)
+                continue;
+            auto it = labelAt.find(br.operands[0].name);
+            if (it == labelAt.end()) continue;
+            const size_t end = it->second;
+            if (end <= i + 1 || end - i - 1 > kMaxInstructions) continue;
+            bool ok = true;
+            for (size_t k = i + 1; k < end && ok; ++k) {
+                const ptx::Instruction& in = code[k];
+                ok = !labelled[k] && in.guard.empty() && speculatable(in);
+                for (std::string_view d : destinations(in)) ok = ok && d != br.guard;
+            }
+            if (!ok) continue;
+            for (size_t k = i + 1; k < end; ++k) {
+                code[k].guard = br.guard;
+                code[k].guardNegated = !br.guardNegated;
+            }
+            removed[i] = any = true;
+            i = end - 1;
+        }
+        if (!any) return;
+        std::vector<size_t> newIndex(code.size() + 1);
+        std::vector<ptx::Instruction> kept;
+        kept.reserve(code.size());
+        for (size_t k = 0; k < code.size(); ++k) {
+            newIndex[k] = kept.size();
+            if (!removed[k]) kept.push_back(std::move(code[k]));
+        }
+        newIndex[code.size()] = kept.size();
+        code = std::move(kept);
+        for (ptx::Label& l : fn_.labels) l.index = newIndex[std::min(l.index, newIndex.size() - 1)];
+    }
+
+    // Predicated instructions become a small selection construct (or, for speculatable ones, a select).
     void emitGuarded(const ptx::Instruction& ins) {
         if (ins.guard.empty()) {
             emitInstruction(ins);
@@ -2908,6 +3077,24 @@ private:
         }
         uint32_t cond = loadReg(ins, ins.guard, {Base::Pred, 1});
         if (ins.guardNegated) cond = b_.op(spv::OpLogicalNot, tBool(), {cond});
+        if (speculatable(ins)) {
+            // Without side effects: run it whatever the guard, keep the result where it is true. A
+            // branch around it would end the basic block, and with it the driver's scheduling: loads
+            // under guards (bounds checks) could not be sent out ahead of the code that uses them.
+            std::vector<std::pair<const Reg*, uint32_t>> saved;
+            for (std::string_view name : destinations(ins)) {
+                const Reg& r = reg(ins, name);
+                saved.emplace_back(&r, b_.op(spv::OpLoad, r.storage, {r.var}));
+            }
+            speculate_ = cond;
+            emitInstruction(ins);
+            speculate_ = 0;
+            for (const auto& [r, old] : saved) {
+                const uint32_t now = b_.op(spv::OpLoad, r->storage, {r->var});
+                b_.opVoid(spv::OpStore, {r->var, b_.op(spv::OpSelect, r->storage, {cond, now, old})});
+            }
+            return;
+        }
         if (!nativeWarps() && isWarpOp(ins.opcode)) {
             // Emulated warp operations synchronize the workgroup (barriers around a scratch area),
             // so every thread must reach them: all run the instruction, and the guard decides whose
@@ -3197,6 +3384,9 @@ private:
     uint32_t pushVar_ = 0, pushBytes_ = 0;
     std::unordered_map<std::string_view, Symbol> symbols_;
     uint32_t sharedStatic_ = 0, localBytes_ = 0, globalsOffset_ = 0, gridOffset_ = 0;
+    uint32_t paramBlockPointer_ = 0;
+    uint32_t speculate_ = 0;             // emitGuarded: the guard of the instruction run speculatively
+    uint32_t speculationLo_ = 0, speculationHi_ = 0;  // specialization constants 6 and 7 (speculationAddress)
     bool paramsInBuffer_ = false, usesGrid_ = false, usesPrintf_ = false, usesAssert_ = false, usesWorkspace_ = false;
     uint32_t printfOffset_ = 0, assertOffset_ = 0;
     uint32_t workspaceOffset_ = 0;

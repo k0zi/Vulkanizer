@@ -163,16 +163,18 @@ Los wheels oficiales de PyTorch solo contienen código máquina nativo de NVIDIA
 puede ejecutar sus kernels. Las versiones CUDA de conda-forge incluyen también PTX (`compute_120`):
 `tools/setup_torch.sh` las instala con micromamba, sin instalación a nivel de sistema. `run_torch.sh` carga `libcuda`,
 `libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft`, `libcusparse` y `libcurand` de Vulkanizer en lugar
-de las de NVIDIA y desactiva todo lo que requiere hardware o bibliotecas de NVIDIA: cuDNN, los kernels de atención
-fusionados (`scaled_dot_product_attention` usa la ruta matemática) y los kernels DSL de `torch._native`
-(`TORCH_DISABLE_NATIVE_JIT=1`): sus kernels Triton funcionan, pero sus kernels CuTe DSL se compilan a SASS, y el mismo
-interruptor apaga ambos. `VULKANIZER_TORCH_DEFAULTS=0` omite todo esto. Triton en sí (`torch.compile`, `@triton.jit`)
-funciona: `tools/triton/ptxas` deja pasar el PTX de Triton en lugar de ensamblarlo, y el lanzador de Triton se compila
-contra `include/cuda.h` de Vulkanizer (requiere un compilador de C). `torch.linalg` (LU, Cholesky, QR, mínimos
-cuadrados, `eigh`, SVD, `pinv`, ...) se ejecuta sobre el cuSOLVER de Vulkanizer y `torch.fft` (también `stft`) sobre su
-cuFFT y `torch.sparse` sobre su cuSPARSE; `run_torch.sh` fija `TORCH_LINALG_PREFER_CUSOLVER=1`, ya que los kernels
-propios de MAGMA no se ejecutan. El jiterator de PyTorch compila sus kernels en tiempo de ejecución con NVRTC a código
-nativo; una biblioteca `LD_AUDIT` (`libvulkanizer_nvrtc.so`) hace que entregue el PTX en su lugar.
+de las de NVIDIA y desactiva todo lo que requiere hardware o bibliotecas de NVIDIA: cuDNN, los kernels de flash
+attention y los kernels DSL de `torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`): sus kernels Triton funcionan, pero sus
+kernels CuTe DSL se compilan a SASS, y el mismo interruptor apaga ambos. `VULKANIZER_TORCH_DEFAULTS=0` omite todo esto.
+Los kernels de atención memory-efficient de PyTorch se ejecutan como la atención fusionada propia de Vulkanizer (f16 con
+dimensión de cabeza hasta 128, en matrices cooperativas; si no, `scaled_dot_product_attention` usa la ruta matemática;
+`VULKANIZER_FUSED_ATTENTION=0` la desactiva). Triton en sí (`torch.compile`, `@triton.jit`) funciona:
+`tools/triton/ptxas` deja pasar el PTX de Triton en lugar de ensamblarlo, y el lanzador de Triton se compila contra
+`include/cuda.h` de Vulkanizer (requiere un compilador de C). `torch.linalg` (LU, Cholesky, QR, mínimos cuadrados,
+`eigh`, SVD, `pinv`, ...) se ejecuta sobre el cuSOLVER de Vulkanizer y `torch.fft` (también `stft`) sobre su cuFFT y
+`torch.sparse` sobre su cuSPARSE; `run_torch.sh` fija `TORCH_LINALG_PREFER_CUSOLVER=1`, ya que los kernels propios de
+MAGMA no se ejecutan. El jiterator de PyTorch compila sus kernels en tiempo de ejecución con NVRTC a código nativo; una
+biblioteca `LD_AUDIT` (`libvulkanizer_nvrtc.so`) hace que entregue el PTX en su lugar.
 
 ### 6. ComfyUI
 
@@ -376,7 +378,8 @@ Lista completa: [plan.md, sección 4](plan.md).
   revalida las páginas importadas, ~4 ms por 256 MB). La memoria fijada y la managed no se ven afectadas.
 - La flash attention de llama.cpp funciona correctamente (`tools/build_llama.sh --fa`), pero sin tensor cores el
   procesamiento del prompt es más lento con ella, por eso está desactivada por defecto.
-- PyTorch: sin kernels de cuDNN ni de atención fusionada.
+- PyTorch: sin cuDNN; de los kernels de atención fusionados solo los memory-efficient hacia delante (f16, dimensión de
+  cabeza hasta 128, sin dropout ni retropropagación).
 - cuSOLVER: solo tipos reales (f32, f64), sin `gesvda`, LDL^T (`sytrf`) ni problemas de valores propios no simétricos
   (`geev`); `eigh` de una matriz la tridiagonaliza (Householder) y resuelve en el host (QL); `eigh` por lotes y la SVD
   usan iteraciones de Jacobi, la SVD es lenta para matrices grandes (n ≳ 1000). cuFFT: sin callbacks ni planes

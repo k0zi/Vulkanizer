@@ -69,6 +69,7 @@ struct Features {
     bool sharedMemory = false;      // allocateShared / importShared (dma-buf): staging between devices
     // S of the S x S x S f16 x f16 -> f32 cooperative matrices of subgroup scope (16 or 8), 0 if none
     uint32_t coopMatrixSize = 0;
+    bool coopMatrixBf16 = false;  // also bf16 x bf16 -> f32 ones of size 16 (VK_KHR_shader_bfloat16)
 };
 
 // One page range of a sparse buffer bound to `memory` (or unbound if VK_NULL_HANDLE).
@@ -277,6 +278,9 @@ private:
     void collectTimings(Batch& b);
     VkResult recordDispatch(const ComputePipeline& p, const uint32_t base[3], const uint32_t count[3],
                             const void* pushData, uint32_t pushSize, const char* label, double estimateNs, bool timed);
+    VkResult dispatchChunks(const ComputePipeline& p, const uint32_t origin[3], const uint32_t extent[3],
+                            std::vector<uint8_t>& push, uint32_t pushSize, const char* label, const void* params,
+                            size_t paramsSize, uint64_t& uploaded);
     // Uploads `params` into the open batch unless already done (uploadedSerial) and patches the
     // address into push[0..8).
     VkResult uploadParams(const void* params, size_t size, std::vector<uint8_t>& push, uint64_t& uploadedSerial);
@@ -355,9 +359,37 @@ private:
     VkResult allocateDedicated(VkDeviceSize size, Buffer& out);
     VkResult subAllocate(VkDeviceSize size, Buffer& out);
     void releaseSubAllocation(Buffer& buf);
+    // Memory kernels may read without using the result (createComputePipeline: specialization constants 6
+    // and 7); at least the largest single load (32 bytes).
+    static constexpr VkDeviceSize kSpeculationBytes = 256;
+    Buffer speculation_;
     Buffer readStaging_;  // host-cached, two kReadChunk halves (read)
     Buffer writeStaging_;  // system memory, two kReadChunk halves (write to a discrete GPU)
-    uint64_t writeStagingSerial_[2] = {0, 0};  // the copy out of each half
+    uint64_t writeStagingSerial_[2] = {0, 0};  // the copy out of each half (copyDone_ value with a copy queue)
+    // Copy queue (PhysicalDeviceInfo::copyQueueFamily, needs timeline semaphores): the staged copies
+    // of large write()s and read()s. A copy waits for progress_ to reach the compute work recorded
+    // before it and signals copyDone_; the compute batch after it waits for that (copyWait_). Buffers
+    // are shared by both queue families (VK_SHARING_MODE_CONCURRENT).
+    VkQueue copyQueue_ = VK_NULL_HANDLE;
+    VkCommandPool copyPool_ = VK_NULL_HANDLE;
+    static constexpr uint32_t kCopySlots = 8;
+    VkCommandBuffer copyCmd_[kCopySlots] = {};
+    uint64_t copyCmdValue_[kCopySlots] = {};  // copyDone_ value of each command buffer's last submission
+    uint32_t nextCopySlot_ = 0;
+    VkSemaphore copyDone_ = VK_NULL_HANDLE;
+    uint64_t copyValue_ = 0;  // last value submitted
+    uint64_t copyWait_ = 0;   // the next batch submitted waits for copyDone_ >= this (0: none)
+    uint32_t sharingFamilies_[2] = {};
+    void setSharing(VkBufferCreateInfo& bci) const;
+    // Records `commands` into the next copy command buffer (once its last submission completed) and
+    // submits it after the compute work up to `after` (progress_ value, 0: none); `value` receives
+    // the copyDone_ value it signals.
+    VkResult submitCopy(uint64_t after, const std::function<void(VkCommandBuffer)>& commands, uint64_t& value);
+    // Makes the compute work recorded next wait for the copies submitted so far (an empty batch now,
+    // so that finish() and the serials cover them).
+    VkResult joinCopies();
+    static constexpr VkDeviceSize kCopyQueueMin = 1 << 20;  // copy() between host and device memory
+    VkResult waitCopy(uint64_t value);
     // Mapped system memory (allocateSystem: write-combined where there is a choice), exportable as
     // a dma-buf with `dmaBuf`.
     VkResult allocateSystem(VkDeviceSize size, VkBufferUsageFlags usage, bool dmaBuf, Buffer& out);

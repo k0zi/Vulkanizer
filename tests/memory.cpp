@@ -88,6 +88,40 @@ int main() {
     CHECK_CU(cuMemFree(b));
     EXPECT_CU(CUDA_ERROR_INVALID_VALUE, cuMemFree(a));
 
+    // Stream order between device work and large host <-> device copies (staged in several chunks,
+    // or straight from pinned memory; on a discrete GPU they run on a queue of their own).
+    {
+        constexpr size_t M = 6 << 20;  // 24 MiB
+        std::vector<uint32_t> src(M), out(M);
+        for (size_t i = 0; i < M; ++i) src[i] = static_cast<uint32_t>(i * 2246822519u + 1);
+        uint32_t* pinned = nullptr;
+        CHECK_CU(cuMemAllocHost(reinterpret_cast<void**>(&pinned), M * 4));
+        CUdeviceptr x, y;
+        CHECK_CU(cuMemAlloc(&x, M * 4));
+        CHECK_CU(cuMemAlloc(&y, M * 4));
+        CUstream st;
+        CHECK_CU(cuStreamCreate(&st, CU_STREAM_NON_BLOCKING));
+        for (int round = 0; round < 3; ++round) {
+            CHECK_CU(cuMemsetD32Async(x, 0x11111111u, M, st));
+            CHECK_CU(cuMemcpyHtoDAsync(x, src.data(), M * 4, st));  // after the memset
+            CHECK_CU(cuMemcpyDtoDAsync(y, x, M * 4, st));            // sees the upload
+            CHECK_CU(cuMemsetD32Async(x, 0x22222222u, M, st));       // after the copy read x
+            CHECK_CU(cuMemcpyDtoHAsync(pinned, y, M * 4, st));      // pinned: after the DtoD
+            CHECK_CU(cuMemsetD32Async(y, 0x33333333u, M, st));       // after the download read y
+            CHECK_CU(cuMemcpyHtoDAsync(y + 4, pinned, M * 4 - 4, st));  // pinned upload over the memset
+            CHECK_CU(cuStreamSynchronize(st));
+            EXPECT(std::memcmp(pinned, src.data(), M * 4) == 0);
+            CHECK_CU(cuMemcpyDtoH(out.data(), y, M * 4));
+            EXPECT(out[0] == 0x33333333u && std::memcmp(out.data() + 1, src.data(), M * 4 - 4) == 0);
+            CHECK_CU(cuMemcpyDtoH(out.data(), x, M * 4));
+            EXPECT(out[0] == 0x22222222u && out[M - 1] == 0x22222222u);
+        }
+        CHECK_CU(cuStreamDestroy(st));
+        CHECK_CU(cuMemFree(x));
+        CHECK_CU(cuMemFree(y));
+        CHECK_CU(cuMemFreeHost(pinned));
+    }
+
     // An allocation larger than one Vulkan allocation may be (RADV: 4 GiB): one contiguous range,
     // copies and memsets across the 4 GiB boundary, the whole range from an interior pointer.
     size_t freeBytes = 0, totalBytes = 0;

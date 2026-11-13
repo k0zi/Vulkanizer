@@ -1,0 +1,88 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+#if ELEM == 2
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+// PyTorch's im2col_kernel (aten/src/ATen/native/cuda/im2col.cuh) in place of its translated PTX
+// (driver/im2col.cpp): the columns of one image for a convolution as a GEMM,
+//   col[((c * kh + i) * kw + j) * hcol * wcol + y * wcol + x] = im[c][y * sh - ph + i * dh][x * sw - pw + j * dw]
+// (0 outside the image), for elements of ELEM bytes (2, 4 or 8; the values are only moved). An invocation
+// makes VW = 16 / ELEM consecutive x of one row (c, y): for each (i, j) its VW loads go out together and
+// the result is one 16-byte store (PyTorch's kernel loads and stores one element at a time, and its
+// loads cannot pass its stores).
+
+layout(local_size_x = 64) in;
+
+#if ELEM == 2
+#define Elem uint16_t
+#elif ELEM == 4
+#define Elem uint
+#else
+#define Elem uvec2
+#endif
+const int VW = 16 / ELEM;
+
+layout(buffer_reference, std430, buffer_reference_align = ELEM) buffer Elems { Elem v; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer Vec { uvec4 v; };
+
+layout(push_constant, std430) uniform Push {
+    uint64_t im, col;
+    int channels, height, width, kh, kw, ph, pw, sh, sw, dh, dw, hcol, wcol;
+    uint vectorStores;  // col 16-byte aligned and wcol a multiple of VW
+} p;
+
+// The device's address bits 63..47 (vk::Device::addressHighBits), specialization constant 5.
+layout(constant_id = 5) const uint kAddressHigh = 0xFFFF8000u;
+uint64_t canon(uint64_t a) {
+    uvec2 w = unpackUint2x32(a);
+    w.y |= kAddressHigh;
+    return packUint2x32(w);
+}
+
+uvec4 pack(Elem v[VW]) {
+#if ELEM == 2
+    return uvec4(uint(v[0]) | uint(v[1]) << 16, uint(v[2]) | uint(v[3]) << 16, uint(v[4]) | uint(v[5]) << 16,
+                 uint(v[6]) | uint(v[7]) << 16);
+#elif ELEM == 4
+    return uvec4(v[0], v[1], v[2], v[3]);
+#else
+    return uvec4(v[0], v[1]);
+#endif
+}
+
+void main() {
+    const int chunks = (p.wcol + VW - 1) / VW;
+    const int64_t id = int64_t(gl_GlobalInvocationID.x);
+    if (id >= int64_t(p.channels) * p.hcol * chunks) return;
+    const int x0 = int(id % chunks) * VW;
+    const int64_t row = id / chunks;
+    const int y = int(row % p.hcol), c = int(row / p.hcol);
+    const uint64_t im = canon(p.im), col = canon(p.col);
+    const int64_t plane = int64_t(p.hcol) * p.wcol;
+    const int64_t imPlane = int64_t(c) * p.height * p.width;
+    for (int i = 0; i < p.kh; ++i) {
+        const int h = y * p.sh - p.ph + i * p.dh;
+        const bool rowInside = h >= 0 && h < p.height;
+        const int64_t imRow = imPlane + int64_t(clamp(h, 0, p.height - 1)) * p.width;
+        for (int j = 0; j < p.kw; ++j) {
+            Elem v[VW];
+            [[unroll]] for (int e = 0; e < VW; ++e) {
+                const int w = (x0 + e) * p.sw - p.pw + j * p.dw;
+                // the load is from a valid address either way (it may be made unconditional)
+                const Elem x = Elems(im + uint64_t(imRow + clamp(w, 0, p.width - 1)) * uint64_t(ELEM)).v;
+                v[e] = rowInside && w >= 0 && w < p.width && x0 + e < p.wcol ? x : Elem(0);
+            }
+            const int64_t at = (int64_t((c * p.kh + i) * p.kw + j)) * plane + int64_t(y) * p.wcol + x0;
+            if (p.vectorStores != 0u) {
+                Vec(col + uint64_t(at) * uint64_t(ELEM)).v = pack(v);
+            } else {
+                [[unroll]] for (int e = 0; e < VW; ++e)
+                    if (x0 + e < p.wcol) Elems(col + uint64_t(at + e) * uint64_t(ELEM)).v = v[e];
+            }
+        }
+    }
+}

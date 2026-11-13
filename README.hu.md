@@ -162,10 +162,12 @@ A hivatalos PyTorch wheelekben csak natív NVIDIA gépi kód (SASS) van, PTX nin
 kerneleiket. A conda-forge CUDA-buildjei PTX-et is tartalmaznak (`compute_120`): a `tools/setup_torch.sh` ezeket
 telepíti micromambával, rendszerszintű telepítés nélkül. A `run_torch.sh` az NVIDIA-é helyett a Vulkanizer `libcuda`,
 `libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft`, `libcusparse` és `libcurand` könyvtárait tölti be,
-és kikapcsol mindent, ami NVIDIA hardvert vagy könyvtárat igényel: a cuDNN-t, a fúzionált attention kerneleket (a
-`scaled_dot_product_attention` a math úton fut) és a `torch._native` DSL-kerneleit (`TORCH_DISABLE_NATIVE_JIT=1`): a
-Triton-kernelei működnek, a CuTe DSL kernelei viszont SASS-ra fordulnak, és ugyanaz az egy kapcsoló mindkettőt tiltja. A
-`VULKANIZER_TORCH_DEFAULTS=0` mindezt kihagyja. Maga a Triton (`torch.compile`, `@triton.jit`) működik: a
+és kikapcsol mindent, ami NVIDIA hardvert vagy könyvtárat igényel: a cuDNN-t, a flash attention kerneleket és a
+`torch._native` DSL-kerneleit (`TORCH_DISABLE_NATIVE_JIT=1`): a Triton-kernelei működnek, a CuTe DSL kernelei viszont
+SASS-ra fordulnak, és ugyanaz az egy kapcsoló mindkettőt tiltja. A `VULKANIZER_TORCH_DEFAULTS=0` mindezt kihagyja. A
+PyTorch memory-efficient attention kernelei a Vulkanizer saját fúzionált attentionjeként futnak (f16, legfeljebb 128-as
+fejméret, kooperatív mátrixokon; egyébként a `scaled_dot_product_attention` a math úton fut; a
+`VULKANIZER_FUSED_ATTENTION=0` kikapcsolja). Maga a Triton (`torch.compile`, `@triton.jit`) működik: a
 `tools/triton/ptxas` továbbadja a Triton PTX-ét ahelyett, hogy lefordítaná, a Triton launchere pedig a Vulkanizer
 `include/cuda.h`-ja ellen fordul (C-fordító kell hozzá). A `torch.linalg` (LU, Cholesky, QR, legkisebb négyzetek,
 `eigh`, SVD, `pinv`, ...) a Vulkanizer cuSOLVER-én, a `torch.fft` (a `stft` is) a cuFFT-jén, a `torch.sparse` a
@@ -207,8 +209,8 @@ Ezután nyisd meg a <http://127.0.0.1:8188> címet. A modellek a szokott módon 
 - A DynamicVRAM (comfy-aimdo) a Vulkanizer virtuális memóriakezelésén fut (VMM, sparse bufferek). Ha gondot okoz, a
   `--disable-dynamic-vram` visszavált a becslés alapú modellbetöltésre.
 - A `tools/torch/sitecustomize.py` csak akkor alkalmazza a PyTorch-beállításokat, amikor a ComfyUI importálja a
-  torch-ot, és a fúzionált attention backendeket akkor is kikapcsolva tartja, ha a ComfyUI visszakapcsolja őket: az
-  attention a math úton fut.
+  torch-ot, és a flash és cuDNN attention backendeket akkor is kikapcsolva tartja, ha a ComfyUI visszakapcsolja őket: az
+  attention a Vulkanizer fúzionált attentionjén (f16) vagy a math úton fut.
 - A ComfyUI-Manager „PyTorch is not installed” üzenete a hiányzó `torchaudio` miatt jön (a conda-forge-on nincs build
   a torch 2.14-hez); a képgeneráláshoz nem kell.
 - Az első generálás lassú, amíg a kernelek SPIR-V-re fordulnak; a későbbi futások a gyorsítótárból töltik őket.
@@ -371,7 +373,8 @@ Teljes lista: [plan.md, 4. szakasz](plan.md).
   újraellenőrzi az importált lapokat, ~4 ms / 256 MB). A pinned és a managed memóriát ez nem érinti.
 - A llama.cpp flash attention helyesen fut (`tools/build_llama.sh --fa`), de tensor core-ok nélkül vele lassabb a
   prompt feldolgozása, ezért alapból ki van kapcsolva.
-- PyTorch: nincsenek cuDNN- és fúzionált attention kernelek.
+- PyTorch: nincs cuDNN; a fúzionált attention kernelek közül csak a memory-efficient forward kernelek futnak (f16,
+  legfeljebb 128-as fejméret, dropout és backward nélkül).
 - cuSOLVER: csak valós típusok (f32, f64), nincs `gesvda`, LDL^T (`sytrf`) és nem szimmetrikus sajátérték-feladat
   (`geev`); egy mátrix `eigh`-ja tridiagonalizál (Householder) és a hoston old meg (QL); a batch-elt `eigh` és az
   SVD Jacobi-iterációt használ, az SVD nagy mátrixokra (n ≳ 1000) lassú. cuFFT: nincsenek callbackek és több GPU-s

@@ -28,6 +28,7 @@ struct PhysicalDeviceInfo {
     uint8_t uuid[VK_UUID_SIZE]{};
     uint32_t computeQueueFamily = 0;
     bool computeQueueSparse = false;  // the compute queue family supports sparse binding
+    uint32_t copyQueueFamily = 0;     // host <-> device copies; == computeQueueFamily: no queue of their own
     uint32_t computeUnits = 0;        // active compute units (VK_AMD_shader_core_properties2); 0: unknown
     uint32_t ordinal = 0;             // index in Instance::devices() (the CUDA device ordinal)
     bool hasPciInfo = false;          // VK_EXT_pci_bus_info

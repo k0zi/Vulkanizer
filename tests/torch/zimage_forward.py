@@ -4,7 +4,7 @@
 # summation order). Needs a ComfyUI checkout with its venv-vulkanizer environment and the Z-Image
 # Turbo models (README, "ComfyUI"); takes a few minutes and ~25 GB RAM.
 #
-#   python3 tests/torch/zimage_forward.py [--comfy DIR] [--env DIR] [--out DIR]
+#   python3 tests/torch/zimage_forward.py [--comfy DIR] [--env DIR] [--out DIR] [--extra-model-paths YAML]
 #
 # The steps run in their own processes (`zimage_forward.py STEP OUT`, from the ComfyUI directory):
 #   cond   text encoder on the CPU (fp32) -> OUT/cond.pt
@@ -32,6 +32,9 @@ def run_step(step, out):
     import comfy.sd
     import folder_paths
     import nodes
+    if os.environ.get("ZIMAGE_EXTRA_MODEL_PATHS"):  # ComfyUI's --extra-model-paths-config
+        from utils.extra_config import load_extra_path_config
+        load_extra_path_config(os.environ["ZIMAGE_EXTRA_MODEL_PATHS"])
     from comfy_extras.nodes_model_advanced import ModelSamplingAuraFlow
 
     if step == "cond":
@@ -75,6 +78,8 @@ def main():
     env = Path(opt("--env", comfy / "venv-vulkanizer")).resolve()
     out = Path(opt("--out", root / ".work/zimage_forward")).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if "--extra-model-paths" in args:
+        os.environ["ZIMAGE_EXTRA_MODEL_PATHS"] = str(Path(opt("--extra-model-paths", "")).resolve())
     python = str(env / "bin/python")
     for step in STEPS:
         cmd = [python, __file__, step, str(out)]

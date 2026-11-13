@@ -160,7 +160,7 @@ PyTorch の公式 wheel には NVIDIA のネイティブ機械語（SASS）し�
 実行できません。conda-forge の CUDA ビルドは PTX（`compute_120`）も同梱しています。`tools/setup_torch.sh` はそれを
 micromamba で、システム全体へのインストールなしで導入します。`run_torch.sh` は NVIDIA のものの代わりに Vulkanizer の
 `libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver`、`libcufft`、`libcusparse`、`libcurand` を読み込み、NVIDIA のハードウェアやライブラリを必要とする機能を
-すべて無効にします：cuDNN、融合 attention カーネル（`scaled_dot_product_attention` は math パスで実行）、そして
+すべて無効にします：cuDNN、flash attention カーネル、そして
 `torch._native` の DSL カーネル（`TORCH_DISABLE_NATIVE_JIT=1`）です。その Triton カーネルは動作しますが、CuTe DSL
 カーネルは SASS にコンパイルされ、同じ 1 つのスイッチで両方が無効になります。`VULKANIZER_TORCH_DEFAULTS=0` で
 これらの設定を省略できます。
@@ -205,7 +205,7 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - DynamicVRAM（comfy-aimdo）は Vulkanizer の仮想メモリ管理（VMM、スパースバッファ）上で動作します。問題が起きた場合は
   `--disable-dynamic-vram` で推定ベースのモデル読み込みに戻せます。
 - `tools/torch/sitecustomize.py` は ComfyUI が torch を import した時点で初めて PyTorch の設定を適用し、ComfyUI が
-  融合 attention バックエンドを再び有効にしても無効のまま保ちます。attention は math パスで実行されます。
+  flash と cuDNN の attention バックエンドを再び有効にしても無効のまま保ちます。attention は Vulkanizer の融合 attention（f16）か math パスで実行されます。
 - ComfyUI-Manager の「PyTorch is not installed」というメッセージは `torchaudio` がないためです（conda-forge には
   torch 2.14 向けのビルドがありません）。画像生成には不要です。
 - 初回の生成はカーネルを SPIR-V にコンパイルするため遅くなります。以降の実行はキャッシュから読み込みます。
@@ -367,7 +367,9 @@ Qwen3.6-35B-A3B Q5_K_XL（25 GiB、eGPU 1 台には収まらない）：
   するため、256 MB あたり約 4 ms）。ピン留めメモリとマネージドメモリは影響を受けません。
 - llama.cpp の flash attention は正しく動作します（`tools/build_llama.sh --fa`）が、tensor core がない環境では
   プロンプト処理が遅くなるため、既定では無効です。
-- PyTorch：cuDNN と融合 attention のカーネルはありません。
+- PyTorch：cuDNN はありません。融合 attention カーネルのうち動くのは memory-efficient の forward カーネルのみです（f16、ヘッド次元 128
+  まで、dropout と backward なし。PyTorch の memory-efficient カーネルは Vulkanizer 独自の融合 attention として実行され、
+  `VULKANIZER_FUSED_ATTENTION=0` で無効にできます）。
 - cuSOLVER：実数型（f32、f64）のみで、`gesvda`、LDL^T（`sytrf`）、非対称固有値問題（`geev`）はありません。単一行列の
   `eigh` は Householder 法で三重対角化し、ホストで QL 法により解きます。バッチの `eigh` と SVD は Jacobi 反復を使い、
   SVD は大きな行列（n ≳ 1000）では遅くなります。cuFFT：コールバックとマルチ GPU プランはありません。長さが 2048

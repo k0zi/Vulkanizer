@@ -162,14 +162,16 @@ The official PyTorch wheels contain only native NVIDIA machine code (SASS), no P
 kernels. The conda-forge CUDA builds also ship PTX (`compute_120`): `tools/setup_torch.sh` installs these with
 micromamba, without a system-wide install. `run_torch.sh` loads Vulkanizer's `libcuda`, `libcudart`, `libcublas`,
 `libcublasLt`, `libcusolver`, `libcufft`, `libcusparse` and `libcurand` instead of NVIDIA's, and disables everything
-that requires NVIDIA hardware or libraries: cuDNN, the fused attention kernels (so `scaled_dot_product_attention` runs
-on the math path) and the DSL kernels of `torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`): its Triton kernels work, but
-its CuTe DSL kernels compile to SASS and the one switch turns off both. `VULKANIZER_TORCH_DEFAULTS=0` skips this. Triton
-itself (`torch.compile`, `@triton.jit`) works: `tools/triton/ptxas` hands Triton's PTX through instead of assembling it,
-and Triton's launcher is built against Vulkanizer's `include/cuda.h` (needs a C compiler). `torch.linalg` (LU, Cholesky,
-QR, least squares, `eigh`, SVD, `pinv`, ...) runs on Vulkanizer's cuSOLVER and `torch.fft` (including `stft`) on its
-cuFFT, `torch.sparse` on its cuSPARSE; `run_torch.sh` sets `TORCH_LINALG_PREFER_CUSOLVER=1`, since MAGMA's own kernels
-do not run. PyTorch's jiterator compiles its kernels at run time with NVRTC to native code; an `LD_AUDIT` library
+that requires NVIDIA hardware or libraries: cuDNN, the flash attention kernels and the DSL kernels of `torch._native`
+(`TORCH_DISABLE_NATIVE_JIT=1`): its Triton kernels work, but its CuTe DSL kernels compile to SASS and the one switch
+turns off both. `VULKANIZER_TORCH_DEFAULTS=0` skips this. PyTorch's memory-efficient attention kernels run as
+Vulkanizer's own fused attention (f16 with head dimensions up to 128, on cooperative matrices; otherwise
+`scaled_dot_product_attention` takes the math path; `VULKANIZER_FUSED_ATTENTION=0` turns it off). Triton itself
+(`torch.compile`, `@triton.jit`) works: `tools/triton/ptxas` hands Triton's PTX through instead of assembling it, and
+Triton's launcher is built against Vulkanizer's `include/cuda.h` (needs a C compiler). `torch.linalg` (LU, Cholesky, QR,
+least squares, `eigh`, SVD, `pinv`, ...) runs on Vulkanizer's cuSOLVER and `torch.fft` (including `stft`) on its cuFFT,
+`torch.sparse` on its cuSPARSE; `run_torch.sh` sets `TORCH_LINALG_PREFER_CUSOLVER=1`, since MAGMA's own kernels do not
+run. PyTorch's jiterator compiles its kernels at run time with NVRTC to native code; an `LD_AUDIT` library
 (`libvulkanizer_nvrtc.so`) makes it hand over the PTX instead.
 
 ### 6. ComfyUI
@@ -205,8 +207,9 @@ Then open <http://127.0.0.1:8188>. Models go into `models/` as usual. Notes:
 - `--disable-cuda-malloc`: ComfyUI's `cudaMallocAsync` allocator backend is not used.
 - DynamicVRAM (comfy-aimdo) runs on Vulkanizer's virtual memory management (VMM, sparse buffers). If it causes
   trouble, `--disable-dynamic-vram` switches back to estimate based model loading.
-- `tools/torch/sitecustomize.py` applies the PyTorch settings only when ComfyUI imports torch, and keeps
-  the fused attention backends off even though ComfyUI re-enables them: attention runs on the math path.
+- `tools/torch/sitecustomize.py` applies the PyTorch settings only when ComfyUI imports torch, and keeps the flash and
+  cuDNN attention backends off even though ComfyUI re-enables them: attention runs on Vulkanizer's fused attention (f16)
+  or on the math path.
 - The ComfyUI-Manager "PyTorch is not installed" message comes from the missing `torchaudio` (conda-forge has
   no build for torch 2.14); image generation does not need it.
 - The first generation is slow while the kernels are compiled to SPIR-V; later runs load them from the cache.
@@ -368,7 +371,8 @@ Full list: [plan.md, section 4](plan.md).
   revalidates the imported pages, ~4 ms per 256 MB). Pinned and managed memory are not affected.
 - llama.cpp flash attention runs correctly (`tools/build_llama.sh --fa`), but without tensor cores prompt
   processing is slower with it, so it is off by default.
-- PyTorch: no cuDNN or fused attention kernels.
+- PyTorch: no cuDNN; of the fused attention kernels only the memory-efficient forward ones (f16, head dimensions up
+  to 128, no dropout, no backward).
 - cuSOLVER: real types (f32, f64) only, no `gesvda`, LDL^T (`sytrf`) or non-symmetric eigenproblems (`geev`); `eigh`
   of one matrix tridiagonalizes it (Householder) and solves on the host (QL); batched `eigh` and SVD use Jacobi
   iterations, the SVD is slow for large matrices (n ≳ 1000). cuFFT: no callbacks or multi-GPU plans; transforms longer

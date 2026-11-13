@@ -43,7 +43,8 @@ const uint32_t kGemmF16TnMSpirv[] = {
 const uint32_t kGemmF16TnMHSpirv[] = {
 #include "gemm_f16_tn_mh.comp.inc"
 };
-// gemm_coopmat.comp: S = 16 and 8, each with f32 and f16 C
+// gemm_coopmat.comp: S = 16 (128 x 128 tiles with one or two shared buffers, 64 x 64 tiles) with f16 inputs
+// and f32 or f16 C, bf16 inputs and f32 or bf16 C; S = 8 with f16 inputs and f32 or f16 C
 const uint32_t kGemmCoop16Spirv[] = {
 #include "gemm_coopmat16.comp.inc"
 };
@@ -55,6 +56,30 @@ const uint32_t kGemmCoop16SSpirv[] = {
 };
 const uint32_t kGemmCoop16SHSpirv[] = {
 #include "gemm_coopmat16s_h.comp.inc"
+};
+const uint32_t kGemmCoop16BSpirv[] = {
+#include "gemm_coopmat16_b.comp.inc"
+};
+const uint32_t kGemmCoop16BBSpirv[] = {
+#include "gemm_coopmat16_bb.comp.inc"
+};
+const uint32_t kGemmCoop16SBSpirv[] = {
+#include "gemm_coopmat16s_b.comp.inc"
+};
+const uint32_t kGemmCoop16SBBSpirv[] = {
+#include "gemm_coopmat16s_bb.comp.inc"
+};
+const uint32_t kGemmCoop16DSpirv[] = {
+#include "gemm_coopmat16d.comp.inc"
+};
+const uint32_t kGemmCoop16DHSpirv[] = {
+#include "gemm_coopmat16d_h.comp.inc"
+};
+const uint32_t kGemmCoop16DBSpirv[] = {
+#include "gemm_coopmat16d_b.comp.inc"
+};
+const uint32_t kGemmCoop16DBBSpirv[] = {
+#include "gemm_coopmat16d_bb.comp.inc"
 };
 const uint32_t kGemmCoop8Spirv[] = {
 #include "gemm_coopmat8.comp.inc"
@@ -163,11 +188,11 @@ struct cublasContext {
     // gemm_f16_tn.comp variants, indexed by bit 0 = f16 C, bit 1 = f16 math
     CUfunction gemmF16Tn[4] = {};
     int float16 = -1;  // device has f16 arithmetic (-1: not queried yet)
-    // gemm_coopmat.comp, indexed by f16 C; its matrix size S (0: no cooperative matrices, -1: not
-    // queried yet) and the subgroup size (a workgroup is 4 subgroups)
-    // indexed by bit 0 = f16 C, bit 1 = 64 x 64 tiles (S = 16 only)
-    CUfunction gemmCoop[4] = {};
-    int coopSize = -1, subgroupSize = 0, multiprocessors = 0;
+    // gemm_coopmat.comp by variant (coopVariant) and operand layout (its kConfig, << 8); its matrix
+    // size S (0: no cooperative matrices, -1: not queried yet), the subgroup size (a workgroup is 4
+    // subgroups), whether there are bf16 ones and f16 results can be rounded to nearest even
+    std::map<uint32_t, CUfunction> gemmCoop;
+    int coopSize = -1, subgroupSize = 0, multiprocessors = 0, coopBf16 = 0, f16Rte = 0, integrated = 0;
     int coopFaster = -1;  // gemm_coopmat beats the tiled kernel on this device (-1: not measured yet)
     int forcePath = 0;    // while measuring: 1 = cooperative matrices, 2 = the tiled kernel
     CUfunction npu = nullptr;  // npu.comp: packing and epilogue of the zero-copy NPU path
@@ -697,37 +722,45 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     const auto aligned = [](const void* ptr, long long stride, int ld) {
         return (reinterpret_cast<uintptr_t>(ptr) & 15) == 0 && stride % 8 == 0 && ld % 8 == 0;
     };
+    const bool alignedAB = !g.pointerArrays && aligned(g.a, g.strideA, g.lda) && aligned(g.b, g.strideB, g.ldb);
     bool fast = h->forcePath != 2 && g.transa != CUBLAS_OP_N && g.transb == CUBLAS_OP_N && ta == 1 && tb == 1 &&
-                tc != 2 && !g.pointerArrays && aligned(g.a, g.strideA, g.lda) && aligned(g.b, g.strideB, g.ldb);
+                tc != 2 && alignedAB;
     // CUBLAS_COMPUTE_16F permits f16 arithmetic: packed f16 products where the device has it.
     if (fast && h->float16 < 0 && vulkanizerGetFeature(VULKANIZER_FEATURE_FLOAT16_ARITHMETIC, &h->float16) != CUDA_SUCCESS)
         h->float16 = 0;
-    // On cooperative matrices where the device has them: f16 products, f32 sums.
-    if (fast && h->coopSize < 0) {
+    // On cooperative matrices where the device has them: f16 or bf16 products, f32 sums, any layout.
+    const bool f16In = ta == 1 && tb == 1, bf16In = ta == 2 && tb == 2;
+    const bool coopCandidate = h->forcePath != 2 && alignedAB && ((f16In && tc != 2) || (bf16In && tc != 1));
+    if (coopCandidate && h->coopSize < 0) {
         if (vulkanizerGetFeature(VULKANIZER_FEATURE_COOPERATIVE_MATRIX_F16, &h->coopSize) != CUDA_SUCCESS ||
             vulkanizerGetFeature(VULKANIZER_FEATURE_SUBGROUP_SIZE, &h->subgroupSize) != CUDA_SUCCESS ||
             4 * h->subgroupSize > 1024)
             h->coopSize = 0;
+        if (h->coopSize > 0 && (vulkanizerGetFeature(VULKANIZER_FEATURE_COOPERATIVE_MATRIX_BF16, &h->coopBf16) != CUDA_SUCCESS ||
+                                vulkanizerGetFeature(VULKANIZER_FEATURE_F16_ROUND_RTE, &h->f16Rte) != CUDA_SUCCESS))
+            h->coopBf16 = h->f16Rte = 0;
     }
+    // f16 C of the 16 x 16 kernels is rounded by the hardware conversion: only with round to nearest even.
+    bool coop = coopCandidate && h->coopSize > 0 &&
+                (f16In ? tc == 0 || h->coopSize == 8 || h->f16Rte > 0 : h->coopSize == 16 && h->coopBf16 > 0);
     // Where the device has them and they are the faster kernel there (coopFaster); otherwise the
     // tiled kernel takes products of a full tile, which beats gemm_f16_tn on such devices.
-    bool coop = fast && h->coopSize > 0;
     if (coop && h->forcePath == 0 && !coopFaster(h)) {
         coop = false;
-        fast = g.m < int(kFastTile) || g.n < int(kFastTile);
+        fast = fast && (g.m < int(kFastTile) || g.n < int(kFastTile));
     }
     const bool f16Math = fast && !coop && h->float16 > 0 &&
                          (g.compute == CUBLAS_COMPUTE_16F || g.compute == CUBLAS_COMPUTE_32F_FAST_16F) &&
                          !std::getenv("VULKANIZER_GEMM_F32");
     VULKANIZER_DEBUG("gemm %c%c m=%d n=%d k=%d types %u/%u/%u compute %d batch %d%s -> %s", g.transa ? 'T' : 'N',
                 g.transb ? 'T' : 'N', g.m, g.n, g.k, ta, tb, tc, int(g.compute), g.batch, g.pointerArrays ? " (arrays)" : "",
-                !fast ? (g.m >= int(kFastTile) && g.n >= int(kFastTile) ? "tiled" : "generic")
-                      : coop ? "f16 tn, cooperative matrices" : f16Math ? "f16 tn, f16 math" : "f16 tn");
+                coop ? "cooperative matrices" : !fast ? (g.m >= int(kFastTile) && g.n >= int(kFastTile) ? "tiled" : "generic")
+                      : f16Math ? "f16 tn, f16 math" : "f16 tn");
     const int variant = (tc == 1 ? 1 : 0) | (f16Math ? 2 : 0);
     // The rest: 128 x 128 tiles once both dimensions fill one, compiled for the operands' layout:
     // contiguous along k or not, the types, and 16-byte loads where every row start is 16-byte
     // aligned (not knowable for pointer arrays) and the contiguous dimension a multiple of 8.
-    const bool tiled = !fast && g.m >= int(kFastTile) && g.n >= int(kFastTile);
+    const bool tiled = !coop && !fast && g.m >= int(kFastTile) && g.n >= int(kFastTile);
     uint32_t config = 0;
     if (tiled) {
         const bool alongKA = g.transa != CUBLAS_OP_N, alongKB = g.transb == CUBLAS_OP_N;
@@ -743,24 +776,52 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
     if (coop) {
         // 128 x 128 tiles (2 x 2 subgroups of 4 x 4 matrices); 64 x 64 ones (2 x 2 matrices) where that
         // leaves compute units idle: about 3x faster for a 1000 x 77 product, 1.5x slower for large ones.
-        const bool s16 = h->coopSize == 16, halfC = tc == 1;
+        const bool s16 = h->coopSize == 16;
         if (!h->multiprocessors) {
             CUdevice dev = 0;
             if (cuCtxGetDevice(&dev) != CUDA_SUCCESS ||
                 cuDeviceGetAttribute(&h->multiprocessors, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) != CUDA_SUCCESS)
                 h->multiprocessors = 1;
+            if (cuDeviceGetAttribute(&h->integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, dev) != CUDA_SUCCESS) h->integrated = 0;
         }
         const long long bigTiles = (long long)((g.m + 127) / 128) * ((g.n + 127) / 128) * g.batch;
         const bool small = s16 && bigTiles < h->multiprocessors;
-        CUfunction& fn = h->gemmCoop[(halfC ? 1 : 0) | (small ? 2 : 0)];
+        // Two shared buffers for products of few 128 x 128 tiles (a few per compute unit), where the
+        // barriers' latency shows: 9060 XT, 4096 x 512 x 4096: 18 -> 25 TFLOPS; with many tiles one
+        // buffer is faster (more workgroups per compute unit), 10240 x 4128 x 3840: 34 vs 25.
+        static const long long dbufTiles = [] {
+            const char* env = std::getenv("VULKANIZER_GEMM_DBUF_TILES");  // tiles per compute unit
+            return env && *env ? std::atoll(env) : 16;
+        }();
+        const bool dbuf = s16 && !small && bigTiles <= dbufTiles * h->multiprocessors;
+        // Long k (or system memory) with one buffer: 4 KiB more shared memory per workgroup, so that
+        // fewer run on a compute unit at a time. Their operands then stay in the caches until every
+        // workgroup that shares them is done with them (9060 XT, 3840 x 4128 x 10240: 20 -> 29 TFLOPS,
+        // 4096^3: 22 -> 28; with k = 3840 the extra workgroups are worth more, 37 against 33. 890M:
+        // 5.8 -> 6.1 over the Z-Image shapes, NT 4096 x 4096 x 1024 6.2 -> 8.5).
+        const bool longK = s16 && !small && !dbuf && (g.k >= 4096 || h->integrated);
+        // operands contiguous along k (op(A) = A^T, op(B) = B) or along m / n
+        const uint32_t layout = (g.transa != CUBLAS_OP_N ? 1u : 0u) | (g.transb == CUBLAS_OP_N ? 2u : 0u);
+        struct Code { const uint32_t* code; size_t bytes; };
+        // [bf16 inputs][tiles: 128 x 128, 64 x 64, 128 x 128 double buffered][16-bit C]; S = 8: f16 only,
+        // one tile size
+        static const Code kCoop16[2][3][2] = {
+            {{{kGemmCoop16Spirv, sizeof kGemmCoop16Spirv}, {kGemmCoop16HSpirv, sizeof kGemmCoop16HSpirv}},
+             {{kGemmCoop16SSpirv, sizeof kGemmCoop16SSpirv}, {kGemmCoop16SHSpirv, sizeof kGemmCoop16SHSpirv}},
+             {{kGemmCoop16DSpirv, sizeof kGemmCoop16DSpirv}, {kGemmCoop16DHSpirv, sizeof kGemmCoop16DHSpirv}}},
+            {{{kGemmCoop16BSpirv, sizeof kGemmCoop16BSpirv}, {kGemmCoop16BBSpirv, sizeof kGemmCoop16BBSpirv}},
+             {{kGemmCoop16SBSpirv, sizeof kGemmCoop16SBSpirv}, {kGemmCoop16SBBSpirv, sizeof kGemmCoop16SBBSpirv}},
+             {{kGemmCoop16DBSpirv, sizeof kGemmCoop16DBSpirv}, {kGemmCoop16DBBSpirv, sizeof kGemmCoop16DBBSpirv}}}};
+        static const Code kCoop8[2] = {{kGemmCoop8Spirv, sizeof kGemmCoop8Spirv}, {kGemmCoop8HSpirv, sizeof kGemmCoop8HSpirv}};
+        const bool c16 = tc != 0;
+        const uint32_t tiles = small ? 1 : dbuf ? 2 : 0;
+        const Code code = s16 ? kCoop16[bf16In][tiles][c16] : kCoop8[c16];
+        CUfunction& fn = h->gemmCoop[uint32_t(s16) | uint32_t(bf16In) << 1 | tiles << 2 | uint32_t(c16) << 4 |
+                                     uint32_t(longK) << 5 | layout << 8];
         if (!fn) {
-            const uint32_t* code = small ? (halfC ? kGemmCoop16SHSpirv : kGemmCoop16SSpirv)
-                                   : s16 ? (halfC ? kGemmCoop16HSpirv : kGemmCoop16Spirv)
-                                         : (halfC ? kGemmCoop8HSpirv : kGemmCoop8Spirv);
-            const size_t words = (small ? (halfC ? sizeof kGemmCoop16SHSpirv : sizeof kGemmCoop16SSpirv)
-                                  : s16 ? (halfC ? sizeof kGemmCoop16HSpirv : sizeof kGemmCoop16Spirv)
-                                        : (halfC ? sizeof kGemmCoop8HSpirv : sizeof kGemmCoop8Spirv)) / 4;
-            if (vulkanizerCreateSpirvFunction(&fn, code, words, "main", sizeof(GemmParams)) != CUDA_SUCCESS)
+            std::vector<uint32_t> specialized = withSpecConstant(code.code, code.bytes / 4, 10, layout);
+            if (longK) specialized = withSpecConstant(specialized.data(), specialized.size(), 11, 256);  // uvec4s
+            if (vulkanizerCreateSpirvFunction(&fn, specialized.data(), specialized.size(), "main", sizeof(GemmParams)) != CUDA_SUCCESS)
                 return CUBLAS_STATUS_INTERNAL_ERROR;
         }
         const unsigned tile = (small ? 4 : 8) * unsigned(h->coopSize);

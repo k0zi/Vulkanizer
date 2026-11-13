@@ -1,0 +1,279 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#ifdef BF16
+#extension GL_EXT_bfloat16 : require
+#define InType bfloat16_t
+#else
+#define InType float16_t
+#endif
+
+// Fused attention forward (flash attention) on 16 x 16 x 16 cooperative matrices, in place of PyTorch's
+// memory-efficient attention kernels (driver/attention.cpp): softmax(scale * Q K^T + bias, masked) V,
+// f16 (bf16 with BF16 defined) inputs and output, f32 accumulation, head dimensions up to 128.
+// A workgroup is NSG subgroups, 16 queries each (BM = 16 NSG queries). Keys go in blocks of BN through shared
+// memory; each subgroup computes its 16 x BN scores, writes them to its own shared rows, where its lanes
+// (16 / subgroup size lanes per row) apply the scale, bias and masks and update the running maximum and
+// sum (online softmax), and write the probabilities back (f16 / bf16) for P V. The output accumulators
+// stay in registers: their rows are rescaled element by element, with each element's row read once from
+// a matrix of row numbers (the element layout of the accumulators is the implementation's).
+
+layout(local_size_x_id = 0) in;               // NSG subgroups
+layout(constant_id = 1) const int DQ = 8;     // head_dim in 16-column tiles
+layout(constant_id = 2) const int DV = 8;     // head_dim_value in 16-column tiles
+
+#include "attention_common.glsl"
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer U16x8 { uvec4 v; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer U16 { uint16_t v; };
+
+#ifndef BN
+#define BN 32
+#endif
+// Subgroups per workgroup: 256 invocations (4 subgroups of 64, 8 of 32). Workgroups of 512 compute wrong
+// results on the 890M (RADV, wave64).
+layout(constant_id = 3) const int NSG = 4;
+const int S = 16, BM = NSG * S;
+const int QROWS = 64;  // Q goes through shared memory QROWS rows at a time
+const int LDK = DQ * 2 + 1, LDV = DV * 2 + 1;  // uvec4 (8 values) per K / V row, padded
+const int LDS = BN / 4 + 1;                    // uvec4 per score row (f32)
+const int LDP = BN / 8 + 1;                    // uvec4 per probability row (16 bits)
+const int KV_VECS = BN * (LDK + LDV) > QROWS * LDK ? BN * (LDK + LDV) : QROWS * LDK;
+shared uvec4 kv[KV_VECS];           // Q at the start; then K (BN rows) and V (BN rows)
+shared uvec4 sp[NSG * S * LDS];     // per subgroup: 16 score rows, then the probabilities over them
+shared float rowScale[BM];
+
+#define AccMat coopmat<float, gl_ScopeSubgroup, S, S, gl_MatrixUseAccumulator>
+#define AMat coopmat<InType, gl_ScopeSubgroup, S, S, gl_MatrixUseA>
+#define BMat coopmat<InType, gl_ScopeSubgroup, S, S, gl_MatrixUseB>
+
+uint16_t toBits(float x) {
+#ifdef BF16
+    uint u = floatBitsToUint(x);
+    u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even (finite values)
+    return uint16_t(u >> 16);
+#else
+    return float16BitsToUint16(float16_t(x));
+#endif
+}
+
+float fromBits(uint16_t b) {
+#ifdef BF16
+    return uintBitsToFloat(uint(b) << 16);
+#else
+    return float(uint16BitsToFloat16(b));
+#endif
+}
+
+// uvec4 c of row r of a matrix of `cols` 16-bit values per row (row stride `ld` elements, rows from
+// row0, row0 + validRows of them); zeros past the end, where the loads read from the last row instead
+// (see problemFor).
+uvec4 fetch(uint64_t base, int64_t ld, int row0, int validRows, int cols, int r, int c, bool vector) {
+    const bool rowValid = r < validRows;
+    const uint64_t rowAddr = base + uint64_t(int64_t(row0 + (rowValid ? r : validRows - 1)) * ld) * 2ul;
+    uvec4 value;
+    if (vector) {
+        const bool inside = c * 8 < cols;
+        value = U16x8(rowAddr + uint64_t(inside ? c : 0) * 16ul).v;
+        if (!rowValid || !inside) value = uvec4(0);
+    } else {
+        uint w[8];
+        [[unroll]] for (int e = 0; e < 8; ++e) {
+            const int col = c * 8 + e;
+            const uint x = uint(U16(rowAddr + uint64_t(min(col, cols - 1)) * 2ul).v);
+            w[e] = rowValid && col < cols ? x : 0u;
+        }
+        value = uvec4(w[0] | w[1] << 16, w[2] | w[3] << 16, w[4] | w[5] << 16, w[6] | w[7] << 16);
+    }
+    return value;
+}
+
+// `rows` rows of `vecs` uvec4 into shared memory at `dst`, `pitch` uvec4 per row.
+void loadTile(uint64_t base, int64_t ld, int row0, int rows, int validRows, int cols, int dst, int pitch, int vecs,
+              bool vector) {
+    for (int i = int(gl_LocalInvocationIndex); i < rows * vecs; i += int(gl_WorkGroupSize.x)) {
+        const int r = i / vecs, c = i - r * vecs;
+        kv[dst + r * pitch + c] = fetch(base, ld, row0, validRows, cols, r, c, vector);
+    }
+}
+
+// A block of K and V in registers (the next one is loaded while the current one is multiplied): at
+// most NF uvec4 of each per invocation (BN rows of up to 16 uvec4, 128 or more invocations).
+const int NF = BN * 16 / 128;
+struct Staged {
+    uvec4 k[NF], v[NF];
+};
+
+void fetchBlock(uint64_t kBase, uint64_t vBase, Args a, Problem pr, int k0, bool vector, out Staged st) {
+    [[unroll]] for (int n = 0; n < NF; ++n) {
+        const int i = int(gl_LocalInvocationIndex) + n * int(gl_WorkGroupSize.x);
+        st.k[n] = uvec4(0);
+        st.v[n] = uvec4(0);
+        if (i < BN * DQ * 2)
+            st.k[n] = fetch(kBase, a.kStrideM, k0, pr.numK - k0, a.headDim, i / (DQ * 2), i % (DQ * 2), vector);
+        if (i < BN * DV * 2)
+            st.v[n] = fetch(vBase, a.vStrideM, k0, pr.numK - k0, a.headDimV, i / (DV * 2), i % (DV * 2), vector);
+    }
+}
+
+void storeBlock(Staged st) {
+    [[unroll]] for (int n = 0; n < NF; ++n) {
+        const int i = int(gl_LocalInvocationIndex) + n * int(gl_WorkGroupSize.x);
+        if (i < BN * DQ * 2) kv[(i / (DQ * 2)) * LDK + i % (DQ * 2)] = st.k[n];
+        if (i < BN * DV * 2) kv[BN * LDK + (i / (DV * 2)) * LDV + i % (DV * 2)] = st.v[n];
+    }
+}
+
+void main() {
+    Args a = Args(canon(pc.args));
+    const int batch = int(gl_WorkGroupID.z), head = int(gl_WorkGroupID.y);
+    Problem pr = problemFor(a, batch, head);
+    const int q0 = int(gl_WorkGroupID.x) * BM;
+    if (q0 >= pr.numQ) return;  // variable lengths: past this sequence
+
+    const int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    const int L = int(gl_SubgroupSize) / S;   // lanes per score row
+    const int CPL = BN / L;                   // scores per lane
+    const int myRow = lane / L, part = lane - myRow * L;
+    const int sgBase = sg * S * LDS;
+    const bool vector = (a.flags & kVectorLoads) != 0u;
+    const uint64_t qBase = canon(a.q), kBase = canon(a.k), vBase = canon(a.v);
+
+    // Q (this workgroup's BM rows) into registers through shared memory, QROWS rows at a time; the
+    // row-number matrix
+    for (int i = lane; i < S * S / 4; i += int(gl_SubgroupSize)) {
+        const int r = i / (S / 4);
+        sp[sgBase + r * LDS + i % (S / 4)] = uvec4(floatBitsToUint(float(r)));
+    }
+    BMat qt[DQ];  // Q^T: the scores are computed transposed, K Q^T, with K row-major (fast loads) as A
+    for (int r0 = 0; r0 < BM; r0 += QROWS) {
+        barrier();
+        loadTile(qBase + uint64_t(pr.q) * 2ul, a.qStrideM, q0 + r0, QROWS, pr.numQ - q0 - r0, a.headDim, 0, LDK, DQ * 2,
+                 vector);
+        barrier();
+        if (sg * S >= r0 && sg * S < r0 + QROWS)
+            [[unroll]] for (int t = 0; t < DQ; ++t)
+                coopMatLoad(qt[t], kv, (sg * S - r0) * LDK + t * 2, LDK, gl_CooperativeMatrixLayoutColumnMajor);
+    }
+    AccMat rowOf;
+    coopMatLoad(rowOf, sp, sgBase, LDS, gl_CooperativeMatrixLayoutRowMajor);
+
+    AccMat o[DV];
+    [[unroll]] for (int j = 0; j < DV; ++j) o[j] = AccMat(0.0);
+    float m = -kInf, l = 0.0;
+    const int query = q0 + sg * S + myRow;
+    const bool hasBias = a.bias != 0ul;
+    const uint64_t biasRow = hasBias ? canon(a.bias) + uint64_t(pr.bias + int64_t(min(query, pr.numQ - 1)) * a.biasStrideM) * 2ul
+                                     : qBase;
+    const float scale2 = hasBias ? a.scale : a.scale * kLog2e;
+
+    const Mask mask = maskOf(a);
+    int kBegin, kEnd;
+    keyRange(a, pr, q0, min(q0 + BM, pr.numQ), kBegin, kEnd);
+    kBegin = kBegin / BN * BN;
+    const uint64_t kRows = kBase + uint64_t(pr.k) * 2ul, vRows = vBase + uint64_t(pr.v) * 2ul;
+    Staged staged;
+    if (kBegin < kEnd) fetchBlock(kRows, vRows, a, pr, kBegin, vector, staged);
+    for (int k0 = kBegin; k0 < kEnd; k0 += BN) {
+        barrier();  // Q, or the previous block's K and V, are no longer read
+        storeBlock(staged);
+        barrier();
+        if (k0 + BN < kEnd) fetchBlock(kRows, vRows, a, pr, k0 + BN, vector, staged);
+
+        // scores: (K Q^T)^T, stored column-major: the subgroup's 16 rows of BN scores
+        [[unroll]] for (int n = 0; n < BN / S; ++n) {
+            AccMat s = AccMat(0.0);
+            [[unroll]] for (int t = 0; t < DQ; ++t) {
+                AMat km;
+                coopMatLoad(km, kv, n * S * LDK + t * 2, LDK, gl_CooperativeMatrixLayoutRowMajor);
+                s = coopMatMulAdd(km, qt[t], s);
+            }
+            coopMatStore(s, sp, sgBase + n * 4, LDS, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // online softmax over this lane's CPL scores of its row (whole: every key of the block is seen)
+        const bool whole = mask.type == 0 && mask.window == 0 && k0 + BN <= pr.numK;
+        float x[BN];
+        float rowMax = -kInf;
+        [[unroll]] for (int c = 0; c < BN; ++c) {
+            if (c >= CPL) break;
+            const int col = part * CPL + c, key = k0 + col;
+            const uvec4 w = sp[sgBase + myRow * LDS + col / 4];
+            float v = uintBitsToFloat(w[col % 4]) * scale2;
+            if (hasBias) v = (v + fromBits(U16(biasRow + uint64_t(min(key, pr.numK - 1)) * 2ul).v)) * kLog2e;
+            if (!whole && !visible(mask, pr, query, key)) v = -kInf;
+            x[c] = v;
+            rowMax = max(rowMax, v);
+        }
+        for (int d = 1; d < L; d *= 2) rowMax = max(rowMax, subgroupShuffleXor(rowMax, d));
+        const float mNew = max(m, rowMax);
+        const float mUse = mNew == -kInf ? 0.0 : mNew;
+        const float alpha = exp2(m - mUse);
+        float sum = 0.0;
+        [[unroll]] for (int c = 0; c < BN; ++c) {
+            if (c >= CPL) break;
+            x[c] = exp2(x[c] - mUse);
+            sum += x[c];
+        }
+        for (int d = 1; d < L; d *= 2) sum += subgroupShuffleXor(sum, d);
+        l = l * alpha + sum;
+        m = mNew;
+        subgroupBarrier();  // every lane has read its scores before the probabilities overwrite them
+        [[unroll]] for (int c = 0; c < BN; c += 8) {
+            if (c >= CPL) break;
+            uvec4 w;
+            [[unroll]] for (int e = 0; e < 4; ++e)
+                w[e] = uint(toBits(x[c + 2 * e])) | uint(toBits(x[c + 2 * e + 1])) << 16;
+            sp[sgBase + myRow * LDP + (part * CPL + c) / 8] = w;
+        }
+        if (part == 0) rowScale[sg * S + myRow] = alpha;
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        [[unroll]] for (int j = 0; j < DV; ++j)
+            for (int e = 0; e < o[j].length(); ++e) o[j][e] *= rowScale[sg * S + int(rowOf[e])];
+        [[unroll]] for (int kk = 0; kk < BN / S; ++kk) {
+            AMat pm;
+            coopMatLoad(pm, sp, sgBase + kk * 2, LDP, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (int j = 0; j < DV; ++j) {
+                BMat vm;
+                coopMatLoad(vm, kv, BN * LDK + kk * S * LDV + j * 2, LDV, gl_CooperativeMatrixLayoutRowMajor);
+                o[j] = coopMatMulAdd(pm, vm, o[j]);
+            }
+        }
+    }
+
+    // normalize, logsumexp, store (one 16 x 16 matrix at a time through the subgroup's shared rows)
+    subgroupBarrier();
+    if (part == 0) {
+        rowScale[sg * S + myRow] = l == 0.0 ? 1.0 : 1.0 / l;
+        storeLogsumexp(a, pr, batch, head, query, m, l);
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    const uint64_t oBase = canon(a.o) + uint64_t(pr.o) * 2ul;
+    [[unroll]] for (int j = 0; j < DV; ++j) {
+        for (int e = 0; e < o[j].length(); ++e) o[j][e] *= rowScale[sg * S + int(rowOf[e])];
+        coopMatStore(o[j], sp, sgBase, LDS, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (int i = lane; i < S * S; i += int(gl_SubgroupSize)) {
+            const int r = i / S, c = i % S, row = q0 + sg * S + r, col = j * S + c;
+            if (row < pr.numQ && col < a.headDimV) {
+                const float v = uintBitsToFloat(sp[sgBase + r * LDS + c / 4][c % 4]);
+                U16(oBase + uint64_t(int64_t(row) * a.oStrideM + col) * 2ul).v = toBits(v);
+            }
+        }
+        subgroupBarrier();
+    }
+}

@@ -165,16 +165,15 @@ donc pas exécuter leurs kernels. Les versions CUDA de conda-forge contiennent a
 `tools/setup_torch.sh` les installe avec micromamba, sans installation à l’échelle du système. `run_torch.sh` charge
 `libcuda`, `libcudart`, `libcublas`, `libcublasLt`, `libcusolver`, `libcufft`, `libcusparse` et `libcurand` de
 Vulkanizer à la place de celles de NVIDIA, et désactive tout ce qui exige du matériel ou des bibliothèques NVIDIA :
-cuDNN, les kernels d’attention fusionnés (`scaled_dot_product_attention` passe par le chemin mathématique) et les
-kernels DSL de `torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`) : ses kernels Triton fonctionnent, mais ses kernels CuTe
-DSL se compilent en SASS, et le même interrupteur désactive les deux. `VULKANIZER_TORCH_DEFAULTS=0` désactive ces
-réglages. Triton lui-même (`torch.compile`, `@triton.jit`) fonctionne : `tools/triton/ptxas` transmet le PTX de Triton
-au lieu de l’assembler, et le lanceur de Triton est compilé avec `include/cuda.h` de Vulkanizer (il faut un compilateur
-C). `torch.linalg` (LU, Cholesky, QR, moindres carrés, `eigh`, SVD, `pinv`, ...) tourne sur le cuSOLVER de Vulkanizer et
-`torch.fft` (y compris `stft`) sur son cuFFT, `torch.sparse` sur son cuSPARSE ; `run_torch.sh` définit
-`TORCH_LINALG_PREFER_CUSOLVER=1`, car les kernels propres à MAGMA ne tournent pas. Le jiterator de PyTorch compile ses
-kernels à l’exécution avec NVRTC en code natif ; une bibliothèque `LD_AUDIT` (`libvulkanizer_nvrtc.so`) lui fait
-transmettre le PTX à la place.
+cuDNN, les kernels de flash attention et les kernels DSL de `torch._native` (`TORCH_DISABLE_NATIVE_JIT=1`) : ses kernels
+Triton fonctionnent, mais ses kernels CuTe DSL se compilent en SASS, et le même interrupteur désactive les deux.
+`VULKANIZER_TORCH_DEFAULTS=0` désactive ces réglages. Triton lui-même (`torch.compile`, `@triton.jit`) fonctionne :
+`tools/triton/ptxas` transmet le PTX de Triton au lieu de l’assembler, et le lanceur de Triton est compilé avec
+`include/cuda.h` de Vulkanizer (il faut un compilateur C). `torch.linalg` (LU, Cholesky, QR, moindres carrés, `eigh`,
+SVD, `pinv`, ...) tourne sur le cuSOLVER de Vulkanizer et `torch.fft` (y compris `stft`) sur son cuFFT, `torch.sparse`
+sur son cuSPARSE ; `run_torch.sh` définit `TORCH_LINALG_PREFER_CUSOLVER=1`, car les kernels propres à MAGMA ne tournent
+pas. Le jiterator de PyTorch compile ses kernels à l’exécution avec NVRTC en code natif ; une bibliothèque `LD_AUDIT`
+(`libvulkanizer_nvrtc.so`) lui fait transmettre le PTX à la place.
 
 ### 6. ComfyUI
 
@@ -210,8 +209,8 @@ Ouvrez ensuite <http://127.0.0.1:8188>. Les modèles vont dans `models/`, comme 
 - DynamicVRAM (comfy-aimdo) fonctionne sur la gestion de mémoire virtuelle de Vulkanizer (VMM, buffers sparse). En cas
   de problème, `--disable-dynamic-vram` revient au chargement des modèles fondé sur des estimations.
 - `tools/torch/sitecustomize.py` n’applique les réglages PyTorch qu’au moment où ComfyUI importe torch, et maintient
-  désactivés les backends d’attention fusionnés même si ComfyUI les réactive : l’attention passe par le chemin
-  mathématique.
+  désactivés les backends d’attention flash et cuDNN même si ComfyUI les réactive : l’attention passe par l’attention
+  fusionnée de Vulkanizer (f16) ou par le chemin mathématique.
 - Le message « PyTorch is not installed » de ComfyUI-Manager vient de l’absence de `torchaudio` (conda-forge n’a pas de
   version pour torch 2.14) ; la génération d’images n’en a pas besoin.
 - La première génération est lente, le temps de compiler les kernels en SPIR-V ; les suivantes les chargent depuis le cache.
@@ -382,7 +381,8 @@ Liste complète : [plan.md, section 4](plan.md).
   managed n’est pas concernée.
 - La flash attention de llama.cpp fonctionne correctement (`tools/build_llama.sh --fa`), mais sans tensor cores le
   traitement du prompt est plus lent avec elle ; elle est donc désactivée par défaut.
-- PyTorch : pas de kernels cuDNN ni d’attention fusionnée.
+- PyTorch : pas de cuDNN ; parmi les kernels d’attention fusionnés, seuls ceux de l’attention memory-efficient (avant)
+  tournent (f16, dimension de tête jusqu’à 128, sans dropout ni rétropropagation).
 - cuSOLVER : types réels (f32, f64) uniquement, pas de `gesvda`, de LDL^T (`sytrf`) ni de problèmes aux valeurs
   propres non symétriques (`geev`) ; `eigh` d’une matrice la tridiagonalise (Householder) et résout sur l’hôte (QL) ;
   `eigh` par lots et la SVD utilisent des itérations de Jacobi, la SVD est lente pour les grandes matrices (n ≳ 1000).

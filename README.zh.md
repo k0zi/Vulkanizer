@@ -156,7 +156,7 @@ PyTorch 官方 wheel 只包含 NVIDIA 原生机器码（SASS），没有 PTX，�
 conda-forge 的 CUDA 构建同时附带 PTX（`compute_120`）：`tools/setup_torch.sh` 用 micromamba 安装它们，无需系统级安装。
 `run_torch.sh` 加载 Vulkanizer 的 `libcuda`、`libcudart`、`libcublas`、`libcublasLt`、`libcusolver`、`libcufft` 和
 `libcusparse`、`libcurand` 来代替 NVIDIA 的库，
-并关闭所有需要 NVIDIA 硬件或库的功能：cuDNN、融合的 attention 内核（`scaled_dot_product_attention` 走数学路径），
+并关闭所有需要 NVIDIA 硬件或库的功能：cuDNN、flash attention 内核，
 以及 `torch._native` 的 DSL 内核（`TORCH_DISABLE_NATIVE_JIT=1`）：其中的 Triton 内核可以工作，但 CuTe DSL 内核会编译成
 SASS，而同一个开关会同时关闭两者。`VULKANIZER_TORCH_DEFAULTS=0` 可跳过这些设置。
 Triton 本身（`torch.compile`、`@triton.jit`）可以工作：`tools/triton/ptxas` 直接传递 Triton 生成的 PTX 而不进行汇编，
@@ -198,8 +198,8 @@ $VK/run_torch.sh --env venv-vulkanizer main.py --enable-manager --disable-cuda-m
 - `--disable-cuda-malloc`：不使用 ComfyUI 的 `cudaMallocAsync` 分配器后端。
 - DynamicVRAM（comfy-aimdo）运行在 Vulkanizer 的虚拟内存管理（VMM、稀疏缓冲区）之上。如果出现问题，
   `--disable-dynamic-vram` 会切回基于估算的模型加载。
-- `tools/torch/sitecustomize.py` 只在 ComfyUI 导入 torch 时应用 PyTorch 设置，并且即使 ComfyUI 重新启用融合的
-  attention 后端，也会让它们保持关闭：attention 走数学路径。
+- `tools/torch/sitecustomize.py` 只在 ComfyUI 导入 torch 时应用 PyTorch 设置，并且即使 ComfyUI 重新启用 flash 和 cuDNN
+  attention 后端，也会让它们保持关闭：attention 走 Vulkanizer 的融合 attention（f16）或数学路径。
 - ComfyUI-Manager 的 “PyTorch is not installed” 提示来自缺少的 `torchaudio`（conda-forge 没有适用于 torch 2.14 的构建）；
   生成图像不需要它。
 - 第一次生成会很慢，因为要把内核编译成 SPIR-V；之后的运行会从缓存加载。
@@ -344,7 +344,8 @@ Qwen3.6-35B-A3B Q5_K_XL（25 GiB，单块 eGPU 放不下）：
   约 4 ms）。锁页内存和托管内存不受影响。
 - llama.cpp 的 flash attention 可以正确运行（`tools/build_llama.sh --fa`），但在没有 tensor core 的情况下，
   它会让提示词处理变慢，因此默认关闭。
-- PyTorch：没有 cuDNN 和融合 attention 内核。
+- PyTorch：没有 cuDNN；融合 attention 内核中只有 memory-efficient 的前向内核可用（f16，头维度最多 128，无 dropout 和反向；
+  PyTorch 的 memory-efficient 内核作为 Vulkanizer 自己的融合 attention 运行，`VULKANIZER_FUSED_ATTENTION=0` 可关闭）。
 - cuSOLVER：只支持实数类型（f32、f64），没有 `gesvda`、LDL^T（`sytrf`）和非对称特征值问题（`geev`）；单个矩阵的
   `eigh` 先用 Householder 三对角化，再在主机上用 QL 求解；批量 `eigh` 和 SVD 使用 Jacobi 迭代，SVD 对大矩阵（n ≳ 1000）
   较慢。cuFFT：没有回调和多 GPU 计划；长度超过 2048（f64：1024）的变换，如果长度能分解为两个都不超过该上限的因子，则遍历内存两次，否则每个基数遍历一次。cuSPARSE：没有块稀疏（BSR）格式和复数值；SpGEMM 和排序例程在主机上运行。

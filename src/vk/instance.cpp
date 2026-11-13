@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <tuple>
 
 namespace vulkanizer::vk {
@@ -143,6 +144,19 @@ bool Instance::init() {
             layers.push_back("VK_LAYER_KHRONOS_validation");
         else
             VULKANIZER_WARN("VULKANIZER_VALIDATION set but VK_LAYER_KHRONOS_validation is not installed");
+    }
+
+    // RADV exposes its transfer-only (SDMA) queue family only with RADV_PERFTEST=transfer_queue: the copy
+    // queue of discrete GPUs (queryDevice) is that family, so it is asked for here, before the instance is
+    // created (RADV reads the variable then). Not with VULKANIZER_COPY_QUEUE=0 or =graphics.
+    {
+        const char* copyEnv = std::getenv("VULKANIZER_COPY_QUEUE");
+        const bool sdma = !(copyEnv && (!std::strcmp(copyEnv, "0") || !std::strcmp(copyEnv, "graphics")));
+        const char* perftest = std::getenv("RADV_PERFTEST");
+        if (sdma && !(perftest && std::strstr(perftest, "transfer_queue"))) {
+            const std::string value = perftest && *perftest ? std::string(perftest) + ",transfer_queue" : "transfer_queue";
+            setenv("RADV_PERFTEST", value.c_str(), 1);
+        }
     }
 
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -300,8 +314,32 @@ bool Instance::queryDevice(VkPhysicalDevice pd, PhysicalDeviceInfo& out, std::st
         whyNot = "no compute queue";
         return false;
     }
-    out.computeQueueFamily = static_cast<uint32_t>(computeOnly >= 0 ? computeOnly : anyCompute);
+    // VULKANIZER_QUEUE=graphics: the graphics + compute family even where there is a compute-only one
+    const char* queueEnv = std::getenv("VULKANIZER_QUEUE");
+    const bool graphicsQueue = queueEnv && !std::strcmp(queueEnv, "graphics");
+    out.computeQueueFamily = static_cast<uint32_t>(computeOnly >= 0 && !graphicsQueue ? computeOnly : anyCompute);
     out.computeQueueSparse = qfs[out.computeQueueFamily].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT;
+    // Host <-> device copies of a discrete GPU on a queue of their own: a transfer-only family (SDMA)
+    // where the driver exposes one (RADV: RADV_PERFTEST=transfer_queue, set in init()). It moves data over the bus
+    // faster than a compute-only queue (RX 9060 XT over USB4, host to device: 3.8 GB/s against 2.6 GB/s,
+    // device to host: 3.0-3.4 against 2.4). The graphics family copies as fast, but only on request
+    // (VULKANIZER_COPY_QUEUE=graphics): when a kernel of the process faults, the GPU stalls the process's
+    // work on every ring, the graphics ring's own reset fails (amdgpu, RX 9060 XT) and the whole GPU is
+    // reset, with its VRAM lost, taking the desktop with it; a compute ring is reset on its own.
+    // VULKANIZER_COPY_QUEUE=0 keeps the copies on the compute queue.
+    out.copyQueueFamily = out.computeQueueFamily;
+    const char* copyEnv = std::getenv("VULKANIZER_COPY_QUEUE");
+    if (out.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU && !(copyEnv && !std::strcmp(copyEnv, "0"))) {
+        int transferOnly = -1;
+        for (uint32_t i = 0; i < qfCount; ++i)
+            if ((qfs[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+                !(qfs[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) && transferOnly < 0)
+                transferOnly = static_cast<int>(i);
+        const bool graphics = copyEnv && !std::strcmp(copyEnv, "graphics");
+        if (transferOnly >= 0 && !graphics) out.copyQueueFamily = static_cast<uint32_t>(transferOnly);
+        else if (graphics && (qfs[anyCompute].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+            out.copyQueueFamily = static_cast<uint32_t>(anyCompute);
+    }
 
     for (uint32_t i = 0; i < out.memProps.memoryHeapCount; ++i)
         if (out.memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)

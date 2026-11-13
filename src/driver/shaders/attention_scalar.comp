@@ -1,0 +1,139 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : require
+#if defined(IN_F16) || defined(IN_BF16)
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#endif
+
+// Fused attention forward without matrix units (driver/attention.cpp): f32, f16 or bf16 (IN_F32,
+// IN_F16, IN_BF16), any head dimension. A workgroup computes BM queries x DVS value columns (the value
+// columns go in slices along y: head * slices + slice); keys in blocks of KB through shared memory, the
+// scores in DC-wide steps over head_dim, online softmax per row, f32 throughout.
+
+layout(local_size_x = 128) in;
+
+#include "attention_common.glsl"
+
+#ifdef IN_F32
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Elem { float v; };
+float loadElem(uint64_t base, int64_t i) { return Elem(base + uint64_t(i) * 4ul).v; }
+void storeElem(uint64_t base, int64_t i, float x) { Elem(base + uint64_t(i) * 4ul).v = x; }
+const uint64_t kElemBytes = 4ul;
+#else
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer Elem { uint16_t v; };
+#ifdef IN_BF16
+float loadElem(uint64_t base, int64_t i) { return uintBitsToFloat(uint(Elem(base + uint64_t(i) * 2ul).v) << 16); }
+void storeElem(uint64_t base, int64_t i, float x) {
+    uint u = floatBitsToUint(x);
+    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);  // nearest even, inf / nan kept
+    Elem(base + uint64_t(i) * 2ul).v = uint16_t(u >> 16);
+}
+#else
+float loadElem(uint64_t base, int64_t i) { return unpackHalf2x16(uint(Elem(base + uint64_t(i) * 2ul).v)).x; }
+void storeElem(uint64_t base, int64_t i, float x) { Elem(base + uint64_t(i) * 2ul).v = uint16_t(packHalf2x16(vec2(x, 0.0))); }
+#endif
+const uint64_t kElemBytes = 2ul;
+#endif
+
+const int WG = 128, BM = 32, KB = 32, DC = 32, DVS = 64;
+const int SPT = BM * KB / WG;   // scores per thread
+const int OPT = BM * DVS / WG;  // output values per thread
+shared float qs[BM * (DC + 1)], ks[KB * (DC + 1)], ss[BM * (KB + 1)], vs[KB * DVS];
+shared float rowScale[BM];
+
+void main() {
+    Args a = Args(canon(pc.args));
+    const int batch = int(gl_WorkGroupID.z);
+    const int head = int(gl_WorkGroupID.y) / a.slices, slice = int(gl_WorkGroupID.y) % a.slices;
+    Problem pr = problemFor(a, batch, head);
+    const int q0 = int(gl_WorkGroupID.x) * BM;
+    if (q0 >= pr.numQ) return;
+    const int tid = int(gl_LocalInvocationIndex);
+    const int col0 = slice * DVS;
+    const uint64_t qBase = canon(a.q) + uint64_t(pr.q) * kElemBytes, kBase = canon(a.k) + uint64_t(pr.k) * kElemBytes;
+    const uint64_t vBase = canon(a.v) + uint64_t(pr.v) * kElemBytes;
+    const bool hasBias = a.bias != 0ul;
+    const uint64_t biasBase = hasBias ? canon(a.bias) : qBase;  // a valid address either way
+    const float scale2 = hasBias ? a.scale : a.scale * kLog2e;
+
+    float o[OPT];
+    [[unroll]] for (int i = 0; i < OPT; ++i) o[i] = 0.0;
+    float m = -kInf, l = 0.0;  // the row's, in thread `row` (< BM)
+
+    const Mask mask = maskOf(a);
+    int kBegin, kEnd;
+    keyRange(a, pr, q0, min(q0 + BM, pr.numQ), kBegin, kEnd);
+    for (int k0 = kBegin; k0 < kEnd; k0 += KB) {
+        float s[SPT];
+        [[unroll]] for (int i = 0; i < SPT; ++i) s[i] = 0.0;
+        for (int d0 = 0; d0 < a.headDim; d0 += DC) {
+            barrier();
+            for (int i = tid; i < BM * DC; i += WG) {
+                const int r = i / DC, d = i % DC;
+                // the loads past the end read from valid rows and columns (see problemFor)
+                const int dd = min(d0 + d, a.headDim - 1);
+                const float qv = loadElem(qBase, int64_t(min(q0 + r, pr.numQ - 1)) * a.qStrideM + dd);
+                const float kv = loadElem(kBase, int64_t(min(k0 + r, pr.numK - 1)) * a.kStrideM + dd);
+                qs[r * (DC + 1) + d] = q0 + r < pr.numQ && d0 + d < a.headDim ? qv : 0.0;
+                ks[r * (DC + 1) + d] = k0 + r < pr.numK && d0 + d < a.headDim ? kv : 0.0;
+            }
+            barrier();
+            [[unroll]] for (int i = 0; i < SPT; ++i) {
+                const int e = tid + i * WG, r = e / KB, c = e % KB;
+                for (int d = 0; d < DC; ++d) s[i] += qs[r * (DC + 1) + d] * ks[c * (DC + 1) + d];
+            }
+        }
+        [[unroll]] for (int i = 0; i < SPT; ++i) {
+            const int e = tid + i * WG, r = e / KB, c = e % KB;
+            const int query = q0 + r, key = k0 + c;
+            float v = s[i] * scale2;
+            if (hasBias) {
+                const int64_t at = pr.bias + int64_t(min(query, pr.numQ - 1)) * a.biasStrideM + min(key, pr.numK - 1);
+                v = (v + loadElem(biasBase, hasBias ? at : 0)) * kLog2e;
+            }
+            ss[r * (KB + 1) + c] = visible(mask, pr, query, key) ? v : -kInf;
+        }
+        for (int i = tid; i < KB * DVS; i += WG) {
+            const int r = i / DVS, c = i % DVS;
+            const float x = loadElem(vBase, int64_t(min(k0 + r, pr.numK - 1)) * a.vStrideM + min(col0 + c, a.headDimV - 1));
+            vs[i] = k0 + r < pr.numK && col0 + c < a.headDimV ? x : 0.0;
+        }
+        barrier();
+        if (tid < BM) {
+            float mx = -kInf;
+            for (int c = 0; c < KB; ++c) mx = max(mx, ss[tid * (KB + 1) + c]);
+            const float mNew = max(m, mx), mUse = mNew == -kInf ? 0.0 : mNew;
+            const float alpha = exp2(m - mUse);
+            float sum = 0.0;
+            for (int c = 0; c < KB; ++c) {
+                const float p = exp2(ss[tid * (KB + 1) + c] - mUse);
+                ss[tid * (KB + 1) + c] = p;
+                sum += p;
+            }
+            l = l * alpha + sum;
+            m = mNew;
+            rowScale[tid] = alpha;
+        }
+        barrier();
+        [[unroll]] for (int i = 0; i < OPT; ++i) {
+            const int e = tid + i * WG, r = e / DVS, c = e % DVS;
+            float acc = o[i] * rowScale[r];
+            for (int k = 0; k < KB; ++k) acc += ss[r * (KB + 1) + k] * vs[k * DVS + c];
+            o[i] = acc;
+        }
+    }
+    barrier();
+    if (tid < BM) {
+        rowScale[tid] = l == 0.0 ? 1.0 : 1.0 / l;
+        if (slice == 0) storeLogsumexp(a, pr, batch, head, q0 + tid, m, l);
+    }
+    barrier();
+    const uint64_t oBase = canon(a.o) + uint64_t(pr.o) * kElemBytes;
+    [[unroll]] for (int i = 0; i < OPT; ++i) {
+        const int e = tid + i * WG, r = e / DVS, c = e % DVS;
+        if (q0 + r < pr.numQ && col0 + c < a.headDimV)
+            storeElem(oBase, int64_t(q0 + r) * a.oStrideM + col0 + c, o[i] * rowScale[r]);
+    }
+}
