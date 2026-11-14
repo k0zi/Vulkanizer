@@ -62,10 +62,13 @@ VkResult createChunks(vk::Device& dev, size_t size, size_t alignment, VmReservat
     const VkDeviceSize chunk = dev.maxSparseBufferSize() / granularity(dev) * granularity(dev);
     if (!chunk) return VK_ERROR_FEATURE_NOT_PRESENT;
     const uint64_t n = (size + chunk - 1) / chunk;
-    auto done = [&](std::vector<vk::Buffer> chunks) {
+    // Reservations start at multiples of the granularity, as CUDA's do (mappings are made in whole
+    // granularity pages from the start of a reservation).
+    alignment = std::max(alignment, granularity(dev));
+    auto done = [&](std::vector<vk::Buffer> chunks, uint64_t base) {
         res.chunks = std::move(chunks);
         res.chunkSize = chunk;
-        res.base = res.chunks[0].address;
+        res.base = base;
         return VK_SUCCESS;
     };
 
@@ -74,7 +77,14 @@ VkResult createChunks(vk::Device& dev, size_t size, size_t alignment, VmReservat
     vk::Buffer first;
     uint64_t firstOpaque = 0;
     if (VkResult r = dev.createSparseBuffer(n == 1 ? size : chunk, 0, first, firstOpaque)) return r;
-    if (n == 1 && (!alignment || first.address % alignment == 0)) return done({first});
+    if (n == 1 && first.address % alignment == 0) return done({first}, first.address);
+    if (n == 1 && size + alignment <= chunk) {
+        // A lone buffer at an unaligned address (llvmpipe's come from the heap): one that is larger
+        // by the alignment, with the reservation starting inside it.
+        dev.freeBuffer(first);
+        if (VkResult r = dev.createSparseBuffer(size + alignment, 0, first, firstOpaque)) return r;
+        return done({first}, (first.address + alignment - 1) / alignment * alignment);
+    }
     if (!dev.features().addressCaptureReplay) {
         dev.freeBuffer(first);
         VULKANIZER_WARN_ONCE("the device cannot place buffers at chosen addresses (bufferDeviceAddressCaptureReplay): "
@@ -95,7 +105,7 @@ VkResult createChunks(vk::Device& dev, size_t size, size_t alignment, VmReservat
     auto candidate = [&](uint64_t from, uint64_t below, uint64_t above) {
         if (below > from || UINT64_MAX - (from - below) < above) return;
         uint64_t s = from - below + above;
-        if (alignment) s = (s + delta) / alignment * alignment - delta;
+        s = (s + delta) / alignment * alignment - delta;
         if (UINT64_MAX - s >= span) starts.push_back(s);
     };
     candidate(firstOpaque, (n - 1) * chunk, 0);
@@ -131,7 +141,7 @@ VkResult createChunks(vk::Device& dev, size_t size, size_t alignment, VmReservat
             chunks.push_back(b);
             ok = b.address == opaque + delta;
         }
-        if (ok) return done(std::move(chunks));
+        if (ok) return done(std::move(chunks), start + delta);
         for (vk::Buffer& b : chunks)
             if (b.buffer != first.buffer) dev.freeBuffer(b);
     }

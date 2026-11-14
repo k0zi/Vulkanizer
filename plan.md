@@ -397,6 +397,8 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     `cuMemGetAllocationGranularity`; mellette `cuMemHostRegister/Unregister`.
   - Megvalósítás: reserve = `SPARSE_BINDING | SPARSE_RESIDENCY` VkBuffer BDA-val; create = VkDeviceMemory;
     map/unmap = `vkQueueBindSparse` a stream munkájához rendezve. A granularitás a sparse alignment (RADV: 64 KB) és 2 MB közül a nagyobb.
+  - A lefoglalt tartomány bázisa mindig granularitásra igazított (CUDA-garancia; az llvmpipe heapje nem igazít): a
+    nem igazított egyetlen buffer helyett `alignment`-tel nagyobb jön, a bázis azon belül igazítva (2026-11-13).
   - Fő akadály: RADV-n a `maxBufferSize` 4 GB, az aimdo viszont 16 GB-os (cast buffer) és modellméretű (Z-Image: 11,5 GB)
     tartományokat foglal. Ezért egy foglalás több, ≤4 GB-os sparse bufferből áll, egybefüggő címtartományon
     (`bufferDeviceAddressCaptureReplay`, `VkBufferOpaqueCaptureAddressCreateInfo`). A `findAllocation` és a
@@ -754,7 +756,7 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
     különbözteti meg őket) saját argumentum-struktúrát tölt, és a saját shadert indítja (CC-től függetlenül).
     Dropouttal `CUDA_ERROR_NOT_SUPPORTED`.
   - `attention_coopmat.comp` (f16, bf16 ahol van bf16 coopmat; head_dim ≤ 128): flash attention 16×16×16
-    coopmatokon, 256 szálas workgroup, subgroupanként 16 lekérdezés, 32-es kulcsblokkok, a következő K/V-blokk
+    coopmatokon, 256 szálas workgroup, subgroupanként 16 × RT lekérdezés, 16-os kulcsblokkok, a következő K/V-blokk
     regiszterekbe előtöltve. A pontszámok (K Qᵀ, a K sor-folytonos A-mátrix: 64 bites LDS-olvasás) a subgroup
     saját shared soraiba kerülnek; ott a lane-ek (soronként 4 / 2) alkalmazzák a skálát, a biast és a maszkokat,
     online softmax, a valószínűségek f16/bf16-ként vissza a P·V-hez. Az O akkumulátorok regiszterben maradnak, a
@@ -782,6 +784,24 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
     kép az előzőtől átlagosan 0,3–0,8/255-re, a ROCm-tól változatlanul ~5/255-re. `zimage_forward.py`: GPU fp16 vs
     CPU fp16 rel. L2 2,9e-3, a GPU az fp32-től annyira tér el, mint az fp16 maga (OK; új kapcsoló:
     `--extra-model-paths`, a ComfyUI `extra_model_paths.yaml`-ja).
+  - Gyorsítás (2026-11-13), mérés a körök minimumával (a korábbi átlag az órajel-felfutást is mérte; a valós
+    kiindulás 13,3 ms). Ablációval: a szűk keresztmetszet a betöltés és a barrierek, nem a WMMA; az LDS
+    (28,6 KB → 2 workgroup/CU) korlátozta az átfedést.
+    - 16-os kulcsblokk (BN), 32 sornyi Q-staging, párnázott pontszám-tár: 14–19 KB LDS, 3–4 workgroup/CU.
+    - Fetch-terv: a teljes blokkok betöltése szálanként előre kiszámolt eltolásokkal, vektoros olvasással
+      (−1,5 ms); a peremblokkok a régi úton.
+    - Lusta online softmax (FA3): a futó maximum csak 2⁸-nál nagyobb túllépésnél mozdul (`kSlack`), az O
+      átskálázása `subgroupAny(alpha != 1)` mögött (−0,7 ms).
+    - Subgroupanként RT darab 16 soros query-csempe (spec constant): 2, ha a fejméret > 64, egyébként 1
+      (`VULKANIZER_ATTENTION_TILES` felülírja). A V-mátrix egyszer töltődik, mindkét csempe használja.
+    - 9060 XT, 30 fej × 4128²: f16 d128 13,3 → 8,0 ms (19,7 → 32,8 TFLOPS), bf16 d128 13,1 → 8,4, f16 d64
+      9,0 → 8,8. 890M: d128 63 → 39 ms, d64 61 → 41 (bf16 ott a skalár kernel marad). torch SDPA f16 ~18 → 9,8 ms
+      (max. hiba 1,2e-4–2e-3).
+    - Nem nyert: BN = 32 kisebb LDS-sel (d64-en rosszabb), a V transzponálása az LDS-ben (a `ds_load_u16`
+      eltűnt, a sebesség nem változott), 13 KB-os változat (az LDS-allokációs granularitás miatt nincs 5.
+      workgroup/CU), RT = 2 d64-en (8,8 → 10,0 ms).
+    - A ComfyUI-mérés függőben: a mérés idején (strata/unsloth HIP-folyamatok ugyanazon a GPU-n) a régi kóddal is
+      compute ring timeout jött az első lépésnél.
   - Teszt: `tests/attention.cpp` (PyTorch-nevű csonk kernel, 2.14-es `Params`, CPU-referencia: f16 d64/d128/d80
     páratlan stride-okkal, causal + LSE, változó hossz, bf16 bias + GQA, f32 ablak, f32 d200 bias; RADV és
     llvmpipe).
@@ -1515,6 +1535,7 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
 | `VULKANIZER_GEMM_COOP` | `0`/`1`: a cuBLAS f16/bf16 GEMM coopmat vagy tiled kernelen fut; alapból eszközönként egyszer mérve dől el |
 | `VULKANIZER_TORCH_SDPA` | a megtartott SDPA-backendek (alapból `mem_efficient`, a fused attentionnel); `math`: egyik sem; `mem_efficient,flash`: a flash is, és a `run_torch.sh` `VULKANIZER_CC=80`-at állít (6.3) |
 | `VULKANIZER_FUSED_ATTENTION` | `0` = a PyTorch mem-efficient kernelei nem cserélődnek a saját fused attentionre (6.3); `scalar` = mindig a skalár kernel |
+| `VULKANIZER_ATTENTION_TILES` | a coopmat fused attention 16 soros query-csempéinek száma subgroupanként (alapból 2, ha a fejméret > 64, különben 1; 6.3) |
 | `VULKANIZER_BUILTIN_KERNELS` | `0` = a könyvtárkernelek (PyTorch mem-efficient attention, `im2col_kernel`) nem cserélődnek Vulkanizer saját shadereire, a PTX-ük fordul le (6.3, 6.3b) |
 | `VULKANIZER_NPU` | NPU offload (7.): `off` (alap; 7.2: a másolós út nem nyer), `auto` (a policy dönt), `force` (minden, amit a backend tud) |
 | `VULKANIZER_NPU_BACKEND` | `auto` (alap: a felderített NPU szerint), `xdna` (AMD, XRT), `cpu` (host referencia, teszthez; NPU nem kell) |

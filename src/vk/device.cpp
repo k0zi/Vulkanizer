@@ -645,6 +645,7 @@ VkResult Device::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
     for (VkMemoryPropertyFlags pref : preferences) {
         int32_t type = findMemoryType(req.memoryTypeBits, pref);
         if (type < 0) continue;
+        if (!fitsVramBudget(uint32_t(type), req.size)) continue;
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.pNext = wantAddress ? static_cast<void*>(&flagsInfo) : static_cast<void*>(&dedicated);
         mai.allocationSize = req.size;
@@ -700,6 +701,7 @@ void Device::memoryInfo(VkDeviceSize allocated, VkDeviceSize& free, VkDeviceSize
     for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; ++i)
         if (mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
             sum += budget.heapBudget[i] > budget.heapUsage[i] ? budget.heapBudget[i] - budget.heapUsage[i] : 0;
+    if (info_.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) sum = sum > kVramReserve ? sum - kVramReserve : 0;
     free = std::min(sum, total);
 }
 
@@ -710,12 +712,13 @@ VkResult Device::allocateBuffer(VkDeviceSize size, Buffer& out) {
 
 VkResult Device::allocateDedicated(VkDeviceSize size, Buffer& out) {
     // Prefer memory that is both device-local and host-mappable (UMA / ReBAR): copies become memcpy.
+    // Discrete GPUs: VRAM or out of memory, as with CUDA (system memory behind the bus is slow).
+    const bool discrete = info_.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     auto attempt = [&] {
-        return createBuffer(size, kDeviceBufferUsage,
-                            {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0},
-                            out, true);
+        constexpr VkMemoryPropertyFlags kRebar = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        return discrete ? createBuffer(size, kDeviceBufferUsage, {kRebar, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT}, out, true)
+                        : createBuffer(size, kDeviceBufferUsage, {kRebar, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0}, out, true);
     };
     reapDeferredFrees();
     VkResult r = attempt();
@@ -1302,14 +1305,20 @@ VkResult Device::allocateMemory(VkDeviceSize size, VkDeviceMemory& out) {
     VkMemoryAllocateFlagsInfo flagsInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
     flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    const bool discrete = info_.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     for (VkMemoryPropertyFlags pref : {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), VkMemoryPropertyFlags(0)}) {
+        if (discrete && !pref) break;  // VRAM or out of memory, as with CUDA (see allocateDedicated)
         const int32_t type = findMemoryType(sparseMemoryTypes_, pref);
         if (type < 0) continue;
+        if (!fitsVramBudget(uint32_t(type), size)) continue;
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mai.pNext = &flagsInfo;
         mai.allocationSize = size;
         mai.memoryTypeIndex = uint32_t(type);
-        if ((r = vkAllocateMemory(device_, &mai, nullptr, &out)) == VK_SUCCESS) return r;
+        if ((r = vkAllocateMemory(device_, &mai, nullptr, &out)) == VK_SUCCESS) {
+            if (!pref) sparseInSystem_.store(true, std::memory_order_relaxed);
+            return r;
+        }
     }
     return r;
 }
@@ -1600,16 +1609,44 @@ VkResult Device::waitBatch(Batch& b) {
     return VK_SUCCESS;
 }
 
-VkResult Device::record(const std::function<void(VkCommandBuffer)>& commands) {
+VkResult Device::record(const std::function<void(VkCommandBuffer)>& commands, double estimateNs) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (estimateNs > 0 && batchBudgetNs_ > 0 && open_ >= 0 && commands_ &&
+        batches_[open_].estimateNs + estimateNs > batchBudgetNs_) {
+        if (VkResult r = flushLocked()) return r;
+    }
     if (open_ < 0) {
         if (VkResult r = beginBatch()) return r;
     }
+    batches_[open_].estimateNs += estimateNs;
     VkCommandBuffer cb = batches_[open_].cmd;
     fullBarrier(cb);  // CUDA orders all work; finer-grained dependencies can come later
     commands(cb);
     if (++commands_ >= kMaxCommandsPerBatch) return flushLocked();
     return VK_SUCCESS;
+}
+
+bool Device::fitsVramBudget(uint32_t type, VkDeviceSize size) const {
+    if (!memoryBudget_ || info_.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return true;
+    const VkMemoryType& t = info_.memProps.memoryTypes[type];
+    if (!(t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return true;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    mp.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(info_.handle, &mp);
+    return budget.heapUsage[t.heapIndex] + size + kVramReserve <= budget.heapBudget[t.heapIndex];
+}
+
+bool Device::inVram(const Buffer& b) const {
+    if (b.hostAddressed) return false;
+    if (!b.memory) return !sparseInSystem_.load(std::memory_order_relaxed);  // sparse (VMM): allocateMemory
+    return (info_.memProps.memoryTypes[b.memoryType].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+}
+
+double Device::transferEstimateNs(VkDeviceSize size, const Buffer& a, const Buffer* b) const {
+    constexpr double kVramNsPerByte = 0.01;  // 100 GB/s
+    constexpr double kLinkNsPerByte = 1.0;   // 1 GB/s
+    return double(size) * (inVram(a) && (!b || inVram(*b)) ? kVramNsPerByte : kLinkNsPerByte);
 }
 
 uint64_t Device::currentSerial() {
@@ -2007,15 +2044,27 @@ VkResult Device::copy(const Buffer& src, VkDeviceSize srcOffset, const Buffer& d
             return r;
         return joinCopies();
     }
-    return record([&](VkCommandBuffer cb) {  // device to device: no host synchronization
-        VkBufferCopy region{src.offset + srcOffset, dst.offset + dstOffset, size};
-        vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
-    });
+    // Device to device: no host synchronization. In pieces of at most the batch budget, so that a
+    // copy over the host link cannot run into the GPU timeout on its own.
+    const double nsPerByte = transferEstimateNs(1, src, &dst);
+    const VkDeviceSize piece =
+        batchBudgetNs_ > 0 ? std::max<VkDeviceSize>(VkDeviceSize(batchBudgetNs_ / nsPerByte) & ~VkDeviceSize(255), 1 << 20)
+                           : size;
+    for (VkDeviceSize at = 0; at < size; at += piece) {
+        const VkDeviceSize n = std::min(piece, size - at);
+        if (VkResult r = record([&](VkCommandBuffer cb) {
+                VkBufferCopy region{src.offset + srcOffset + at, dst.offset + dstOffset + at, n};
+                vkCmdCopyBuffer(cb, src.buffer, dst.buffer, 1, &region);
+            }, double(n) * nsPerByte))
+            return r;
+    }
+    return VK_SUCCESS;
 }
 
 VkResult Device::fill(const Buffer& dst, VkDeviceSize offset, VkDeviceSize size, uint32_t pattern) {
     if (size == 0) return VK_SUCCESS;
-    return record([&](VkCommandBuffer cb) { vkCmdFillBuffer(cb, dst.buffer, dst.offset + offset, size, pattern); });
+    return record([&](VkCommandBuffer cb) { vkCmdFillBuffer(cb, dst.buffer, dst.offset + offset, size, pattern); },
+                  transferEstimateNs(size, dst));
 }
 
 VkResult Device::createComputePipeline(const uint32_t* code, size_t wordCount, const char* entryPoint,

@@ -3,6 +3,7 @@
 #include "common/device_address.h"
 #include "vk/instance.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -264,7 +265,20 @@ private:
     // Runs commands immediately and waits (after all recorded work).
     VkResult submit(const std::function<void(VkCommandBuffer)>& record);
     // Records into the open batch, starting one if needed.
-    VkResult record(const std::function<void(VkCommandBuffer)>& commands);
+    // estimateNs: the commands' expected GPU time, counted against the batch budget like a dispatch's.
+    VkResult record(const std::function<void(VkCommandBuffer)>& commands, double estimateNs = 0);
+    // Expected GPU time of a copy or fill touching these buffers: VRAM bandwidth when all of them are in
+    // VRAM, otherwise the host link's (an eGPU's USB4 link can be as slow as ~1 GB/s; a batch of 64
+    // uncounted 64 MiB copies over it outran the kernel driver's 2 s timeout).
+    double transferEstimateNs(VkDeviceSize size, const Buffer& a, const Buffer* b = nullptr) const;
+    bool inVram(const Buffer& b) const;
+    // Discrete GPUs: whether `size` more bytes of memory type `type` stay within the device-local heap's
+    // budget (VK_EXT_memory_budget, other processes' use included) minus kVramReserve. RADV does not fail
+    // an allocation beyond it but places it in system memory, behind the host link (an eGPU's USB4: 1.5-4
+    // GB/s), where kernels run so slowly that batches outlast the 2 s GPU timeout; CUDA fails it instead
+    // (ComfyUI's dynamic VRAM then gives memory back).
+    bool fitsVramBudget(uint32_t type, VkDeviceSize size) const;
+    static constexpr VkDeviceSize kVramReserve = 256ull << 20;
     bool probeFusedFma();
     bool probeFusedFma64();
     void probeSparse();
@@ -396,6 +410,7 @@ private:
     VkDeviceSize sparsePageSize_ = 0;
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
+    std::atomic<bool> sparseInSystem_{false};  // allocateMemory fell back to non-device-local memory
     VkDeviceSize hostImportAlignment_ = 0;
     VkDeviceSize placedMapAlignment_ = 4096;
     uint32_t addressHigh_ = 0;  // hostAddressBits() >> 32
