@@ -5,6 +5,7 @@
 #include "common/log.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <regex>
 
@@ -157,8 +158,16 @@ CUresult launchAttention(ApiScope& s, CUfunction f, const unsigned grid[3], cons
                          a.vStrideB % 8 == 0;
     a.flags = elem == 2 && aligned ? kVectorLoads : 0;
 
-    const uint32_t subgroups = 256 / subgroup;  // attention_coopmat.comp: 256 invocations, 16 rows per subgroup
-    const uint32_t rowsPerGroup = coop ? 16 * subgroups : 32;
+    // attention_coopmat.comp: 256 invocations, 16 * tiles query rows per subgroup
+    const uint32_t subgroups = 256 / subgroup;
+    static const uint32_t tilesEnv = [] {
+        const char* v = std::getenv("VULKANIZER_ATTENTION_TILES");
+        return v ? uint32_t(std::atoi(v)) : 0u;
+    }();
+    // Two tiles (twice the queries per K / V block) pay off above head dimension 64 (9060 XT: d128 8.5 ->
+    // 8.0 ms, 890M 56 -> 39; d64 8.8 -> 10.0 on the 9060 XT).
+    const uint32_t tiles = tilesEnv ? tilesEnv : std::max(a.headDim, a.headDimV) > 64 ? 2 : 1;
+    const uint32_t rowsPerGroup = coop ? 16 * subgroups * tiles : 32;
     a.slices = coop ? 1 : (a.headDimV + 63) / 64;
     const uint64_t queries = uint64_t(grid[0]) * f->builtinParam;
     const uint32_t groupsX = uint32_t((queries + rowsPerGroup - 1) / rowsPerGroup);
@@ -178,8 +187,8 @@ CUresult launchAttention(ApiScope& s, CUfunction f, const unsigned grid[3], cons
     }
     // Specialization: workgroup size, head_dim and head_dim_value in 16-column tiles, subgroups per
     // workgroup (0: the scalar kernel, which keeps the two apart in the function's pipeline table).
-    const std::array<uint32_t, 5> spec{coop ? 256 : 128, uint32_t(coop ? (a.headDim + 15) / 16 : 0),
-                                       uint32_t(coop ? (a.headDimV + 15) / 16 : 0), coop ? subgroups : 0, 1};
+    const std::array<uint32_t, 5> spec{coop ? 256u : 128u, uint32_t(coop ? (a.headDim + 15) / 16 : 0),
+                                       uint32_t(coop ? (a.headDimV + 15) / 16 : 0), coop ? subgroups : 0, coop ? tiles : 1};
     auto it = f->pipelines.find(spec);
     if (it == f->pipelines.end()) {
         vk::ComputePipeline pipeline;
