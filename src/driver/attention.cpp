@@ -164,9 +164,9 @@ CUresult launchAttention(ApiScope& s, CUfunction f, const unsigned grid[3], cons
         const char* v = std::getenv("VULKANIZER_ATTENTION_TILES");
         return v ? uint32_t(std::atoi(v)) : 0u;
     }();
-    // Two tiles (twice the queries per K / V block) pay off above head dimension 64 (9060 XT: d128 8.5 ->
-    // 8.0 ms, 890M 56 -> 39; d64 8.8 -> 10.0 on the 9060 XT).
-    const uint32_t tiles = tilesEnv ? tilesEnv : std::max(a.headDim, a.headDimV) > 64 ? 2 : 1;
+    // Two tiles (twice the queries per K / V block): 9060 XT 30 x 4128^2 d128 8.2 -> 6.6 ms, 60 heads d64
+    // 9.4 -> 7.5; 890M d128 67 -> 42, d64 58 -> 50.
+    const uint32_t tiles = tilesEnv ? tilesEnv : 2;
     const uint32_t rowsPerGroup = coop ? 16 * subgroups * tiles : 32;
     a.slices = coop ? 1 : (a.headDimV + 63) / 64;
     const uint64_t queries = uint64_t(grid[0]) * f->builtinParam;

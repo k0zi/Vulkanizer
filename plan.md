@@ -1477,6 +1477,32 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
   - ComfyUI Z-Image 1024², 8 lépés, `--bf16-vae`, meleg futás: 40,0 → 34,8 s (3,55 → 3,13 s/lépés). A kép bitre
     azonos az előzővel; a ROCm-tól átlagosan ~5/255.
   - llama.cpp pp512: 9060 ~1360 (zajos), 890M 312 → 338, MoE 2× 9060 530 → 578; tg változatlan (47,7).
+- [x] **4 KiB-os sorlépés a coopmat GEMM-ben** (2026-11-15): a ComfyUI-alakok bemelegített órajellel (1,5 s
+  előfuttatás; enélkül az elsőként mért alak 30%-kal lassabb) 47–51 TFLOPS-on futnak (ROCm bf16: 46–57), kivéve az
+  FFN `w2`-t (3840 × 4128 × 10240): 26 TFLOPS (ROCm 46). Ok: ha mindkét k mentén folytonos operandus sorai 4 KiB
+  többszörösére vannak egymástól (f16 k = 4096, 10240), egy k-lépésben A és B sorai ugyanazokra a cache-készletekre
+  esnek, és a közös operandusok kiesnek, mielőtt a többi workgroup hozzájuk érne. `lda` + 8 elem: 47, B alapcíme
+  + 2 KiB: 45 TFLOPS. Kipróbálva, nem nyert: a k-lépések forgatása csempénként (26 → 29,7, a 4096³ romlik), k-darabolás
+  (31–34). Javítás: ilyenkor a kisebbik operandus előbb 64 elemmel hosszabb sorlépésű munkapufferbe másolódik
+  (`repitch.comp`, a handle-ön tartott puffer; `cuMemcpy2DAsync` soronkénti parancsai ehhez lassúak, 4 MB 1,15 ms).
+  Csak sok csempénél (a kettős pufferes és a kis csempés út kimarad: 4096 × 512 × 4096-nál nincs különbség).
+  9060 XT: `w2` 12,4 → 7,5 ms (ROCm 7,0), 4096³ 5,0 → 3,25 ms; 890M: `w2` 60,8 → 42,1 ms. ComfyUI meleg futás
+  23,6 → 22,85 s (KSampler 1,6 → 1,46 s/lépés; ROCm 1,25), a kép bitre azonos. Teszt: `cublas` „repitch A/B”
+  (mintavételezett referencia; elrontott sorlépéssel elbukik). `VULKANIZER_GEMM_REPITCH=0` kikapcsolja.
+  - Mérés mellékesen: a ROCm meleg futásainak képe hibás (csak a hideg futásé jó), így a ROCm 20,3 s-os meleg
+    teljes ideje nem tiszta viszonyítás; a lépésidő (1,25 s) a hideg futásban is ugyanannyi. A ComfyUI AMD-n
+    aotriton flash attentiont kapcsol be: 7,2 ms a mi 8,3 ms-unkkal szemben (30 fej × 4128 × 128, f16).
+  - bf16 számolás (`VULKANIZER_CC=80`, ahogy a ROCm-on fut): 1,47 s/lépés, nem gyorsabb; a CC marad 7.5.
+- [x] **Fused attention: konstans sor-hozzárendelés a softmaxban (2026-11-15).** Az ISA (`RADV_DEBUG=shaders`)
+  szerint a softmax a blokk minden pontszámát külön 32 bites LDS-olvasással kérte, mindegyik után
+  `s_wait_dscnt 0`-val, előjeles osztással: a soronkénti lane-szám és a lane-enkénti pontszámszám a
+  `gl_SubgroupSize`-ból jött, ami a SPIR-V-ben nem konstans. Most a subgroup-méret `gl_WorkGroupSize.x / NSG`
+  (a host 256 / subgroup-méretre állítja az NSG-t), így minden konstans: a pontszámok uvec4-enként jönnek, a
+  valószínűségek uvec4-felenként mennek vissza, előjel nélküli indexszel. A d64 is két csempével fut (eddig egy).
+  - 9060 XT, f16, 4128²: d128 30 fej 8,25 → 6,6 ms (ROCm aotriton 7,1–7,2), d64 60 fej 11,9 → 7,5 ms.
+    890M: d128 67 → 42 ms, d64 60 → 50 ms.
+  - ComfyUI meleg futás 22,85 → 22,5 s (KSampler 16,45 → 16,05 s, 1,37–1,41 s/lépés), a kép bitre azonos (a
+    softmax műveletei nem változtak). `./test.sh --all-devices`: mint eddig (llvmpipe: `npu_async`).
 - [ ] Nyitva (pp): a MoE-modellnél a GEMM csak 27%: 44 ezer kernelindítás promptonként (sok kis `quantize_q8_1`,
   `mul_mat_q` darab), a lefordított int8 MMQ-kernelek lassúak – ez a PTX-fordítón múlik. A dense modelleknél a
   `dequantize_block_q4_K` (11%) a sávszélesség felén fut. A profil „GPU idle” sora több eszköznél hibás (az eszközök
@@ -1557,13 +1583,14 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
 | `VULKANIZER_COOPMAT` | Cooperative matrix a cuBLAS f16 GEMM-hez: alapból csak GPU-n, `0` = ki, `1` = CPU-s eszközön is (6.6) |
 | `VULKANIZER_SOFT_F16_CVT` | `1` = az f32 → f16 kerekítés egész-kóddal (nem a GPU konverziójával, RTE float controls nélküli eszközök útja) |
 | `VULKANIZER_GEMM_DBUF_TILES` | a coopmat GEMM két shared pufferes változata legfeljebb ennyi 128 × 128-as csempénél / compute unit (alap: 16; `0` = soha) |
+| `VULKANIZER_GEMM_REPITCH` | `0`: a coopmat GEMM nem másolja át a 4 KiB többszörösére eső sorlépésű operandust (alap: átmásolja, ha mindkét operandus ilyen és sok a csempe) |
 | `VULKANIZER_NO_BF16_COOPMAT` | nem kapcsolja be a bf16 cooperative matrixokat (`VK_KHR_shader_bfloat16`); a bf16 GEMM a tiled kernelen fut |
 | `VULKANIZER_QUEUE` | `graphics` = a kernelek is a graphics + compute queue-családon futnak a compute-only helyett (kísérlet; a gyors host ↔ VRAM másolást már a copy queue adja, lásd `VULKANIZER_COPY_QUEUE`) |
 | `VULKANIZER_COPY_QUEUE` | a host ↔ device másolások queue-ja diszkrét GPU-n: alapból SDMA (RADV-n a Vulkanizer `RADV_PERFTEST=transfer_queue`-t állít), ahol nincs, a compute queue; `graphics`: a graphics család (egy kernelhiba ilyenkor teljes GPU-resetet okoz, a desktoppal együtt); `0`: mindig a compute queue |
 | `VULKANIZER_GEMM_COOP` | `0`/`1`: a cuBLAS f16/bf16 GEMM coopmat vagy tiled kernelen fut; alapból eszközönként egyszer mérve dől el |
 | `VULKANIZER_TORCH_SDPA` | a megtartott SDPA-backendek (alapból `mem_efficient`, a fused attentionnel); `math`: egyik sem; `mem_efficient,flash`: a flash is, és a `run_torch.sh` `VULKANIZER_CC=80`-at állít (6.3) |
 | `VULKANIZER_FUSED_ATTENTION` | `0` = a PyTorch mem-efficient kernelei nem cserélődnek a saját fused attentionre (6.3); `scalar` = mindig a skalár kernel |
-| `VULKANIZER_ATTENTION_TILES` | a coopmat fused attention 16 soros query-csempéinek száma subgroupanként (alapból 2, ha a fejméret > 64, különben 1; 6.3) |
+| `VULKANIZER_ATTENTION_TILES` | a coopmat fused attention 16 soros query-csempéinek száma subgroupanként (alapból 2; 6.3) |
 | `VULKANIZER_BUILTIN_KERNELS` | `0` = a könyvtárkernelek (PyTorch mem-efficient attention, `im2col_kernel`) nem cserélődnek Vulkanizer saját shadereire, a PTX-ük fordul le (6.3, 6.3b) |
 | `VULKANIZER_NPU` | NPU offload (7.): `off` (alap; 7.2: a másolós út nem nyer), `auto` (a policy dönt), `force` (minden, amit a backend tud) |
 | `VULKANIZER_NPU_BACKEND` | `auto` (alap: a felderített NPU szerint), `xdna` (AMD, XRT), `cpu` (host referencia, teszthez; NPU nem kell) |

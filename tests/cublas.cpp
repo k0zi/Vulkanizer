@@ -547,6 +547,43 @@ void testGrouped(cublasHandle_t h) {
     if (!ok) ++g_failures;
 }
 
+// TN products whose operands' rows lie a multiple of 4 KiB apart (lda = ldb = 2048 f16), with enough
+// tiles that a GPU's cooperative matrix kernel first copies the smaller operand with a padded pitch
+// (repitch, cublas.cpp): A copied (m <= n) and B copied, edges, beta. Checked on a sample of C (the
+// whole product is too slow for the reference): every 7th row and column plus the last ones.
+void testRepitch(cublasHandle_t h) {
+    struct R { const char* name; int m, n; cudaDataType typeC; float beta; };
+    const R cases[] = {{"repitch A, f32 C", 3000, 3100, CUDA_R_32F, 0.5f}, {"repitch B, f16 C", 3100, 3000, CUDA_R_16F, 0.0f}};
+    const int k = 1024, ld = 2048;
+    for (const R& c : cases) {
+        const int ldc = c.m + 2;
+        Matrix A(CUDA_R_16F, size_t(ld) * c.m, 11), B(CUDA_R_16F, size_t(ld) * c.n, 12), C(c.typeC, size_t(ldc) * c.n, 13);
+        const float alpha = 1.0f;
+        CHECK_BLAS(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, c.m, c.n, k, &alpha, reinterpret_cast<const void*>(A.dev),
+                                CUDA_R_16F, ld, reinterpret_cast<const void*>(B.dev), CUDA_R_16F, ld, &c.beta,
+                                reinterpret_cast<void*>(C.dev), c.typeC, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        const std::vector<float> got = C.download();
+        const float relTol = c.typeC == CUDA_R_32F ? 1e-5f : 2e-3f;
+        bool ok = true;
+        const auto next = [](int x, int count) { return x + 7 < count ? x + 7 : x + 1 < count ? count - 1 : count; };
+        for (int j = 0; j < c.n && ok; j = next(j, c.n))
+            for (int i = 0; i < c.m && ok; i = next(i, c.m)) {
+                double acc = 0;
+                for (int l = 0; l < k; ++l) acc += double(A.values[size_t(i) * ld + l]) * double(B.values[size_t(j) * ld + l]);
+                const size_t at = size_t(i) + size_t(j) * ldc;
+                float want = float(alpha * acc + double(c.beta) * C.values[at]);
+                if (c.typeC == CUDA_R_16F) want = fromHalf(toHalf(want));
+                const float tol = relTol * std::fmax(1.0f, std::fabs(want)) * std::sqrt(float(k) + 1.0f);
+                if (!(std::fabs(got[at] - want) <= tol)) {
+                    std::fprintf(stderr, "  %s: C[%d, %d] = %g, want %g\n", c.name, i, j, got[at], want);
+                    ok = false;
+                }
+            }
+        std::printf("%-28s %s\n", c.name, ok ? "ok" : "FAILED");
+        if (!ok) ++g_failures;
+    }
+}
+
 int main() {
     CHECK_CU(cuInit(0));
     CUdevice dev;
@@ -647,6 +684,7 @@ int main() {
     testTrsm(h);
     testDgemm(h);
     testGrouped(h);
+    testRepitch(h);
     testSgemv(h);
     testLt(h);
 

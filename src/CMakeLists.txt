@@ -165,7 +165,7 @@ set_target_properties(vulkanizer_cudart13 PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${
 set(cublas_gen ${CMAKE_CURRENT_BINARY_DIR}/cublas)
 set(cublas_shaders)
 # name:source[:define] -- variants of one source compiled with different defines.
-foreach(entry gemm:gemm gemm_tiled:gemm_tiled trsm:trsm gemv:gemv epilogue:epilogue npu:npu gemm_f16_tn:gemm_f16_tn gemm_f16_tn_h:gemm_f16_tn:C_F16
+foreach(entry gemm:gemm gemm_tiled:gemm_tiled repitch:repitch trsm:trsm gemv:gemv epilogue:epilogue npu:npu gemm_f16_tn:gemm_f16_tn gemm_f16_tn_h:gemm_f16_tn:C_F16
     gemm_f16_tn_m:gemm_f16_tn:F16_MATH gemm_f16_tn_mh:gemm_f16_tn:F16_MATH,C_F16
     gemm_coopmat16:gemm_coopmat:S=16,DIRECT_STORE gemm_coopmat16_h:gemm_coopmat:S=16,C_F16,DIRECT_STORE
     gemm_coopmat16s:gemm_coopmat:S=16,SMALL_TILE,DIRECT_STORE gemm_coopmat16s_h:gemm_coopmat:S=16,SMALL_TILE,C_F16,DIRECT_STORE

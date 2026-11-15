@@ -96,6 +96,16 @@ const uint32_t kTrsmSpirv[] = {
 const uint32_t kNpuSpirv[] = {
 #include "npu.comp.inc"
 };
+const uint32_t kRepitchSpirv[] = {
+#include "repitch.comp.inc"
+};
+
+// Push constants of repitch.comp (std430).
+struct RepitchParams {
+    uint64_t src, dst;
+    uint64_t srcPitch, dstPitch;
+    int32_t vecs, rows;
+};
 
 // Push constants of npu.comp (std430).
 struct NpuParams {
@@ -197,6 +207,14 @@ struct cublasContext {
     int forcePath = 0;    // while measuring: 1 = cooperative matrices, 2 = the tiled kernel
     CUfunction npu = nullptr;  // npu.comp: packing and epilogue of the zero-copy NPU path
     CUfunction trsm = nullptr;
+    // An operand copied with a padded pitch before the product (gemm_coopmat: rows 4 KiB apart).
+    // Every stream of a device runs on one queue, in order, so one buffer serves them all.
+    CUdeviceptr padded = 0;
+    size_t paddedBytes = 0;
+    CUfunction repitch = nullptr;  // repitch.comp
+    ~cublasContext() {
+        if (padded) cuMemFree(padded);
+    }
 };
 
 namespace {
@@ -579,6 +597,50 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g);
 // given: on RDNA4 it is about twice as fast, on RDNA3.5 (Radeon 890M) three times slower. Measured
 // once per device, on a 1024^3 f16 product of scratch memory on a stream of its own (both kernels
 // timed by events after a warm-up launch). VULKANIZER_GEMM_COOP=0/1 decides instead.
+// Both operands contiguous along k with rows a multiple of 4 KiB apart (f16 k = 4096, 10240, ...):
+// within a k step the rows of A and of B fall on the same cache sets, and the products' operands
+// leave the caches before the other workgroups that share them get to them. 9060 XT, gemm_coopmat
+// 3840 x 4128 x 10240: 26 TFLOPS; 47 with lda = 10248, 48 with 10304; 4096^3: 27 -> 45. The smaller
+// operand is then copied with a pitch 64 values longer first (twice its bytes of memory traffic,
+// 0.6 ms of the 5 saved there). Single products only; kept as it is where the copy cannot be made.
+void repitch(cublasHandle_t h, const Gemm& g, uint32_t layout, GemmParams& p) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("VULKANIZER_GEMM_REPITCH");
+        return !env || std::strcmp(env, "0") != 0;
+    }();
+    const auto aliased = [](long long ld) { return (2 * ld) % 4096 == 0; };
+    if (!enabled || layout != 3u || g.batch != 1 || g.pointerArrays || g.k < 1024 || g.k % 8 != 0 ||
+        !aliased(g.lda) || !aliased(g.ldb))
+        return;
+    if (!h->repitch &&
+        vulkanizerCreateSpirvFunction(&h->repitch, kRepitchSpirv, sizeof kRepitchSpirv / 4, "main", sizeof(RepitchParams)) != CUDA_SUCCESS) {
+        h->repitch = nullptr;
+        return;
+    }
+    const bool copyA = g.m <= g.n;
+    const size_t lines = size_t(copyA ? g.m : g.n), pitch = (size_t(copyA ? g.lda : g.ldb) + 64) * 2;
+    const size_t bytes = lines * pitch;
+    if (bytes > h->paddedBytes) {
+        CUstreamCaptureStatus capture = CU_STREAM_CAPTURE_STATUS_NONE;
+        if (cuStreamIsCapturing(h->stream, &capture) != CUDA_SUCCESS || capture != CU_STREAM_CAPTURE_STATUS_NONE) return;
+        if (h->padded) cuMemFree(h->padded);
+        h->padded = 0, h->paddedBytes = 0;
+        if (cuMemAlloc(&h->padded, bytes) != CUDA_SUCCESS) {
+            h->padded = 0;
+            return;
+        }
+        h->paddedBytes = bytes;
+    }
+    RepitchParams q{copyA ? p.a : p.b, uint64_t(h->padded), uint64_t(copyA ? g.lda : g.ldb) * 2, pitch, g.k / 8, int(lines)};
+    size_t size = sizeof q;
+    void* extra[] = {CU_LAUNCH_PARAM_BUFFER_POINTER, &q, CU_LAUNCH_PARAM_BUFFER_SIZE, &size, CU_LAUNCH_PARAM_END};
+    if (cuLaunchKernel(h->repitch, (unsigned(q.vecs) + 63) / 64, (unsigned(lines) + 3) / 4, 1, 64, 4, 1, 0, h->stream, nullptr,
+                       extra) != CUDA_SUCCESS)
+        return;
+    if (copyA) p.a = h->padded, p.lda = int(pitch / 2);
+    else p.b = h->padded, p.ldb = int(pitch / 2);
+}
+
 bool coopFaster(cublasHandle_t h) {
     if (h->coopFaster >= 0) return h->coopFaster > 0;
     if (const char* env = std::getenv("VULKANIZER_GEMM_COOP"); env && *env) return (h->coopFaster = std::strcmp(env, "0") != 0) > 0;
@@ -824,6 +886,7 @@ cublasStatus_t run(cublasHandle_t h, const Gemm& g) {
             if (vulkanizerCreateSpirvFunction(&fn, specialized.data(), specialized.size(), "main", sizeof(GemmParams)) != CUDA_SUCCESS)
                 return CUBLAS_STATUS_INTERNAL_ERROR;
         }
+        if (s16 && !small && !dbuf) repitch(h, g, layout, p);  // few tiles (4096 x 512 x 4096): no difference
         const unsigned tile = (small ? 4 : 8) * unsigned(h->coopSize);
         const unsigned gx = (unsigned(g.m) + tile - 1) / tile, gy = (unsigned(g.n) + tile - 1) / tile;
         for (int first = 0; first < g.batch; first += int(kMaxGridZ)) {

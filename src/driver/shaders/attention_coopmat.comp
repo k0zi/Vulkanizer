@@ -45,6 +45,12 @@ layout(constant_id = 3) const int NSG = 4;
 // 16-row tiles of queries per subgroup: each K / V matrix read from shared memory goes into RT products.
 layout(constant_id = 4) const int RT = 1;
 const int S = 16, SR = RT * S, BM = NSG * SR;
+// The subgroup size (the host sets NSG to 256 / subgroup size), and from it the lanes per score row and the
+// scores per lane: constants, so a lane reads its scores with vector loads (with gl_SubgroupSize, 8 dependent
+// 32-bit LDS loads per block on RADV).
+const int SGS = int(gl_WorkGroupSize.x) / NSG;
+const int L = SGS / SR;   // lanes per score row
+const int CPL = BN / L;   // scores per lane (a multiple of 4)
 const int QROWS = 32;  // Q goes through shared memory QROWS rows at a time
 const int LDK = DQ * 2 + 1;   // uvec4 (8 values) per K row, padded
 const int LDV = DV * 2 + 1;   // uvec4 per V row, padded
@@ -185,8 +191,6 @@ void main() {
     if (q0 >= pr.numQ) return;  // variable lengths: past this sequence
 
     const int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
-    const int L = int(gl_SubgroupSize) / SR;  // lanes per score row
-    const int CPL = BN / L;                   // scores per lane
     const int myRow = lane / L, part = lane - myRow * L;
     const int sgBase = sg * SR * LDS, sgRow = sg * SR;
     const bool vector = (a.flags & kVectorLoads) != 0u;
@@ -254,18 +258,21 @@ void main() {
 
         // online softmax over this lane's CPL scores of its row (whole: every key of the block is seen)
         const bool whole = mask.type == 0 && mask.window == 0 && k0 + BN <= pr.numK;
-        float x[BN];
-        float rowMax = -kInf;
-        [[unroll]] for (int c = 0; c < BN; ++c) {
-            if (c >= CPL) break;
-            const int col = part * CPL + c, key = k0 + col;
-            const uvec4 w = sp[sgBase + myRow * LDS + col / 4];
-            float v = uintBitsToFloat(w[col % 4]) * scale2;
-            if (hasBias) v = (v + fromBits(U16(biasRow + uint64_t(min(key, pr.numK - 1)) * 2ul).v)) * kLog2e;
-            if (!whole && !visible(mask, pr, query, key)) v = -kInf;
-            x[c] = v;
-            rowMax = max(rowMax, v);
+        float x[CPL];
+        [[unroll]] for (int c4 = 0; c4 < CPL / 4; ++c4) {
+            const vec4 w = uintBitsToFloat(sp[sgBase + myRow * LDS + part * (CPL / 4) + c4]);
+            [[unroll]] for (int e = 0; e < 4; ++e) x[c4 * 4 + e] = w[e] * scale2;
         }
+        if (hasBias)
+            [[unroll]] for (int c = 0; c < CPL; ++c) {
+                const int key = k0 + part * CPL + c;
+                x[c] = (x[c] + fromBits(U16(biasRow + uint64_t(min(key, pr.numK - 1)) * 2ul).v)) * kLog2e;
+            }
+        if (!whole)
+            [[unroll]] for (int c = 0; c < CPL; ++c)
+                if (!visible(mask, pr, query, k0 + part * CPL + c)) x[c] = -kInf;
+        float rowMax = -kInf;
+        [[unroll]] for (int c = 0; c < CPL; ++c) rowMax = max(rowMax, x[c]);
         for (int d = 1; d < L; d *= 2) rowMax = max(rowMax, subgroupShuffleXor(rowMax, d));
         // The running maximum only moves when a score passes it by more than kSlack (the probabilities
         // stay below 2^kSlack, fine for f16 / bf16 and the f32 sums), so the outputs are rarely rescaled.
@@ -273,8 +280,7 @@ void main() {
         const float mUse = mNew == -kInf ? 0.0 : mNew;
         const float alpha = exp2(m - mUse);
         float sum = 0.0;
-        [[unroll]] for (int c = 0; c < BN; ++c) {
-            if (c >= CPL) break;
+        [[unroll]] for (int c = 0; c < CPL; ++c) {
             x[c] = exp2(x[c] - mUse);
             sum += x[c];
         }
@@ -282,10 +288,14 @@ void main() {
         l = l * alpha + sum;
         m = mNew;
         subgroupBarrier();  // every lane has read its scores before the probabilities overwrite them
-        [[unroll]] for (int c = 0; c < BN; c += 2) {  // CPL is even (at least 2)
-            if (c >= CPL) break;
-            const int col = part * CPL + c;
-            sp[sgBase + myRow * LDP + col / 8][(col % 8) / 2] = uint(toBits(x[c])) | uint(toBits(x[c + 1])) << 16;
+        [[unroll]] for (int c = 0; c < CPL; c += 4) {  // 4 probabilities: a half of a uvec4
+            const uvec2 w = uvec2(uint(toBits(x[c])) | uint(toBits(x[c + 1])) << 16,
+                                  uint(toBits(x[c + 2])) | uint(toBits(x[c + 3])) << 16);
+            const int at = sgBase + myRow * LDP + int(uint(part * CPL + c) / 8u);
+            if (CPL % 8 == 0 ? c % 8 == 0 : (part & 1) == 0)
+                sp[at].xy = w;
+            else
+                sp[at].zw = w;
         }
         const bool rescale = subgroupAny(alpha != 1.0);
         if (rescale && part == 0) rowScale[sgRow + myRow] = alpha;
