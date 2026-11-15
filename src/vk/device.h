@@ -276,7 +276,9 @@ private:
     // budget (VK_EXT_memory_budget, other processes' use included) minus kVramReserve. RADV does not fail
     // an allocation beyond it but places it in system memory, behind the host link (an eGPU's USB4: 1.5-4
     // GB/s), where kernels run so slowly that batches outlast the 2 s GPU timeout; CUDA fails it instead
-    // (ComfyUI's dynamic VRAM then gives memory back).
+    // (ComfyUI's dynamic VRAM then gives memory back). Freed VRAM returns to the budget asynchronously
+    // (amdgpu clears it first: ~0.5 ms per 32 MB on a 9060 XT) while callers that just evicted retry at
+    // once, so after a recent free this waits as long as the budget keeps growing.
     bool fitsVramBudget(uint32_t type, VkDeviceSize size) const;
     static constexpr VkDeviceSize kVramReserve = 256ull << 20;
     bool probeFusedFma();
@@ -411,6 +413,8 @@ private:
     VkDeviceSize maxSparseBufferSize_ = 0;
     uint32_t sparseMemoryTypes_ = 0;
     std::atomic<bool> sparseInSystem_{false};  // allocateMemory fell back to non-device-local memory
+    std::atomic<int64_t> lastFreeNs_{0};       // steady_clock time of the last freed allocation (fitsVramBudget)
+    void noteFree();
     VkDeviceSize hostImportAlignment_ = 0;
     VkDeviceSize placedMapAlignment_ = 4096;
     uint32_t addressHigh_ = 0;  // hostAddressBits() >> 32

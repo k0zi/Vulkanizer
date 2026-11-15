@@ -800,8 +800,9 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
     - Nem nyert: BN = 32 kisebb LDS-sel (d64-en rosszabb), a V transzponálása az LDS-ben (a `ds_load_u16`
       eltűnt, a sebesség nem változott), 13 KB-os változat (az LDS-allokációs granularitás miatt nincs 5.
       workgroup/CU), RT = 2 d64-en (8,8 → 10,0 ms).
-    - A ComfyUI-mérés függőben: a mérés idején (strata/unsloth HIP-folyamatok ugyanazon a GPU-n) a régi kóddal is
-      compute ring timeout jött az első lépésnél.
+    - ComfyUI Z-Image 1024², 8 lépés, `--bf16-vae` (2026-11-15, a VRAM-budget javításaival együtt, lásd 3.
+      „GPU-timeout”): mintavétel 1,60 s/lépés (előtte 3,1), meleg futás 26,2–26,7 → 24,8–25,0 s/kép, hideg 33,2 s.
+      A maradék ~12 s nem a mintavétel: szövegkódoló, VAE, a modellek VRAM-ba töltése.
   - Teszt: `tests/attention.cpp` (PyTorch-nevű csonk kernel, 2.14-es `Params`, CPU-referencia: f16 d64/d128/d80
     páratlan stride-okkal, causal + LSE, változó hossz, bf16 bias + GQA, f32 ablak, f32 d200 bias; RADV és
     llvmpipe).
@@ -1467,6 +1468,8 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
   `mul_mat_q` darab), a lefordított int8 MMQ-kernelek lassúak – ez a PTX-fordítón múlik. A dense modelleknél a
   `dequantize_block_q4_K` (11%) a sávszélesség felén fut. A profil „GPU idle” sora több eszköznél hibás (az eszközök
   timestampjei egy listába kerülnek).
+- [ ] Nyitva: `npu_async` llvmpipe-on bukik (`cuEventQuery` a NPU-futás utáni eseményre CUDA_SUCCESS-t ad
+  NOT_READY helyett); az `ecbdddd`-n is, tehát nem a budget-változások okozzák. RADV-n átmegy.
 - [ ] Nyitva: a parancsok közti teljes memóriabarrier (9060 XT-n kísérletben 1,1 → 0,5 µs/indítás nélküle, a 890M-en
   ~7 → ~1–2 µs) csak függőség-követéssel lazítható.
 
@@ -1477,6 +1480,18 @@ Mérés alapján (mikrobenchmark: üres-szerű kernel indítása, indítás + sz
 - **GPU-timeout**: a kernel driver reseteli a GPU-t, ha egy submit túl sokáig fut (amdgpu: 2 s). A batchek mért
   kernelidők alapján legfeljebb `VULKANIZER_BATCH_MS`-nyi munkát kapnak. Ha egyetlen workgroup is tovább fut a
   limitnél, vagy a becslés nagyon alulmér (ugyanaz a pipeline sokkal nagyobb K-val), a reset továbbra is előfordulhat.
+  - A másolások és a fill-ek is beszámítanak a batch becsült idejébe (`Device::transferEstimateNs`: VRAM ↔ VRAM
+    0,01 ns/bájt, ha bármelyik oldal a hoston van, 1 ns/bájt), a nagy device-másolás darabokban megy.
+  - **VRAM-túlfoglalás (2026-11-13/15):** a RADV a budget fölötti foglalást nem utasítja el, hanem GTT-be
+    (rendszermemóriába) teszi. eGPU-n a kernelek ezt az USB4-en át olvassák, a batchek túlfutnak a 2 s-on. A ComfyUI-nál
+    3,7 GB került így GTT-be, ring timeoutok sorozatával. Egy estén kb. 12 reset után a host is lefagyott; aznap a link is
+    leromlott volt: HtoD 1,45 GB/s a 3,8 helyett, a külső NVMe 2,5 GT/s-en; újraindítás után rendben. Javítás: diszkrét
+    GPU-n a device-local foglalás csak a `VK_EXT_memory_budget` szerinti budget − 256 MB-ig megy (`fitsVramBudget`),
+    utána OOM, mint CUDA-n; a ComfyUI DynamicVRAM-ja (aimdo) erre lapokat rak ki. A GTT-be kerülő rész 45 MB-ra csökkent.
+  - A felszabadított VRAM késve jelenik meg a budgetben: az amdgpu előbb törli (9060 XT: ~0,47 ms / 32 MB, 2 GB
+    ~30 ms). Az aimdo és a PyTorch a kirakás után azonnal újrapróbál, és a VAE 4,8 GB-os foglalása OOM-ot kapott
+    (csempézett dekódolás, +3 s). Ezért ha nemrég volt felszabadítás, a `fitsVramBudget` legfeljebb 1 s-ig vár,
+    amíg a szabad rész 20 ms-on belül nő. Kirakás után 1,5 GB foglalása: OOM → siker 16 ms alatt.
 - **Vulkan shader modell**: nincs rekurzió, structured CF kötelező. A függvénypointer és a virtuális hívás modulon belül
   összehasonlítás-lánc (6.9); a device `printf` és `malloc` saját bufferen/heapen.
 - **Warp size ≠ 32** eszközökön a warp-szintű kód lassú vagy részlegesen támogatott.

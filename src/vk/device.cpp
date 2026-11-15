@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -754,6 +755,7 @@ void Device::destroyBuffer(Buffer& buf) {
             }
         }
         vkFreeMemory(device_, buf.memory, nullptr);
+        noteFree();
     }
     buf = Buffer{};
 }
@@ -1324,7 +1326,9 @@ VkResult Device::allocateMemory(VkDeviceSize size, VkDeviceMemory& out) {
 }
 
 void Device::freeMemory(VkDeviceMemory memory) {
-    if (memory) vkFreeMemory(device_, memory, nullptr);
+    if (!memory) return;
+    vkFreeMemory(device_, memory, nullptr);
+    noteFree();
 }
 
 VkResult Device::bindSparse(const std::vector<SparseBind>& binds) {
@@ -1626,6 +1630,12 @@ VkResult Device::record(const std::function<void(VkCommandBuffer)>& commands, do
     return VK_SUCCESS;
 }
 
+void Device::noteFree() {
+    lastFreeNs_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count(),
+                      std::memory_order_relaxed);
+}
+
 bool Device::fitsVramBudget(uint32_t type, VkDeviceSize size) const {
     if (!memoryBudget_ || info_.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return true;
     const VkMemoryType& t = info_.memProps.memoryTypes[type];
@@ -1633,8 +1643,31 @@ bool Device::fitsVramBudget(uint32_t type, VkDeviceSize size) const {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     mp.pNext = &budget;
-    vkGetPhysicalDeviceMemoryProperties2(info_.handle, &mp);
-    return budget.heapUsage[t.heapIndex] + size + kVramReserve <= budget.heapBudget[t.heapIndex];
+    auto room = [&] {
+        vkGetPhysicalDeviceMemoryProperties2(info_.handle, &mp);
+        return int64_t(budget.heapBudget[t.heapIndex]) - int64_t(budget.heapUsage[t.heapIndex]);
+    };
+    const int64_t need = int64_t(size + kVramReserve);
+    int64_t have = room();
+    using namespace std::chrono;
+    const auto start = steady_clock::now();
+    if (have < need && duration_cast<nanoseconds>(start.time_since_epoch()).count() -
+                               lastFreeNs_.load(std::memory_order_relaxed) < 1'000'000'000) {
+        // Freed memory still on its way back: wait while it keeps coming (at most 1 s).
+        for (auto grew = start; steady_clock::now() - grew < 20ms && steady_clock::now() - start < 1s;) {
+            std::this_thread::sleep_for(200us);
+            const int64_t h = room();
+            if (h > have) have = h, grew = steady_clock::now();
+            if (have >= need) break;
+        }
+    }
+    if (have < need)
+        VULKANIZER_DEBUG("VRAM budget: %llu MB requested, heap %u usage %llu MB of budget %llu MB (waited %.1f ms)",
+                         (unsigned long long)(size >> 20), t.heapIndex,
+                         (unsigned long long)(budget.heapUsage[t.heapIndex] >> 20),
+                         (unsigned long long)(budget.heapBudget[t.heapIndex] >> 20),
+                         duration<double, std::milli>(steady_clock::now() - start).count());
+    return have >= need;
 }
 
 bool Device::inVram(const Buffer& b) const {
