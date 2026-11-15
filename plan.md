@@ -388,7 +388,14 @@ nvcc által generált regisztrációs ABI-ra építve. Ára: a runtime-ot statik
     `DEVICEMAP` nem megy). RADV-n egy 12 GB-os foglalás 4 db ~4 GB-os sparse bufferből áll.
   - A RADV felülről lefelé osztja a címeket: a többi darab az első alá kerül. A VA-tartomány tetején túlcsorduló
     címet nem szabad kérni, mert a libdrm címkezelője ettől elromlik, és utána minden kérés elbukik.
-  - Unmapkor a felvett munkát meg kell várni (`finish`), mapkor nem. A host-oldali másolás sparse memóriába
+  - Unmapkor a felvett munkát meg kell várni (`finish`), mapkor nem. Timeline semaphore-ral a map a CPU-n nem
+    is vár (2026-11-15): a bind a `bound_` semaphore-t jelzi, a következő compute batch és copy-queue submit arra
+    vár a GPU-n. Előtte minden map kivárta a compute queue addigi munkáját (fence). A ComfyUI-ban az aimdo a
+    forward pass közben lapoz be, és ez 32 MB-os laponként 18,6 ms CPU-várakozás volt (futásonként ~9 s,
+    a GPU közben állt). Most 22 µs/map; a meleg ComfyUI-futás (Z-Image 1024², 8 lépés) 24,7 → 23,6 s, a szövegkódoló
+    6,06 → 5,47 s (ROCm: 5,43). A RADV a bindet a gyakorlatban beküldési sorrendben végzi (a semaphore nélkül
+    is helyes lenne), a semaphore a specifikáció miatt kell. Teszt: `tests/vmm.cpp` `testOnDemandPages`
+    (map futó munka mellett, aszinkron feltöltés + kernel, kirakás, újra-map új adattal). A host-oldali másolás sparse memóriába
     staging bufferen át megy (lassú modellbetöltés; UMA-n a VkDeviceMemory közvetlen mappelése gyorsítana).
   - ComfyUI + aimdo kész (2026-10-22): a DynamicVRAM magától bekapcsol („comfy-aimdo inited for GPU: ... RADV RENOIR”,
     integrált GPU-ként 2 GB RAM-tartalékkal). A Z-Image Turbo sablon 1024×1024-en, 8 lépéssel 111 s/lépés, összesen 19:50
@@ -803,6 +810,12 @@ algoritmussal), az a [plan_non_clean.md](plan_non_clean.md)-ben van, eltéve.
     - ComfyUI Z-Image 1024², 8 lépés, `--bf16-vae` (2026-11-15, a VRAM-budget javításaival együtt, lásd 3.
       „GPU-timeout”): mintavétel 1,60 s/lépés (előtte 3,1), meleg futás 26,2–26,7 → 24,8–25,0 s/kép, hideg 33,2 s.
       A maradék ~12 s nem a mintavétel: szövegkódoló, VAE, a modellek VRAM-ba töltése.
+    - Összevetés ugyanazon a gépen és linken (2026-11-15, HtoD mindkettőn 1,6 GB/s), csomópontonként, meleg futás
+      (`bench_nodes.py`, a websocket-eseményekből): Vulkanizer 23,6 s (az aszinkron sparse bind után, lásd 4.9) vs
+      ROCm 20,3 s. CLIPTextEncode 5,47 vs 5,43; KSampler 17,05 vs 13,1 (első lépés a súlyok visszatöltésével
+      5,8 vs 4,3, utána 1,6 vs 1,1–1,25 s/lépés); VAEDecode 0,85 (bf16) vs 1,35 (fp32). A 16 GB-ba a szövegkódoló
+      (7,7 GB) és a Lumina2 (11,7 GB) együtt nem fér be, ezért képenként cserélődnek – ez mindkét backendnél így van.
+      A különbség zöme a lépésidő (a GEMM, a GPU-idő 64%-a).
   - Teszt: `tests/attention.cpp` (PyTorch-nevű csonk kernel, 2.14-es `Params`, CPU-referencia: f16 d64/d128/d80
     páratlan stride-okkal, causal + LSE, változó hossz, bf16 bias + GQA, f32 ablak, f32 d200 bias; RADV és
     llvmpipe).

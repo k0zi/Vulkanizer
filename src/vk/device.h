@@ -147,7 +147,11 @@ public:
     VkResult allocateMemory(VkDeviceSize size, VkDeviceMemory& out);  // for sparse binding
     void freeMemory(VkDeviceMemory memory);
     // Takes effect for the work recorded afterwards; unbinding first waits for the recorded work.
+    // With timeline semaphores binding alone does not wait: the next submissions on both queues wait
+    // for it on the GPU (comfy-aimdo maps model pages on demand during the forward pass; waiting for
+    // the work queued before each map stalled the host ~18 ms per 32 MB page and left the GPU idle).
     VkResult bindSparse(const std::vector<SparseBind>& binds);
+    VkResult waitBound();  // host wait for the asynchronous bindings
 
     // CUDA IPC. exportId names an exportable buffer's memory (the same id for every buffer of one
     // memory, valid until that memory is freed); exportMemory gives a new fd of it, for another
@@ -395,6 +399,9 @@ private:
     VkSemaphore copyDone_ = VK_NULL_HANDLE;
     uint64_t copyValue_ = 0;  // last value submitted
     uint64_t copyWait_ = 0;   // the next batch submitted waits for copyDone_ >= this (0: none)
+    VkSemaphore bound_ = VK_NULL_HANDLE;  // timeline: signalled by each asynchronous bindSparse
+    uint64_t boundValue_ = 0;             // last value submitted
+    uint64_t boundWait_ = 0, boundWaitCopy_ = 0;  // the next compute / copy submission waits for bound_ >= this
     uint32_t sharingFamilies_[2] = {};
     void setSharing(VkBufferCreateInfo& bci) const;
     // Records `commands` into the next copy command buffer (once its last submission completed) and

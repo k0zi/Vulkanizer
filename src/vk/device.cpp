@@ -448,6 +448,7 @@ VkResult Device::init() {
         sci.pNext = &ti;
         if ((r = vkCreateSemaphore(device_, &sci, nullptr, &progress_)) != VK_SUCCESS) return r;
         if ((r = vkCreateSemaphore(device_, &sci, nullptr, &hostSteps_)) != VK_SUCCESS) return r;
+        if ((r = vkCreateSemaphore(device_, &sci, nullptr, &bound_)) != VK_SUCCESS) return r;
     }
     if (copyQueue_) {
         VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
@@ -572,6 +573,7 @@ Device::~Device() {
     if (progress_) vkDestroySemaphore(device_, progress_, nullptr);
     if (hostSteps_) vkDestroySemaphore(device_, hostSteps_, nullptr);
     if (copyDone_) vkDestroySemaphore(device_, copyDone_, nullptr);
+    if (bound_) vkDestroySemaphore(device_, bound_, nullptr);
     if (copyPool_) vkDestroyCommandPool(device_, copyPool_, nullptr);
     for (auto& [serial, buf] : deferredFrees_) destroyBuffer(buf);
     destroyBuffer(readStaging_);
@@ -1331,17 +1333,27 @@ void Device::freeMemory(VkDeviceMemory memory) {
     noteFree();
 }
 
+VkResult Device::waitBound() {
+    if (!boundValue_) return VK_SUCCESS;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &bound_;
+    wi.pValues = &boundValue_;
+    return vkWaitSemaphores(device_, &wi, UINT64_MAX);
+}
+
 VkResult Device::bindSparse(const std::vector<SparseBind>& binds) {
     if (binds.empty()) return VK_SUCCESS;
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    // Pages being unbound may still be used by recorded work. Newly bound pages are not
-    // (CUDA forbids touching unmapped memory), and the work recorded later is submitted after
-    // the binding completed below.
-    for (const SparseBind& b : binds)
-        if (!b.memory) {
-            if (VkResult r = finish()) return r;
-            break;
-        }
+    // Pages being unbound may still be used by recorded work (and by earlier asynchronous binds).
+    // Newly bound pages are not (CUDA forbids touching unmapped memory), and the work recorded later
+    // is submitted after the binding: it waits for bound_ on the GPU, or the binding completes here.
+    bool unbind = false;
+    for (const SparseBind& b : binds) unbind |= !b.memory;
+    if (unbind) {
+        if (VkResult r = finish()) return r;
+        if (VkResult r = waitBound()) return r;
+    }
     std::vector<VkSparseMemoryBind> pages(binds.size());
     std::vector<VkSparseBufferMemoryBindInfo> infos(binds.size());
     for (size_t i = 0; i < binds.size(); ++i) {
@@ -1351,6 +1363,19 @@ VkResult Device::bindSparse(const std::vector<SparseBind>& binds) {
     VkBindSparseInfo bsi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
     bsi.bufferBindCount = uint32_t(infos.size());
     bsi.pBufferBinds = infos.data();
+    if (bound_ && !unbind) {
+        // The open batch is submitted after this, so it (and the next copy) can wait for the binding.
+        const uint64_t value = boundValue_ + 1;
+        VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        ts.signalSemaphoreValueCount = 1;
+        ts.pSignalSemaphoreValues = &value;
+        bsi.pNext = &ts;
+        bsi.signalSemaphoreCount = 1;
+        bsi.pSignalSemaphores = &bound_;
+        if (VkResult r = vkQueueBindSparse(queue_, 1, &bsi, VK_NULL_HANDLE)) return r;
+        boundValue_ = boundWait_ = boundWaitCopy_ = value;
+        return VK_SUCCESS;
+    }
     if (VkResult r = vkResetFences(device_, 1, &fence_)) return r;
     if (VkResult r = vkQueueBindSparse(queue_, 1, &bsi, fence_)) return r;
     return vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
@@ -1456,9 +1481,10 @@ VkResult Device::flushLocked() {
     // step's batch waits for the step.
     // A batch after copy queue work waits for that too.
     VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    const VkPipelineStageFlags waitStages[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-    VkSemaphore waitSemaphores[2];
-    uint64_t waitValues[2];
+    const VkPipelineStageFlags waitStages[3] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    VkSemaphore waitSemaphores[3];
+    uint64_t waitValues[3];
     uint32_t waits = 0;
     if (progress_) {
         si.pNext = &ts;
@@ -1474,6 +1500,10 @@ VkResult Device::flushLocked() {
             waitSemaphores[waits] = copyDone_;
             waitValues[waits++] = copyWait_;
         }
+        if (boundWait_) {
+            waitSemaphores[waits] = bound_;
+            waitValues[waits++] = boundWait_;
+        }
         ts.waitSemaphoreValueCount = waits;
         ts.pWaitSemaphoreValues = waitValues;
         si.waitSemaphoreCount = waits;
@@ -1483,6 +1513,7 @@ VkResult Device::flushLocked() {
     const VkResult r = vkQueueSubmit(queue_, 1, &si, b.fence);
     hostWait_ = 0;
     copyWait_ = 0;
+    boundWait_ = 0;
     if (r != VK_SUCCESS) return r;
     b.pending = true;
     return VK_SUCCESS;
@@ -1840,6 +1871,7 @@ bool Device::readTimestampNs(int32_t slot, double& ns) {
 VkResult Device::submit(const std::function<void(VkCommandBuffer)>& record) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (VkResult r = finish()) return r;
+    if (VkResult r = waitBound()) return r;
     VkResult r = vkResetCommandBuffer(cmd_, 0);
     if (r != VK_SUCCESS) return r;
 
@@ -1906,14 +1938,25 @@ VkResult Device::submitCopy(uint64_t after, const std::function<void(VkCommandBu
     si.pCommandBuffers = &cb;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &copyDone_;
+    const VkPipelineStageFlags waitStages[2] = {waitStage, waitStage};
+    VkSemaphore waitSemaphores[2];
+    uint64_t waitValues[2];
+    uint32_t waits = 0;
     if (after) {
-        ts.waitSemaphoreValueCount = 1;
-        ts.pWaitSemaphoreValues = &after;
-        si.waitSemaphoreCount = 1;
-        si.pWaitSemaphores = &progress_;
-        si.pWaitDstStageMask = &waitStage;
+        waitSemaphores[waits] = progress_;
+        waitValues[waits++] = after;
     }
+    if (boundWaitCopy_) {
+        waitSemaphores[waits] = bound_;
+        waitValues[waits++] = boundWaitCopy_;
+    }
+    ts.waitSemaphoreValueCount = waits;
+    ts.pWaitSemaphoreValues = waitValues;
+    si.waitSemaphoreCount = waits;
+    si.pWaitSemaphores = waitSemaphores;
+    si.pWaitDstStageMask = waitStages;
     if (VkResult r = vkQueueSubmit(copyQueue_, 1, &si, VK_NULL_HANDLE)) return r;
+    boundWaitCopy_ = 0;
     copyValue_ = value;
     copyCmdValue_[slot] = value;
     return VK_SUCCESS;

@@ -142,6 +142,77 @@ static void testVmm(CUfunction vecAdd) {
     EXPECT_CU(CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED, cuMemHostUnregister(host.data()));
 }
 
+// comfy-aimdo's pattern: pages mapped on demand while the stream still runs earlier work, filled by
+// asynchronous copies and read by kernels right away, then evicted and mapped again with new data.
+static void testOnDemandPages(CUfunction vecAdd) {
+    int supported = 0;
+    CHECK_CU(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, 0));
+    if (!supported) return;
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location = {CU_MEM_LOCATION_TYPE_DEVICE, 0};
+    size_t g = 0;
+    CHECK_CU(cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    const int pages = 8;
+    const size_t n = g / 4;
+    CUdeviceptr base, out, busy;
+    CHECK_CU(cuMemAddressReserve(&base, pages * g, 0, 0, 0));
+    CHECK_CU(cuMemAlloc(&out, pages * g));
+    CHECK_CU(cuMemAlloc(&busy, 4 * g));
+    CHECK_CU(cuMemsetD8(busy, 0, 4 * g));
+    float* host = nullptr;
+    CHECK_CU(cuMemAllocHost(reinterpret_cast<void**>(&host), pages * g));
+    CUstream s;
+    CHECK_CU(cuStreamCreate(&s, CU_STREAM_NON_BLOCKING));
+    CUmemAccessDesc access{};
+    access.location = prop.location;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CUmemGenericAllocationHandle h[pages] = {};
+    std::vector<float> back(n * pages);
+    for (int round = 0; round < 3; ++round) {
+        for (size_t i = 0; i < n * pages; ++i) host[i] = float((i + 7 * round) % 1000);
+        for (int p = 0; p < pages; ++p) {
+            // earlier work still queued or running while the page is mapped
+            int busyCount = int(g);
+            void* busyArgs[] = {&busy, &busy, &busy, &busyCount};
+            CHECK_CU(cuLaunchKernel(vecAdd, (busyCount + 255) / 256, 1, 1, 256, 1, 1, 0, s, busyArgs, nullptr));
+            if (!h[p]) {
+                CHECK_CU(cuMemCreate(&h[p], g, &prop, 0));
+                CHECK_CU(cuMemMap(base + p * g, g, 0, h[p], 0));
+                CHECK_CU(cuMemSetAccess(base + p * g, g, &access, 1));
+            }
+            CUdeviceptr page = base + p * g, dst = out + p * g;
+            CHECK_CU(cuMemcpyHtoDAsync(page, host + p * n, g, s));
+            int count = int(n);
+            void* args[] = {&page, &page, &dst, &count};
+            CHECK_CU(cuLaunchKernel(vecAdd, (count + 255) / 256, 1, 1, 256, 1, 1, 0, s, args, nullptr));
+        }
+        CHECK_CU(cuMemcpyDtoHAsync(back.data(), out, pages * g, s));
+        // evict every other page while the stream runs (unmapping waits for it)
+        for (int p = round % 2; p < pages; p += 2) {
+            CHECK_CU(cuMemUnmap(base + p * g, g));
+            CHECK_CU(cuMemRelease(h[p]));
+            h[p] = 0;
+        }
+        CHECK_CU(cuStreamSynchronize(s));
+        for (size_t i = 0; i < n * pages; ++i)
+            if (back[i] != 2 * host[i]) {
+                std::fprintf(stderr, "round %d: mismatch at %zu: %f, expected %f\n", round, i, back[i], 2 * host[i]);
+                std::exit(1);
+            }
+    }
+    for (int p = 0; p < pages; ++p)
+        if (h[p]) {
+            CHECK_CU(cuMemUnmap(base + p * g, g));
+            CHECK_CU(cuMemRelease(h[p]));
+        }
+    CHECK_CU(cuStreamDestroy(s));
+    CHECK_CU(cuMemFreeHost(host));
+    CHECK_CU(cuMemFree(busy));
+    CHECK_CU(cuMemFree(out));
+    CHECK_CU(cuMemAddressFree(base, pages * g));
+}
+
 int main() {
     CHECK_CU(cuInit(0));
     CUdevice dev;
@@ -155,6 +226,7 @@ int main() {
 
     testPools();
     testVmm(fn);
+    testOnDemandPages(fn);
 
     CHECK_CU(cuModuleUnload(mod));
     CHECK_CU(cuCtxDestroy(ctx));
